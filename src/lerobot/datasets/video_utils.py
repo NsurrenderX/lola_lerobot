@@ -300,7 +300,8 @@ def decode_video_frames_torchcodec(
             loaded_frames = frame_batch.data      # (T, C, H, W) uint8
             loaded_ts = frame_batch.pts_seconds   # (T,) float
         except RuntimeError as e:
-            if "Expected pre-allocated tensor" in str(e):
+            err_msg = str(e)
+            if "Expected pre-allocated tensor" in err_msg:
                 # =====================================================================
                 # 终极 Fallback：torchcodec 绝对无法处理单文件变分辨率。
                 # 此时果断退化到原生 PyAV 后端来单独处理这个变异的视频。
@@ -308,11 +309,11 @@ def decode_video_frames_torchcodec(
                 logging.warning(f"Dynamic resolution detected in {video_path_str}. Falling back to PyAV.")
                 torchvision.set_video_backend("pyav")
                 reader = torchvision.io.VideoReader(video_path_str, "video")
-                
+
                 first_ts = min(timestamps)
                 last_ts = max(timestamps)
                 reader.seek(first_ts, keyframes_only=True)
-                
+
                 single_frames = []
                 single_pts = []
                 for frame in reader:
@@ -321,9 +322,64 @@ def decode_video_frames_torchcodec(
                     single_pts.append(current_ts)
                     if current_ts >= last_ts:
                         break
-                
+
                 loaded_frames = single_frames
                 loaded_ts = single_pts
+            elif "no more frames left to decode" in err_msg.lower() or "out of bounds" in err_msg.lower():
+                # =====================================================================
+                # Fallback：metadata.num_frames 不准确，部分 frame_indices 超出
+                # 实际可解码范围。逐帧尝试解码，将无法解码的索引替换为
+                # 最近的可解码帧。
+                # =====================================================================
+                logging.warning(
+                    f"torchcodec frame-index out of range in {video_path_str}: "
+                    f"num_frames={num_frames}, requested_indices={frame_indices}, "
+                    f"timestamps={timestamps}, err={err_msg}"
+                )
+                # Find the true last decodable frame by probing from num_frames-1 downward
+                true_last_frame = num_frames - 1
+                for probe in range(num_frames - 1, -1, -1):
+                    try:
+                        _probe_batch = decoder.get_frames_at(indices=[probe])
+                        true_last_frame = probe
+                        break
+                    except RuntimeError:
+                        continue
+                logging.warning(
+                    f"torchcodec: metadata.num_frames={num_frames}, "
+                    f"true_last_decodable_frame={true_last_frame} in {video_path_str}"
+                )
+                # Clamp indices to true last frame and re-try batch decode
+                safe_indices = [max(0, min(idx, true_last_frame)) for idx in frame_indices]
+                try:
+                    frame_batch = decoder.get_frames_at(indices=safe_indices)
+                    loaded_frames = frame_batch.data
+                    loaded_ts = frame_batch.pts_seconds
+                except RuntimeError as e2:
+                    # Batch still fails → decode one-by-one as ultimate fallback
+                    logging.warning(
+                        f"torchcodec batch decode still failed after clamping to "
+                        f"true_last_frame={true_last_frame}, falling back to per-frame decode: {e2}"
+                    )
+                    loaded_frames_list = []
+                    loaded_ts_list = []
+                    for si in safe_indices:
+                        try:
+                            single_batch = decoder.get_frames_at(indices=[si])
+                            loaded_frames_list.append(single_batch.data[0])
+                            loaded_ts_list.append(single_batch.pts_seconds[0])
+                        except RuntimeError:
+                            # Use the true last frame as substitute
+                            single_batch = decoder.get_frames_at(indices=[true_last_frame])
+                            loaded_frames_list.append(single_batch.data[0])
+                            loaded_ts_list.append(single_batch.pts_seconds[0])
+                    loaded_frames = torch.stack(loaded_frames_list)
+                    loaded_ts = torch.tensor(loaded_ts_list)
+                # Update clamped_mask: mark indices that were beyond true_last_frame
+                for i, idx in enumerate(frame_indices):
+                    if idx > true_last_frame or idx < 0:
+                        clamped_mask[i] = True
+                frame_indices = safe_indices
             else:
                 raise
 

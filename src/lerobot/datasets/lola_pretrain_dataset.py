@@ -862,14 +862,25 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             )
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
 
-            if self.decode_device == "cuda":
-                frames = self._decode_video_cuda(video_path, query_ts)
-            else:
-                frames = decode_video_frames_torchcodec(
-                    video_path, query_ts, self.tolerance_s,
-                    tolerance_frames=self.tolerance_frames,
-                    decoder_cache=self.video_decoder_cache,
+            try:
+                if self.decode_device == "cuda":
+                    frames = self._decode_video_cuda(video_path, query_ts)
+                else:
+                    frames = decode_video_frames_torchcodec(
+                        video_path, query_ts, self.tolerance_s,
+                        tolerance_frames=self.tolerance_frames,
+                        decoder_cache=self.video_decoder_cache,
+                    )
+            except Exception as e:
+                logging.error(
+                    f"Video decode failed for ep_idx={ep_idx}, video_key={video_key}: "
+                    f"video_path={video_path}, query_ts={query_ts}, "
+                    f"ep_meta_video_keys={list(ep_meta.keys())}, "
+                    f"from_timestamp={ep_meta.get(f'videos/{video_key}/from_timestamp')}, "
+                    f"to_timestamp={ep_meta.get(f'videos/{video_key}/to_timestamp')}, "
+                    f"is_valid={is_valid}, err={e}"
                 )
+                raise
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
         return item
