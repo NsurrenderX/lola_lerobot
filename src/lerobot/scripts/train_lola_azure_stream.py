@@ -1,19 +1,25 @@
 #!/usr/bin/env python
 """
-LoLA Azure 分布式流式训练脚本
+LoLA 分布式流式训练脚本
 
-使用 LoLAStreamingDataset 从 Azure Blob 等远程存储流式加载数据。
+使用 LoLAStreamingDataset / LoLAPretrainStreamingDataset 从远程存储流式加载数据。
 适用于数据通过挂载方式访问的场景，无需将整个数据集下载到本地。
 
 与 train_lola_azure.py 的区别：
 - 使用 LoLAStreamingDataset（IterableDataset）替代 LoLADataset（map-style）
 - 不需要 DistributedSampler（IterableDataset 自带分片）
 - 适用于远程挂载存储（Azure Blob 等）
+- LoLATrainer 内联定义，无需跨脚本导入
 
 使用方法:
+    # 单 GPU
     python src/lerobot/scripts/train_lola_azure_stream.py \
-        --dataset_root /mnt/data/lerobot-dataset \
-        --strategy ddp
+        --dataset_root /mnt/data/lerobot-dataset --pretrain \
+        --dataset_to_episodes_path /mnt/data/dataset_to_episodes.json
+
+    # 多 GPU (torchrun)
+    torchrun --nproc_per_node=4 src/lerobot/scripts/train_lola_azure_stream.py \
+        --dataset_root /mnt/data/lerobot-dataset --strategy ddp
 """
 
 import argparse
@@ -42,8 +48,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader
-from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset
+from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader as StreamingAsyncDecodeDataLoader
+from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset, AsyncDecodeDataLoader as PretrainAsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig, LoLAPolicy
 from lerobot.policies.factory import make_pre_post_processors
@@ -153,6 +159,7 @@ def create_lola_pretrain_streaming_dataset(
     repo_id: str,
     config: LoLAConfig,
     root: str | None = None,
+    sub_root: str | None = None,
     episodes: list | None = None,
     image_transforms=None,
     max_history_length: int = 100,
@@ -167,6 +174,8 @@ def create_lola_pretrain_streaming_dataset(
     decode_num_threads: int = 1,
     num_dataloader_workers: int = 0,
     dataset_to_episodes_path: str | None = None,
+    temp_process: bool = False,
+    episode_chunk_size: int = 8,
 ):
     """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
     dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id, root=root, revision=None)
@@ -186,6 +195,7 @@ def create_lola_pretrain_streaming_dataset(
         action_chunk_size=config.action_chunk_size,
         history_padding_side=history_padding_side,
         root=root,
+        sub_root=sub_root,
         episodes=episodes,
         image_transforms=image_transforms,
         delta_timestamps=delta_timestamps,
@@ -199,13 +209,430 @@ def create_lola_pretrain_streaming_dataset(
         decode_num_threads=decode_num_threads,
         num_dataloader_workers=num_dataloader_workers,
         dataset_to_episodes_path=dataset_to_episodes_path,
+        temp_process=temp_process,
+        episode_chunk_size=episode_chunk_size,
     )
 
     return dataset
 
 
-# 导入训练器（与 train_lola_azure.py 完全相同）
-from train_lola_azure import LoLATrainer
+# ----------------------------------------------------------------------
+# 训练器（内联定义，自包含，不依赖 train_lola_azure.py）
+# ----------------------------------------------------------------------
+class LoLATrainer:
+    """原生 PyTorch 训练器，支持 DDP 和 FSDP，增强 wandb 日志"""
+
+    def __init__(
+        self,
+        config: LoLAConfig,
+        dataset_stats: dict | None,
+        dist_info: dict,
+        learning_rate: float = 2.5e-5,
+        weight_decay: float = 0.01,
+        warmup_ratio: float = 0.03,
+        max_steps: int = 30000,
+        train_vlm: bool = False,
+        strategy: str = "ddp",
+        gradient_clip_val: float = 1.0,
+        ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
+        save_every_n_steps: int = 500,
+        log_every_n_steps: int = 10,
+        wandb_project: str = "lola-azure-stream",
+        wandb_name: str | None = None,
+        wandb_entity: str | None = None,
+        wandb_id: str | None = None,
+    ):
+        self.config = config
+        self.dataset_stats = dataset_stats
+        self.dist_info = dist_info
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.warmup_ratio = warmup_ratio
+        self.max_steps = max_steps
+        self.train_vlm = train_vlm
+        self.strategy = strategy
+        self.gradient_clip_val = gradient_clip_val
+        self.ckpt_dir = ckpt_dir
+        self.save_every_n_steps = save_every_n_steps
+        self.log_every_n_steps = log_every_n_steps
+
+        self.wandb_project = wandb_project
+        self.wandb_name = wandb_name
+        self.wandb_entity = wandb_entity
+        self.wandb_id = wandb_id
+        self.use_wandb = HAS_WANDB and dist_info["world_rank"] == 0
+
+        self.device = dist_info["device"]
+        self.local_rank = dist_info["local_rank"]
+        self.world_rank = dist_info["world_rank"]
+        self.world_size = dist_info["world_size"]
+        self.is_distributed = dist_info["is_distributed"]
+        self.is_main_process = self.world_rank == 0
+
+        self.policy = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.preprocessor = None
+        self.postprocessor = None
+
+        self.use_bf16 = True
+        self.scaler = None if self.use_bf16 else torch.amp.GradScaler("cuda")
+
+        self.global_step = 0
+        self.best_loss = float("inf")
+
+    def setup_model(self):
+        """设置模型"""
+        logger.info(f"Loading LoLA Policy on {self.device}...")
+
+        self.policy = LoLAPolicy(self.config)
+        self.policy._device = self.device
+        self.policy.model = self.policy.model.to(self.device)
+        self.policy.vlm = self.policy.vlm.to(self.device)
+
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.config,
+            dataset_stats=self.dataset_stats,
+        )
+
+        if not self.train_vlm and hasattr(self.policy, "vlm"):
+            logger.info("Freezing VLM parameters...")
+            for param in self.policy.vlm.parameters():
+                param.requires_grad = False
+            self.policy.vlm.eval()
+
+        trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.policy.parameters())
+        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+
+        if self.is_distributed:
+            if self.strategy == "fsdp":
+                self._setup_fsdp()
+            else:
+                self._setup_ddp()
+        else:
+            self.model = self.policy
+
+    def _setup_ddp(self):
+        """设置 DDP"""
+        logger.info("Setting up DDP...")
+        self.model = DDP(
+            self.policy,
+            device_ids=[self.local_rank],
+            output_device=self.local_rank,
+            find_unused_parameters=False,
+        )
+
+    def _setup_fsdp(self):
+        """设置 FSDP"""
+        logger.info("Setting up FSDP...")
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+
+        auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
+            module, recurse, nonwrapped_numel,
+            transformer_layer_cls={Qwen3_5DecoderLayer}
+        )
+
+        self.model = FSDP(
+            self.policy,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            mixed_precision=mixed_precision,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=self.local_rank,
+        )
+
+    def setup_optimizer(self):
+        """设置优化器"""
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+        self.optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+
+        from torch.optim.lr_scheduler import OneCycleLR
+        warmup_ratio = min(self.warmup_ratio, 0.1)
+        self.scheduler = OneCycleLR(
+            self.optimizer,
+            max_lr=self.learning_rate,
+            total_steps=self.max_steps,
+            pct_start=warmup_ratio,
+            anneal_strategy="cos",
+        )
+
+    def _extract_special_fields(self, batch):
+        """提取特殊字段（action / hist_actions_*），绕过 preprocessor"""
+        special_data = {}
+        keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length"]
+        for key in keys_to_extract:
+            if key in batch:
+                special_data[key] = batch.pop(key)
+        if "action" in batch:
+            special_data["action"] = batch.pop("action")
+        return special_data
+
+    def _restore_special_fields(self, batch, special_data):
+        """恢复特殊字段"""
+        batch.update(special_data)
+        return batch
+
+    def training_step(self, batch):
+        """单步训练"""
+        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        special_data = self._extract_special_fields(batch)
+
+        batch = self.preprocessor(batch)
+        batch = self._restore_special_fields(batch, special_data)
+
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            loss, loss_dict = self.model(batch)
+
+        return loss, loss_dict
+
+    def train(self, train_loader, start_step: int = 0):
+        """训练循环，增强 wandb 日志（throughput / timing / GPU metrics）"""
+        self.global_step = start_step
+        self.model.train()
+
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-stream-{time_str}")
+        if self.is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            logger.info(f"Checkpoint directory: {ckpt_dir}")
+
+        if self.use_wandb:
+            wandb_run_name = self.wandb_name or f"lola-stream-{self.strategy}-{time_str}"
+            wandb.init(
+                project=self.wandb_project,
+                name=wandb_run_name,
+                entity=self.wandb_entity,
+                id=self.wandb_id,
+                resume="allow" if self.wandb_id else None,
+                config={
+                    "learning_rate": self.learning_rate,
+                    "weight_decay": self.weight_decay,
+                    "max_steps": self.max_steps,
+                    "batch_size": train_loader.batch_size,
+                    "strategy": self.strategy,
+                    "world_size": self.world_size,
+                    "train_vlm": self.train_vlm,
+                    "gradient_clip_val": self.gradient_clip_val,
+                },
+            )
+            logger.info(f"Wandb initialized: {wandb_run_name}")
+
+        logger.info(f"Starting training from step {start_step} to {self.max_steps}")
+
+        try:
+            batches_per_epoch = len(train_loader)
+            logger.info(f"Total batches per epoch: {batches_per_epoch}")
+        except TypeError:
+            batches_per_epoch = None
+            logger.info("IterableDataset detected: cannot determine batches per epoch")
+
+        if start_step > 0 and batches_per_epoch is not None:
+            skip_epochs = start_step // batches_per_epoch
+            skip_batches = start_step % batches_per_epoch
+            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
+        elif start_step > 0 and batches_per_epoch is None:
+            skip_epochs = 0
+            skip_batches = 0
+            logger.warning(
+                f"Resuming from step {start_step} with IterableDataset: "
+                "data will restart from the beginning (model/optimizer/scheduler states are restored). "
+                "For precise data resume, use map-style dataset or add start_index to IterableDataset."
+            )
+        else:
+            skip_epochs = 0
+            skip_batches = 0
+
+        epoch = 0
+        while self.global_step < self.max_steps:
+            epoch += 1
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(epoch)
+
+            for batch_idx, batch in enumerate(train_loader):
+                if self.global_step >= self.max_steps:
+                    break
+
+                if skip_epochs > 0 or skip_batches > 0:
+                    if skip_epochs > 0:
+                        skip_epochs -= 1
+                        break
+                    skip_batches -= 1
+                    continue
+
+                step_start = time.monotonic()
+
+                self.optimizer.zero_grad()
+
+                # ── Forward pass (with timing) ───────────────────────
+                fwd_start = time.monotonic()
+                loss, loss_dict = self.training_step(batch)
+                fwd_s = time.monotonic() - fwd_start
+
+                # ── Backward pass (with timing) ──────────────────────
+                bwd_start = time.monotonic()
+                if self.use_bf16:
+                    loss.backward()
+                else:
+                    self.scaler.scale(loss).backward()
+                bwd_s = time.monotonic() - bwd_start
+
+                # ── Gradient clipping ─────────────────────────────────
+                clip_start = time.monotonic()
+                if self.gradient_clip_val > 0:
+                    if not self.use_bf16:
+                        self.scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.gradient_clip_val,
+                    )
+                else:
+                    grad_norm = None
+                clip_s = time.monotonic() - clip_start
+
+                # ── Optimizer step ────────────────────────────────────
+                opt_start = time.monotonic()
+                if self.use_bf16:
+                    self.optimizer.step()
+                else:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                opt_s = time.monotonic() - opt_start
+
+                self.scheduler.step()
+
+                self.global_step += 1
+
+                update_s = time.monotonic() - step_start
+                batch_per_s = 1.0 / update_s if update_s > 0 else 0
+
+                # ── Logging (enhanced wandb metrics) ──────────────────
+                if self.global_step % self.log_every_n_steps == 0:
+                    lr = self.scheduler.get_last_lr()[0]
+                    gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                    gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+
+                    if self.is_main_process:
+                        logger.info(
+                            f"Step {self.global_step}/{self.max_steps} | "
+                            f"Loss: {loss.item():.4f} | "
+                            f"LR: {lr:.2e} | "
+                            f"Update: {update_s:.2f}s | "
+                            f"Throughput: {batch_per_s:.2f} batch/s | "
+                            f"GPU: {gpu_mem_alloc:.1f}/{gpu_mem_reserved:.1f} GB"
+                        )
+                        if self.use_wandb:
+                            log_dict = {
+                                "train/loss": loss.item(),
+                                "train/learning_rate": lr,
+                                "train/step": self.global_step,
+                                "train/epoch": epoch,
+                                "train/update_s": update_s,
+                                "train/batch_per_s": batch_per_s,
+                                "train/fwd_s": fwd_s,
+                                "train/bwd_s": bwd_s,
+                                "train/clip_s": clip_s,
+                                "train/opt_s": opt_s,
+                                "train/gpu_mem_alloc_gb": gpu_mem_alloc,
+                                "train/gpu_mem_reserved_gb": gpu_mem_reserved,
+                            }
+                            if grad_norm is not None:
+                                log_dict["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                            for k, v in loss_dict.items():
+                                if k != "loss" and isinstance(v, (int, float)):
+                                    log_dict[f"train/{k}"] = v
+                            wandb.log(log_dict)
+
+                if self.global_step % self.save_every_n_steps == 0 and self.is_main_process:
+                    self.save_checkpoint(ckpt_dir, self.global_step)
+
+        if self.is_main_process:
+            self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
+            logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+
+        if self.use_wandb:
+            wandb.finish()
+
+    def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
+        """保存 checkpoint"""
+        if self.strategy == "fsdp":
+            from torch.distributed.checkpoint import save as save_fsdp_checkpoint
+            from torch.distributed.checkpoint.state_dict import get_state_dict
+
+            model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
+            ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}" if not is_final else "final")
+            save_fsdp_checkpoint(
+                {
+                    "model": model_sd,
+                    "optimizer": optimizer_sd,
+                    "step": [step],
+                },
+                checkpoint_id=ckpt_path,
+            )
+            if self.is_main_process:
+                torch.save(
+                    {"scheduler_state_dict": self.scheduler.state_dict()},
+                    os.path.join(ckpt_path, "scheduler.pt"),
+                )
+        else:
+            state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
+            ckpt_name = f"lola-step-{step:06d}.pt" if not is_final else "lola-final.pt"
+            ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+            torch.save({
+                "step": step,
+                "model_state_dict": state_dict,
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+            }, ckpt_path)
+
+        logger.info(f"Checkpoint saved: {ckpt_path}")
+
+    def load_checkpoint(self, ckpt_path: str):
+        """加载 checkpoint"""
+        if self.strategy == "fsdp":
+            from torch.distributed.checkpoint import load as load_fsdp_checkpoint
+            from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+            model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
+            step_container = [0]
+            load_fsdp_checkpoint(
+                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container},
+                checkpoint_id=ckpt_path,
+            )
+            set_state_dict(self.model, self.optimizer, model_state_dict=model_sd, optim_state_dict=optimizer_sd)
+            self.global_step = step_container[0]
+            scheduler_path = os.path.join(ckpt_path, "scheduler.pt")
+            if os.path.exists(scheduler_path):
+                scheduler_ckpt = torch.load(scheduler_path, map_location=self.device)
+                self.scheduler.load_state_dict(scheduler_ckpt["scheduler_state_dict"])
+        else:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            if self.is_distributed:
+                self.model.module.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.global_step = checkpoint.get("step", 0)
+
+        logger.info(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
 
 def main():
@@ -274,6 +701,12 @@ def main():
                         help="启用预训练模式（使用 LoLAPretrainStreamingDataset，per-sub-dataset 归一化）")
     parser.add_argument("--dataset_to_episodes_path", type=str, default=None,
                         help="dataset_to_episodes.json 路径（预训练模式必须）")
+    parser.add_argument("--sub_root", type=str, default=None,
+                        help="子数据集 stats.json 的根目录（预训练模式，默认与 root 相同）")
+    parser.add_argument("--temp_process", action="store_true",
+                        help="预训练模式：允许维度不匹配时用 0/1 填充归一化 stats")
+    parser.add_argument("--episode_chunk_size", type=int, default=8,
+                        help="预训练模式：每次加载的连续 episode 数（影响 I/O 效率）")
 
     args = parser.parse_args()
 
@@ -294,6 +727,9 @@ def main():
         if args.pretrain:
             logger.info(f"Pretrain Mode: True")
             logger.info(f"Dataset to Episodes: {args.dataset_to_episodes_path}")
+            logger.info(f"Sub Root: {args.sub_root}")
+            logger.info(f"Temp Process: {args.temp_process}")
+            logger.info(f"Episode Chunk Size: {args.episode_chunk_size}")
         logger.info("=" * 60)
 
     # 获取数据集元数据
@@ -337,14 +773,16 @@ def main():
         }
 
     # 创建流式数据集
+    AsyncLoaderClass = PretrainAsyncDecodeDataLoader if args.pretrain else StreamingAsyncDecodeDataLoader
+
     if args.pretrain:
-        if args.dataset_to_episodes_path is None:
-            raise ValueError("--dataset_to_episodes_path is required for --pretrain mode")
+        # dataset_to_episodes_path is optional for local testing without per-sub-dataset normalization
         logger.info("Creating pretrain streaming dataset...")
         train_dataset = create_lola_pretrain_streaming_dataset(
             repo_id=args.dataset_repo_id,
             config=config,
             root=args.dataset_root,
+            sub_root=args.sub_root,
             episodes=args.episodes,
             max_history_length=args.max_history_length,
             history_padding_side=args.history_padding_side,
@@ -357,6 +795,8 @@ def main():
             decode_num_threads=args.decode_num_threads,
             num_dataloader_workers=args.num_workers,
             dataset_to_episodes_path=args.dataset_to_episodes_path,
+            temp_process=args.temp_process,
+            episode_chunk_size=args.episode_chunk_size,
         )
     else:
         logger.info("Creating streaming dataset...")
@@ -378,23 +818,20 @@ def main():
         )
 
     # IterableDataset 不使用 DistributedSampler，由数据集内部处理分片
-    # 使用 AsyncDecodeDataLoader 处理视频解码 + 变长序列 collate
+    # passthrough collate：AsyncDecodeDataLoader 会处理解码和 collate
     raw_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        collate_fn=lambda x: x,  # passthrough, AsyncDecodeDataLoader 会处理 collate
-        pin_memory=True,
+        collate_fn=lambda x: x,
     )
-    train_loader = AsyncDecodeDataLoader(
+    train_loader = AsyncLoaderClass(
         dataloader=raw_loader,
         dataset=train_dataset,
-        collate_fn=AsyncDecodeDataLoader.make_collate_fn(),
+        collate_fn=AsyncLoaderClass.make_collate_fn(),
     )
 
     # 创建训练器
-    # 预训练模式：dataset_stats 传空 dict（归一化由 dataset 内部完成，processor 全 IDENTITY）
-    # 正常模式：传全局 dataset stats 给 processor 的 NormalizerProcessorStep
     dataset_stats = {} if args.pretrain else dataset_metadata.stats
     trainer = LoLATrainer(
         config=config,
@@ -432,4 +869,6 @@ def main():
 
 
 if __name__ == "__main__":
+    os.environ['WANDB_API_KEY'] = "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"
+    
     main()

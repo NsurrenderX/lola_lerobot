@@ -2,18 +2,25 @@
 """
 LoLA 多卡分布式流式训练脚本 - 使用 StreamingLeRobotDataset
 
-本脚本使用 LoLAStreamingDataset 从远程存储（如 Azure Blob 挂载）流式加载数据。
+本脚本使用 LoLAStreamingDataset / LoLAPretrainStreamingDataset 从远程存储（如 Azure Blob 挂载）流式加载数据。
 适用于数据通过挂载方式访问的场景，无需将整个数据集下载到本地。
 
 与 train_lola_multigpu.py 的区别：
 - 使用 LoLAStreamingDataset（IterableDataset）替代 LoLADataset（map-style）
 - 不需要 DistributedSampler（IterableDataset 自带分片）
 - 适用于远程挂载存储（Azure Blob 等）
+- 支持 LoLAPretrainStreamingDataset 预训练模式
 
 使用方法:
     # 使用流式数据集训练
     torchrun --nproc_per_node=4 src/lerobot/scripts/train_lola_multigpu_stream.py \
         --dataset_repo_id lerobot/pusht \
+        --strategy fsdp
+
+    # 预训练模式
+    torchrun --nproc_per_node=4 src/lerobot/scripts/train_lola_multigpu_stream.py \
+        --dataset_root /mnt/data/lerobot-dataset \
+        --pretrain --dataset_to_episodes_path /mnt/data/dataset_to_episodes.json \
         --strategy fsdp
 
     # DeepSpeed 训练
@@ -48,9 +55,10 @@ os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader
+from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader as StreamingAsyncDecodeDataLoader
+from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset, AsyncDecodeDataLoader as PretrainAsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig, LoLAPolicy
 from lerobot.policies.factory import make_pre_post_processors
@@ -91,6 +99,8 @@ class LoLALightningModule(pl.LightningModule):
 
         # 计时
         self._step_start_time = None
+        self._fwd_start_time = None
+        self._bwd_start_time = None
 
     def setup(self, stage=None):
         """在 distributed 环境初始化后加载模型"""
@@ -155,24 +165,44 @@ class LoLALightningModule(pl.LightningModule):
         return batch
 
     def training_step(self, batch, batch_idx):
-        """训练步骤"""
+        """训练步骤（增强日志：throughput / timing / GPU metrics）"""
         self._step_start_time = time.monotonic()
 
         special_data = self._extract_special_fields(batch)
+
+        self._fwd_start_time = time.monotonic()
         batch = self.preprocessor(batch)
         batch = self._restore_special_fields(batch, special_data)
 
         loss, loss_dict = self(batch)
+        fwd_s = time.monotonic() - self._fwd_start_time
+
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         for k, v in loss_dict.items():
             if k != "loss":
                 self.log(f"train_{k}", v, prog_bar=False, sync_dist=True)
 
-        if self._step_start_time is not None:
-            update_s = round(time.monotonic() - self._step_start_time, 2)
-            self.log("train_update_s", update_s, prog_bar=False, sync_dist=False)
+        update_s = time.monotonic() - self._step_start_time
+        batch_per_s = 1.0 / update_s if update_s > 0 else 0
+
+        # GPU memory
+        device = self.policy._device if self.policy is not None else torch.device("cuda:0")
+        gpu_mem_alloc = torch.cuda.memory_allocated(device) / 1e9
+        gpu_mem_reserved = torch.cuda.memory_reserved(device) / 1e9
+
+        self.log("train_update_s", update_s, prog_bar=False, sync_dist=False)
+        self.log("train_batch_per_s", batch_per_s, prog_bar=True, sync_dist=False)
+        self.log("train_fwd_s", fwd_s, prog_bar=False, sync_dist=False)
+        self.log("train_gpu_mem_alloc_gb", gpu_mem_alloc, prog_bar=False, sync_dist=False)
+        self.log("train_gpu_mem_reserved_gb", gpu_mem_reserved, prog_bar=False, sync_dist=False)
 
         return loss
+
+    def on_after_backward(self):
+        """Backward 后记录 timing"""
+        if self._fwd_start_time is not None:
+            bwd_s = time.monotonic() - self._fwd_start_time
+            self.log("train_bwd_s", bwd_s, prog_bar=False, sync_dist=False)
 
     def configure_optimizers(self):
         """配置优化器"""
@@ -256,6 +286,67 @@ def create_lola_streaming_dataset(
         decode_device=decode_device,
         decode_num_threads=decode_num_threads,
         num_dataloader_workers=num_dataloader_workers,
+    )
+
+    return dataset
+
+
+def create_lola_pretrain_streaming_dataset(
+    repo_id: str,
+    config: LoLAConfig,
+    root: str | None = None,
+    sub_root: str | None = None,
+    episodes: list | None = None,
+    image_transforms=None,
+    max_history_length: int = 100,
+    history_padding_side: str = "left",
+    streaming: bool = True,
+    buffer_size: int = 1000,
+    seed: int = 42,
+    shuffle: bool = True,
+    deferred_video_decode: bool = True,
+    async_decode: bool = False,
+    decode_device: str = "cpu",
+    decode_num_threads: int = 1,
+    num_dataloader_workers: int = 0,
+    dataset_to_episodes_path: str | None = None,
+    temp_process: bool = False,
+    episode_chunk_size: int = 8,
+):
+    """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id, root=root, revision=None)
+    fps = dataset_metadata.fps
+
+    delta_timestamps = {}
+    delta_timestamps["observation.state"] = [i / fps for i in config.observation_delta_indices]
+    delta_timestamps["action"] = [i / fps for i in config.action_delta_indices]
+    for key in dataset_metadata.camera_keys:
+        delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
+
+    print(f"[Dataset] delta_timestamps: {delta_timestamps}")
+
+    dataset = LoLAPretrainStreamingDataset(
+        repo_id=repo_id,
+        max_history_length=max_history_length,
+        action_chunk_size=config.action_chunk_size,
+        history_padding_side=history_padding_side,
+        root=root,
+        sub_root=sub_root,
+        episodes=episodes,
+        image_transforms=image_transforms,
+        delta_timestamps=delta_timestamps,
+        streaming=streaming,
+        buffer_size=buffer_size,
+        seed=seed,
+        shuffle=shuffle,
+        deferred_video_decode=deferred_video_decode,
+        async_decode=async_decode,
+        decode_device=decode_device,
+        decode_num_threads=decode_num_threads,
+        num_dataloader_workers=num_dataloader_workers,
+        dataset_to_episodes_path=dataset_to_episodes_path,
+        temp_process=temp_process,
+        episode_chunk_size=episode_chunk_size,
     )
 
     return dataset
@@ -366,6 +457,18 @@ def main():
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
 
+    # 预训练参数
+    parser.add_argument("--pretrain", action="store_true",
+                        help="启用预训练模式（使用 LoLAPretrainStreamingDataset，per-sub-dataset 归一化）")
+    parser.add_argument("--dataset_to_episodes_path", type=str, default=None,
+                        help="dataset_to_episodes.json 路径（预训练模式必须）")
+    parser.add_argument("--sub_root", type=str, default=None,
+                        help="子数据集 stats.json 的根目录（预训练模式，默认与 root 相同）")
+    parser.add_argument("--temp_process", action="store_true",
+                        help="预训练模式：允许维度不匹配时用 0/1 填充归一化 stats")
+    parser.add_argument("--episode_chunk_size", type=int, default=8,
+                        help="预训练模式：每次加载的连续 episode 数（影响 I/O 效率）")
+
     args = parser.parse_args()
 
     if args.dataset_repo_id is None and args.dataset_root is None:
@@ -380,11 +483,19 @@ def main():
         strategy = "auto"
 
     # 获取数据集元数据
-    print(f"Loading dataset metadata from {args.dataset_repo_id or args.dataset_root}...")
-    dataset_metadata = LeRobotDatasetMetadata(
-        args.dataset_repo_id,
-        root=args.dataset_root,
-    )
+    if args.pretrain:
+        print(f"Loading pretrain dataset metadata from {args.dataset_repo_id or args.dataset_root}...")
+        dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(
+            args.dataset_repo_id,
+            root=args.dataset_root,
+            revision=None,
+        )
+    else:
+        print(f"Loading dataset metadata from {args.dataset_repo_id or args.dataset_root}...")
+        dataset_metadata = LeRobotDatasetMetadata(
+            args.dataset_repo_id,
+            root=args.dataset_root,
+        )
 
     features = dataset_to_policy_features(dataset_metadata.features)
     if "action" in features:
@@ -414,44 +525,79 @@ def main():
         history_padding_side=args.history_padding_side,
     )
 
+    # 预训练模式：归一化由 dataset 内部完成，processor 使用 IDENTITY
+    if args.pretrain:
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+
     # 创建流式数据集
-    print("Creating streaming dataset...")
-    train_dataset = create_lola_streaming_dataset(
-        repo_id=args.dataset_repo_id,
-        config=config,
-        root=args.dataset_root,
-        episodes=args.episodes,
-        max_history_length=args.max_history_length,
-        history_padding_side=args.history_padding_side,
-        buffer_size=args.buffer_size,
-        seed=args.streaming_seed,
-        shuffle=not args.no_shuffle,
-        deferred_video_decode=not args.no_deferred,
-        async_decode=args.async_decode,
-        decode_device=args.decode_device,
-        decode_num_threads=args.decode_num_threads,
-        num_dataloader_workers=args.num_workers,
-    )
+    AsyncLoaderClass = PretrainAsyncDecodeDataLoader if args.pretrain else StreamingAsyncDecodeDataLoader
+
+    if args.pretrain:
+        # if args.dataset_to_episodes_path is None:
+        # dataset_to_episodes_path is optional for local testing without per-sub-dataset normalization
+        print("Creating pretrain streaming dataset...")
+        train_dataset = create_lola_pretrain_streaming_dataset(
+            repo_id=args.dataset_repo_id,
+            config=config,
+            root=args.dataset_root,
+            sub_root=args.sub_root,
+            episodes=args.episodes,
+            max_history_length=args.max_history_length,
+            history_padding_side=args.history_padding_side,
+            buffer_size=args.buffer_size,
+            seed=args.streaming_seed,
+            shuffle=not args.no_shuffle,
+            deferred_video_decode=not args.no_deferred,
+            async_decode=args.async_decode,
+            decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
+            num_dataloader_workers=args.num_workers,
+            dataset_to_episodes_path=args.dataset_to_episodes_path,
+            temp_process=args.temp_process,
+            episode_chunk_size=args.episode_chunk_size,
+        )
+    else:
+        print("Creating streaming dataset...")
+        train_dataset = create_lola_streaming_dataset(
+            repo_id=args.dataset_repo_id,
+            config=config,
+            root=args.dataset_root,
+            episodes=args.episodes,
+            max_history_length=args.max_history_length,
+            history_padding_side=args.history_padding_side,
+            buffer_size=args.buffer_size,
+            seed=args.streaming_seed,
+            shuffle=not args.no_shuffle,
+            deferred_video_decode=not args.no_deferred,
+            async_decode=args.async_decode,
+            decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
+            num_dataloader_workers=args.num_workers,
+        )
 
     # IterableDataset 不使用 DistributedSampler，由数据集内部处理分片
-    # 使用 AsyncDecodeDataLoader 处理视频解码 + 变长序列 collate
+    # passthrough collate：AsyncDecodeDataLoader 会处理解码和 collate
     raw_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        collate_fn=lambda x: x,  # passthrough, AsyncDecodeDataLoader 会处理 collate
-        pin_memory=True,
+        collate_fn=lambda x: x,
     )
-    train_loader = AsyncDecodeDataLoader(
+    train_loader = AsyncLoaderClass(
         dataloader=raw_loader,
         dataset=train_dataset,
-        collate_fn=AsyncDecodeDataLoader.make_collate_fn(),
+        collate_fn=AsyncLoaderClass.make_collate_fn(),
     )
 
     # 创建模型
+    dataset_stats = {} if args.pretrain else dataset_metadata.stats
     model = LoLALightningModule(
         config=config,
-        dataset_stats=dataset_metadata.stats,
+        dataset_stats=dataset_stats,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
         train_vlm=args.train_vlm,
@@ -473,9 +619,10 @@ def main():
 
     # Logger
     logger_name = args.dataset_repo_id.replace('/', '-') if args.dataset_repo_id else os.path.basename(args.dataset_root)
+    suffix = "-pretrain" if args.pretrain else ""
     logger = WandbLogger(
         project="lola-multigpu-stream",
-        name=f"lola-{args.strategy}-{logger_name}",
+        name=f"lola-{args.strategy}-{logger_name}{suffix}",
         save_dir="logs",
     )
 
@@ -521,6 +668,12 @@ def main():
     print(f"History Padding Side: {args.history_padding_side}")
     print(f"Streaming: True")
     print(f"Buffer Size: {args.buffer_size}")
+    if args.pretrain:
+        print(f"Pretrain Mode: True")
+        print(f"Dataset to Episodes: {args.dataset_to_episodes_path}")
+        print(f"Sub Root: {args.sub_root}")
+        print(f"Temp Process: {args.temp_process}")
+        print(f"Episode Chunk Size: {args.episode_chunk_size}")
     print("=" * 60)
 
     # 开始训练

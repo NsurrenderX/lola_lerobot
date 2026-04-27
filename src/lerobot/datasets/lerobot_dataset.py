@@ -246,12 +246,16 @@ class LeRobotDatasetMetadata:
     @property
     def video_keys(self) -> list[str]:
         """Keys to access visual modalities stored as videos."""
-        return [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+        if not hasattr(self, "_cached_video_keys"):
+            self._cached_video_keys = [key for key, ft in self.features.items() if ft["dtype"] == "video"]
+        return self._cached_video_keys
 
     @property
     def camera_keys(self) -> list[str]:
         """Keys to access visual modalities (regardless of their storage method)."""
-        return [key for key, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+        if not hasattr(self, "_cached_camera_keys"):
+            self._cached_camera_keys = [key for key, ft in self.features.items() if ft["dtype"] in ["video", "image"]]
+        return self._cached_camera_keys
 
     @property
     def names(self) -> dict[str, list | dict]:

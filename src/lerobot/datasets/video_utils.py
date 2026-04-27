@@ -43,12 +43,145 @@ def get_safe_default_codec():
         return "pyav"
 
 
+def _probe_last_decodable(decoder, num_frames: int, probe_range: int = 10) -> int:
+    """Probe from the end of a video to find the last decodable frame index."""
+    actual_last = -1
+    probe_start = max(0, num_frames - 1)
+    probe_end = max(0, num_frames - 1 - probe_range)
+    for idx in range(probe_start, probe_end - 1, -1):
+        try:
+            decoder.get_frames_at(indices=[idx])
+            actual_last = idx
+            break
+        except RuntimeError:
+            continue
+
+    if actual_last == -1:
+        for idx in range(num_frames - 1, -1, -1):
+            try:
+                decoder.get_frames_at(indices=[idx])
+                actual_last = idx
+                break
+            except RuntimeError:
+                continue
+
+    return actual_last
+
+
+def _classify_single_video_seek_mode(video_path: str) -> str:
+    """Classify whether a video needs exact or approximate seek mode.
+
+    Opens with approximate, probes last decodable frame. If metadata num_frames
+    differs from what approximate seek can reach, re-probes with exact seek.
+    Returns "exact" if approximate has a seek issue, "approximate" otherwise.
+    """
+    from torchcodec.decoders import VideoDecoder
+
+    try:
+        fh = fsspec.open(video_path).__enter__()
+        dec = VideoDecoder(fh, seek_mode="approximate")
+        meta = dec.metadata
+        num_frames = meta.num_frames
+
+        approx_last = _probe_last_decodable(dec, num_frames)
+        delta_approx = (num_frames - 1) - approx_last if approx_last >= 0 else -1
+        fh.close()
+
+        if delta_approx > 0:
+            # Re-probe with exact seek to confirm it's a seek issue
+            fh = fsspec.open(video_path).__enter__()
+            dec = VideoDecoder(fh, seek_mode="exact")
+            exact_last = _probe_last_decodable(dec, num_frames)
+            delta_exact = (num_frames - 1) - exact_last if exact_last >= 0 else -1
+            fh.close()
+
+            if delta_exact == 0:
+                # Approximate seek can't reach last frames → use exact
+                return "exact"
+
+        return "approximate"
+    except Exception as e:
+        logging.warning(f"Failed to classify seek mode for {video_path}: {e}")
+        # Fallback to exact for safety
+        return "exact"
+
+
+def scan_video_seek_modes(dataset_root: str, num_workers: int = 8) -> dict[str, str]:
+    """Scan all videos in a dataset and return a path→seek_mode mapping.
+
+    Walks dataset_root/videos/, probes each video with approximate seek,
+    and switches to exact for any video where approximate seek can't reach
+    the last frame.
+
+    Args:
+        dataset_root: Dataset root directory (contains videos/ subdir).
+        num_workers: Number of parallel workers for probing.
+
+    Returns:
+        Dict mapping relative video path (relative to videos/) to
+        "approximate" or "exact" seek_mode.
+    """
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    videos_dir = os.path.join(dataset_root, "videos")
+    if not os.path.isdir(videos_dir):
+        logging.warning(f"No videos/ directory found at {dataset_root}, skipping seek-mode scan")
+        return {}
+
+    video_files = []
+    for root, dirs, files in os.walk(videos_dir):
+        for f in files:
+            if f.endswith(".mp4"):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, videos_dir)
+                video_files.append((full_path, rel_path))
+
+    video_files.sort(key=lambda x: x[1])
+
+    if not video_files:
+        return {}
+
+    total = len(video_files)
+    seek_modes = {}
+    exact_count = 0
+    start_time = time.time()
+
+    logging.info(f"Scanning {total} videos for seek-mode classification with {num_workers} workers...")
+
+    # Use ThreadPoolExecutor to avoid polars Rayon fork deadlock.
+    # ProcessPoolExecutor(fork) deadlocks if Rayon is already initialized
+    # in the parent process. ThreadPoolExecutor shares the parent's address
+    # space so no fork occurs, eliminating the deadlock risk entirely.
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(_classify_single_video_seek_mode, full_path): rel_path
+            for full_path, rel_path in video_files
+        }
+        for future in as_completed(futures):
+            rel_path = futures[future]
+            mode = future.result()
+            seek_modes[rel_path] = mode
+            if mode == "exact":
+                exact_count += 1
+
+    elapsed = time.time() - start_time
+    logging.info(
+        f"Seek-mode scan complete: {total} videos, {exact_count} need exact mode, "
+        f"{total - exact_count} use approximate. Time: {elapsed:.1f}s"
+    )
+
+    return seek_modes
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
     tolerance_s: float = 1e-4,
     tolerance_frames: int | None = None,
     backend: str | None = None,
+    seek_mode: str = "approximate",
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -60,6 +193,7 @@ def decode_video_frames(
         tolerance_frames (int | None): Max allowed frame offset. When set, tolerance_s is
             computed per-video from (tolerance_frames + 0.5) / average_fps.
         backend (str, optional): Backend to use for decoding.
+        seek_mode (str): Seek mode for torchcodec decoder ("approximate" or "exact").
 
     Returns:
         torch.Tensor: Decoded frames.
@@ -69,7 +203,7 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, tolerance_frames)
+        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, tolerance_frames, seek_mode=seek_mode)
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -177,68 +311,96 @@ def decode_video_frames_torchvision(
 class VideoDecoderCache:
     """Thread-safe cache for video decoders to avoid expensive re-initialization.
 
-    Stores each decoder alongside its resolution (H, W) extracted from metadata
-    at construction time.  On cache hit the stored resolution is compared against
-    the decoder's *current* metadata — if they diverge (which can happen with
-    AV1 dynamic-resolution streams) the stale entry is evicted and a fresh
-    decoder is created.  This prevents torchcodec's internal pre-allocated
-    tensor shape mismatch: ``RuntimeError: Expected pre-allocated tensor of
-    shape 480x640x3, got [360, 640, 3]``.
+    Stores each decoder alongside its resolution (H, W) and seek_mode
+    extracted from metadata at construction time.  On cache hit the stored
+    resolution is compared against the decoder's *current* metadata — if
+    they diverge (which can happen with AV1 dynamic-resolution streams)
+    the stale entry is evicted and a fresh decoder is created.
     """
 
     def __init__(self):
-        # _cache maps video_path -> (decoder, file_handle, cached_resolution)
+        # _cache maps video_path -> (decoder, file_handle, cached_resolution, seek_mode)
         # where cached_resolution is (height, width) from decoder.metadata at
         # the time the decoder was created.
-        self._cache: dict[str, tuple[Any, Any, tuple[int, int]]] = {}
+        self._cache: dict[str, tuple[Any, Any, tuple[int, int], str]] = {}
         self._lock = Lock()
 
-    def _make_decoder(self, video_path: str):
-        """Create a new VideoDecoder and return (decoder, file_handle, (H, W))."""
+    def _make_decoder(self, video_path: str, seek_mode: str = "approximate"):
+        """Create a new VideoDecoder and return (decoder, file_handle, (H, W), seek_mode)."""
         if importlib.util.find_spec("torchcodec"):
             from torchcodec.decoders import VideoDecoder
         else:
             raise ImportError("torchcodec is required but not available.")
 
         file_handle = fsspec.open(video_path).__enter__()
-        decoder = VideoDecoder(file_handle, seek_mode="approximate")
+        decoder = VideoDecoder(file_handle, seek_mode=seek_mode)
         meta = decoder.metadata
         resolution = (meta.height, meta.width)
-        return decoder, file_handle, resolution
+        return decoder, file_handle, resolution, seek_mode
 
-    def get_decoder(self, video_path: str):
+    def get_decoder(self, video_path: str, seek_mode: str = "approximate"):
         """Get a cached decoder or create a new one.
 
         On cache hit, validates that the stored resolution still matches the
         decoder's current metadata.  If the resolution has changed (dynamic-
-        resolution AV1 stream), the stale entry is evicted and rebuilt.
+        resolution AV1 stream) or the seek_mode differs, the stale entry is
+        evicted and rebuilt.
         """
         video_path = str(video_path)
 
         with self._lock:
             if video_path in self._cache:
-                decoder, file_handle, cached_res = self._cache[video_path]
-                meta = decoder.metadata
-                current_res = (meta.height, meta.width)
-                if current_res != cached_res:
-                    # Resolution changed — evict stale decoder
+                decoder, file_handle, cached_res, cached_seek = self._cache[video_path]
+                # Evict if seek_mode changed or resolution diverged
+                if cached_seek != seek_mode:
                     try:
                         file_handle.close()
                     except Exception:
                         pass
                     del self._cache[video_path]
+                else:
+                    meta = decoder.metadata
+                    current_res = (meta.height, meta.width)
+                    if current_res != cached_res:
+                        # Resolution changed — evict stale decoder
+                        try:
+                            file_handle.close()
+                        except Exception:
+                            pass
+                        del self._cache[video_path]
                     # Fall through to create a fresh decoder below
 
             if video_path not in self._cache:
-                decoder, file_handle, resolution = self._make_decoder(video_path)
-                self._cache[video_path] = (decoder, file_handle, resolution)
+                decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+                self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
 
             return self._cache[video_path][0]
+
+    def evict_and_rebuild(self, video_path: str, seek_mode: str = "approximate"):
+        """Force-evict a stale decoder entry and rebuild it from scratch.
+
+        Used when torchcodec raises "Expected pre-allocated tensor" RuntimeError
+        on a cached decoder whose internal buffer no longer matches the video's
+        output shape.  By evicting and rebuilding we get a fresh decoder with
+        correct pre-allocated tensor dimensions.
+        """
+        video_path = str(video_path)
+        with self._lock:
+            if video_path in self._cache:
+                _, file_handle, _, _ = self._cache[video_path]
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+                del self._cache[video_path]
+            decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+            self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
+            return decoder
 
     def clear(self):
         """Clear the cache and close file handles."""
         with self._lock:
-            for _, file_handle, _ in self._cache.values():
+            for _, file_handle, _, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
 
@@ -264,6 +426,7 @@ def decode_video_frames_torchcodec(
     tolerance_frames: int | None = None,
     log_loaded_timestamps: bool = False,
     decoder_cache: VideoDecoderCache | None = None,
+    seek_mode: str = "approximate",
 ) -> torch.Tensor | list[torch.Tensor]:
     """Loads frames associated with the requested timestamps of a video using torchcodec.
 
@@ -271,13 +434,22 @@ def decode_video_frames_torchcodec(
         tolerance_s: Fallback tolerance in seconds (used only when tolerance_frames is None).
         tolerance_frames: Max allowed frame offset. When set, tolerance_s is computed as
             (tolerance_frames + 0.5) / average_fps, adapting to each video's actual fps.
+        seek_mode: Seek mode for VideoDecoder ("approximate" or "exact").
     """
     from torchcodec.decoders import VideoDecoder
     import torchvision # 用于 Fallback
 
     video_path_str = str(video_path)
-    file_handle = fsspec.open(video_path_str).__enter__()
-    decoder = VideoDecoder(file_handle, seek_mode="approximate")
+
+    # Use cached decoder when available, avoiding expensive per-call re-init
+    use_cache = decoder_cache is not None
+    file_handle = None  # only needed for fresh-decoder path
+
+    if use_cache:
+        decoder = decoder_cache.get_decoder(video_path_str, seek_mode)
+    else:
+        file_handle = fsspec.open(video_path_str).__enter__()
+        decoder = VideoDecoder(file_handle, seek_mode=seek_mode)
 
     try:
         # get metadata for frame information
@@ -302,29 +474,50 @@ def decode_video_frames_torchcodec(
         except RuntimeError as e:
             err_msg = str(e)
             if "Expected pre-allocated tensor" in err_msg:
-                # =====================================================================
-                # 终极 Fallback：torchcodec 绝对无法处理单文件变分辨率。
-                # 此时果断退化到原生 PyAV 后端来单独处理这个变异的视频。
-                # =====================================================================
-                logging.warning(f"Dynamic resolution detected in {video_path_str}. Falling back to PyAV.")
-                torchvision.set_video_backend("pyav")
-                reader = torchvision.io.VideoReader(video_path_str, "video")
+                # When using a cached decoder, the internal pre-allocated buffer
+                # may mismatch after resolution changes.  Evict and rebuild first.
+                eviction_retry_ok = False
+                if use_cache:
+                    logging.warning(
+                        f"torchcodec pre-allocated tensor mismatch in cached decoder for "
+                        f"{video_path_str}. Evicting and rebuilding."
+                    )
+                    decoder = decoder_cache.evict_and_rebuild(video_path_str, seek_mode)
+                    try:
+                        frame_batch = decoder.get_frames_at(indices=frame_indices)
+                        loaded_frames = frame_batch.data
+                        loaded_ts = frame_batch.pts_seconds
+                        eviction_retry_ok = True
+                    except RuntimeError as e_retry:
+                        # Rebuilt decoder still fails — fall through to PyAV fallback
+                        err_msg = str(e_retry)
+                        if "Expected pre-allocated tensor" not in err_msg:
+                            raise
 
-                first_ts = min(timestamps)
-                last_ts = max(timestamps)
-                reader.seek(first_ts, keyframes_only=True)
+                if not eviction_retry_ok:
+                    # =====================================================================
+                    # 终极 Fallback：torchcodec 绝对无法处理单文件变分辨率。
+                    # 此时果断退化到原生 PyAV 后端来单独处理这个变异的视频。
+                    # =====================================================================
+                    logging.warning(f"Dynamic resolution detected in {video_path_str}. Falling back to PyAV.")
+                    torchvision.set_video_backend("pyav")
+                    reader = torchvision.io.VideoReader(video_path_str, "video")
 
-                single_frames = []
-                single_pts = []
-                for frame in reader:
-                    current_ts = frame["pts"]
-                    single_frames.append(frame["data"])
-                    single_pts.append(current_ts)
-                    if current_ts >= last_ts:
-                        break
+                    first_ts = min(timestamps)
+                    last_ts = max(timestamps)
+                    reader.seek(first_ts, keyframes_only=True)
 
-                loaded_frames = single_frames
-                loaded_ts = single_pts
+                    single_frames = []
+                    single_pts = []
+                    for frame in reader:
+                        current_ts = frame["pts"]
+                        single_frames.append(frame["data"])
+                        single_pts.append(current_ts)
+                        if current_ts >= last_ts:
+                            break
+
+                    loaded_frames = single_frames
+                    loaded_ts = single_pts
             elif "no more frames left to decode" in err_msg.lower() or "out of bounds" in err_msg.lower():
                 # =====================================================================
                 # Fallback：metadata.num_frames 不准确，部分 frame_indices 超出
@@ -437,10 +630,13 @@ def decode_video_frames_torchcodec(
         return closest_frames
 
     finally:
-        try:
-            file_handle.close()
-        except Exception:
-            pass
+        # Only close file_handle for fresh-decoder path; cached decoder
+        # manages its own file handle lifecycle.
+        if not use_cache and file_handle is not None:
+            try:
+                file_handle.close()
+            except Exception:
+                pass
 
 
 def encode_video_frames(

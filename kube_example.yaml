@@ -1,0 +1,66 @@
+description: This is an example configuration file for submitting jobs to Bonete
+env_defaults:
+  NODES: 1 # The number of nodes you want to use
+  GPUS: 2 # number of gpus per node
+  JOB_NAME: bonete-test-bonete
+
+target:
+  service: volcano # sing for singularity, no need to change
+  queue: bonete81
+
+environment: # select the image, clone your code, install the packages
+  registry: nvcr.io
+  image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+  setup:
+    - apt-get update
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y git wget curl rsync ca-certificates
+    - git clone https://github.com/NsurrenderX/lola_lerobot.git && cd lola_lerobot
+    - wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh
+    - bash /tmp/miniforge.sh -b -p /opt/conda
+    - rm /tmp/miniforge.sh
+    - export PATH="/opt/conda/bin:$$PATH"
+    - conda create -n lerobot python==3.13 -y
+    - conda run --name lerobot conda install ffmpeg==7.1.1 -c conda-forge -y
+    - conda run --name lerobot pip install -e ".[pi]"
+    - conda run --name lerobot pip install torch==2.10 torchvision==0.25 torchcodec==0.10 --index-url https://download.pytorch.org/whl/cu128
+    - conda run --name lerobot pip install accelerate pytest deepspeed polars 
+    - conda run --name lerobot pip install datasets==4.1.1
+    - conda run --name lerobot pip install termcolor pytorch_lightning
+    - conda run --name lerobot pip install transformers==5.2.0 diffusers==0.37.0
+    - conda run --name lerobot pip install numpy==1.26.4
+    - conda clean -afy
+
+code:
+  local_dir: $CONFIG_DIR/
+
+data:
+  storage_id: my_output
+
+jobs:
+
+  - name: $JOB_NAME # the job name you will see on the portal. Though not important, you'd better carefully set it for clarity.
+    sku: ${NODES}xG${GPUS} # determinate the GPU you will use, please refer to the official docs for more information 
+    process_count_per_node: 1 # usually 1
+
+    submit_args:
+      env:
+        AMLT_PERSISTENT_VOLUME_NAME: pvc-vast-bonete81
+        AMLT_PERSISTENT_VOLUME_MOUNT_DIR: /mnt/pvc
+        MASTER_PORT: "45667"
+        AMLT_CPU_REQUEST_RATIO: 0.10417
+        AMLT_MEMORY_REQUEST_RATIO: 1
+      container_args:
+        cpus: 20
+        memory: 1404GI
+
+    command:
+      - cd /mnt/pvc
+      - ls
+      - nvidia-smi
+      - cd && cd lola_lerobot
+      - which conda
+      - which python
+      - conda run --name lerobot python -c "import sys; print(sys.executable)"
+      - conda run --name lerobot which python
+      - conda run --name lerobot which torchrun
+      - echo "Hello"

@@ -19,7 +19,7 @@ SAVE_INTERVAL=5000
 
 # 数据集参数
 DATASET_REPO_ID=""
-DATASET_ROOT="/data_6t_2/lerobot_v30/simpler_bridge_v3"
+DATASET_ROOT="/data_6t_1/lerobot-v30/merged_0422_sub1/"
 
 # 模型参数
 VLM_PATH="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/"
@@ -42,7 +42,11 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --log_every_n_steps ${LOG_EVERY_N_STEPS} \
     --save_every_n_steps ${SAVE_INTERVAL} \
     --vlm_path ${VLM_PATH} \
-    --train_vlm "
+    --num_workers 8 \
+    --buffer_size 5000 \
+    --decode_num_threads 2 \
+    --pretrain \
+    --temp_process"
 
 # 如果启用完整历史action加载
 if [ "$LOAD_FULL_HISTORY" = true ]; then

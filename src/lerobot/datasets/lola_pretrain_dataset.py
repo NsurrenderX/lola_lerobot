@@ -73,6 +73,7 @@ from lerobot.datasets.utils import (
     EPISODES_DIR,
     check_version_compatibility,
     find_float_index,
+    find_float_index_or_none,
     get_delta_indices,
     is_float_in_list,
     item_to_torch,
@@ -80,7 +81,7 @@ from lerobot.datasets.utils import (
     load_stats,
     load_tasks,
 )
-from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec
+from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec, scan_video_seek_modes
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 logger = logging.getLogger(__name__)
@@ -92,9 +93,9 @@ logger = logging.getLogger(__name__)
 class BoundedVideoDecoderCache(VideoDecoderCache):
     """VideoDecoderCache with capacity limit to bound per-worker memory.
 
-    Inherits resolution-validation logic from VideoDecoderCache: on cache hit
-    the stored resolution is checked against the decoder's current metadata.
-    If it diverges (dynamic-resolution AV1), the stale entry is evicted.
+    Inherits resolution-validation and seek_mode logic from VideoDecoderCache:
+    on cache hit the stored resolution and seek_mode are checked against
+    current requirements.  If they diverge, the stale entry is evicted.
     """
 
     def __init__(self, max_size: int = 4):
@@ -102,38 +103,70 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
         self._max_size = max_size
         self._key_order: list[str] = []
 
-    def get_decoder(self, video_path: str):
+    def get_decoder(self, video_path: str, seek_mode: str = "approximate"):
         video_path = str(video_path)
 
         with self._lock:
             if video_path in self._cache:
-                decoder, file_handle, cached_res = self._cache[video_path]
-                meta = decoder.metadata
-                current_res = (meta.height, meta.width)
-                if current_res != cached_res:
+                decoder, file_handle, cached_res, cached_seek = self._cache[video_path]
+                # Evict if seek_mode changed
+                if cached_seek != seek_mode:
                     try:
                         file_handle.close()
                     except Exception:
                         pass
                     del self._cache[video_path]
                     self._key_order.remove(video_path)
+                else:
+                    meta = decoder.metadata
+                    current_res = (meta.height, meta.width)
+                    if current_res != cached_res:
+                        try:
+                            file_handle.close()
+                        except Exception:
+                            pass
+                        del self._cache[video_path]
+                        self._key_order.remove(video_path)
 
             if video_path not in self._cache:
                 while len(self._cache) >= self._max_size and self._key_order:
                     oldest_key = self._key_order.pop(0)
                     if oldest_key in self._cache:
-                        _, old_handle, _ = self._cache.pop(oldest_key)
+                        _, old_handle, _, _ = self._cache.pop(oldest_key)
                         old_handle.close()
 
-                decoder, file_handle, resolution = self._make_decoder(video_path)
-                self._cache[video_path] = (decoder, file_handle, resolution)
+                decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+                self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
                 self._key_order.append(video_path)
 
             return self._cache[video_path][0]
 
+    def evict_and_rebuild(self, video_path: str, seek_mode: str = "approximate"):
+        """Force-evict a stale decoder and rebuild, respecting capacity limit."""
+        video_path = str(video_path)
+        with self._lock:
+            if video_path in self._cache:
+                _, file_handle, _, _ = self._cache[video_path]
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+                del self._cache[video_path]
+                self._key_order.remove(video_path)
+            # Enforce capacity before creating new entry
+            while len(self._cache) >= self._max_size and self._key_order:
+                oldest_key = self._key_order.pop(0)
+                if oldest_key in self._cache:
+                    _, old_handle, _, _ = self._cache.pop(oldest_key)
+                    old_handle.close()
+            decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+            self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
+            self._key_order.append(video_path)
+            return decoder
+
     def clear(self):
         with self._lock:
-            for _, file_handle, _ in self._cache.values():
+            for _, file_handle, _, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
             self._key_order.clear()
@@ -289,17 +322,17 @@ class _ParquetRowReader:
     across epochs -- avoiding repeated mmap setup overhead.
     """
 
-    def __init__(self, parquet_files: list[str], file_cumsum: list[int]):
+    def __init__(self, parquet_files: list[str], file_cumsum: list[int], max_cache_size: int = 16):
         self._parquet_files = parquet_files
         self._file_cumsum = file_cumsum
         self._table_cache: dict[int, "pyarrow.Table"] = {}
+        self._max_cache_size = max_cache_size
 
     def _get_table(self, file_idx: int):
         if file_idx not in self._table_cache:
             path = self._parquet_files[file_idx]
             self._table_cache[file_idx] = pq.read_table(path, memory_map=True)
-            # Evict oldest entries if cache exceeds 3 files (~60MB per file for typical sizes)
-            while len(self._table_cache) > 3:
+            while len(self._table_cache) > self._max_cache_size:
                 oldest = next(iter(self._table_cache))
                 del self._table_cache[oldest]
         return self._table_cache[file_idx]
@@ -324,9 +357,12 @@ class _ParquetRowReader:
             local_end = min(end_idx - file_start, file_end - file_start)
             table = self._get_table(file_idx)
             slice_table = table.slice(local_start, local_end - local_start)
-            for i in range(slice_table.num_rows):
-                row = slice_table.slice(i, 1).to_pydict()
-                rows.append({k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in row.items()})
+            # Convert entire slice to columnar dict once (much faster than per-row to_pydict)
+            col_dict = slice_table.to_pydict()
+            n_rows = slice_table.num_rows
+            for i in range(n_rows):
+                row = {k: v[i] if isinstance(v, list) else v for k, v in col_dict.items()}
+                rows.append(row)
             current = file_start + local_end
         return rows
 
@@ -500,11 +536,27 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             self._episode_ends[ep_idx] = ep["dataset_to_index"]
 
         # Row reader (will be shared per-worker via fork)
-        self._row_reader = _ParquetRowReader(self._parquet_files, self._file_cumsum)
+        self._row_reader = _ParquetRowReader(self._parquet_files, self._file_cumsum, max_cache_size=16)
 
-        # Video decoder caches (initialized lazily in __getitem__)
+        # Video decoder caches (initialized lazily per-worker in _ensure_decoder_cache)
         self.video_decoder_cache = None
         self._cuda_decoder_cache = None
+
+        # Pre-compute sets for fast membership checks (avoid repeated property calls)
+        self._video_keys_set = set(self.meta.video_keys)
+        self._cached_video_keys_list = self.meta.video_keys
+        self._cached_camera_keys_list = self.meta.camera_keys
+
+        # Pre-build task name lookup for O(1) access instead of pandas iloc
+        self._task_names = [self.meta.tasks.iloc[i].name for i in range(len(self.meta.tasks))]
+
+        # ── Seek-mode mapping (scan videos at init) ────────────────
+        self._video_seek_modes: dict[str, str] = {}
+        if self.streaming_from_local and os.path.isdir(os.path.join(str(self.root), "videos")):
+            self._video_seek_modes = scan_video_seek_modes(str(self.root), num_workers=8)
+            exact_count = sum(1 for v in self._video_seek_modes.values() if v == "exact")
+            print(f"[LoLAPretrainDataset] seek-mode scan: {len(self._video_seek_modes)} videos, "
+                  f"{exact_count} require exact mode")
 
         # ── Per-sub-dataset normalization setup ──────────────────────
         self._episode_to_ds_idx = np.full(self.meta.total_episodes, -1, dtype=np.int16)
@@ -649,6 +701,10 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         # Ensure decoder caches are initialized (lazily, per-worker)
         self._ensure_decoder_cache()
 
+        # Pre-cache frequently accessed properties as locals for this getitem call
+        video_keys = self.meta.video_keys
+        camera_keys = self.meta.camera_keys
+
         # 1. Read the primary row
         row = self._row_reader.read_row(idx)
         item = item_to_torch(self._row_to_item(row))
@@ -658,14 +714,14 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         ep_idx = bisect.bisect_right(self._episode_starts, idx) - 1
 
         # 2. Video decode (always in getitem)
-        if len(self.meta.video_keys) > 0:
+        if len(video_keys) > 0:
             current_ts = item["index"] / self.fps
             episode_boundaries_ts = {
                 key: (
                     self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
                     self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
                 )
-                for key in self.meta.video_keys
+                for key in video_keys
             }
             original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
             query_timestamps = self._get_query_timestamps(
@@ -690,7 +746,10 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         item = self._add_history_actions_map(idx, ep_idx, item)
 
         # 5. Post-processing
-        item["task"] = self.meta.tasks.iloc[item["task_index"]].name
+        task_idx = item["task_index"]
+        if isinstance(task_idx, torch.Tensor):
+            task_idx = task_idx.item()
+        item["task"] = self._task_names[task_idx]
         item = self._apply_camera_valid_mask(item, ep_idx)
         item = self._normalize_per_subdataset(item, temp_process=self.temp_process)
         ds_idx = (
@@ -728,7 +787,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
     # ── Delta frames (map-style, replaces Backtrackable) ─────────────
 
     def _get_delta_frames_map(self, idx: int, ep_idx: int, current_item: dict):
-        """Compute delta frames using direct index math instead of Backtrackable."""
+        """Compute delta frames using batch row reading instead of per-delta read_row."""
         ep_start = int(self._episode_starts[ep_idx])
         ep_end = int(self._episode_ends[ep_idx])
 
@@ -736,28 +795,62 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         padding = {}
 
         for key, delta_indices in self.delta_indices.items():
-            if key in self.meta.video_keys:
+            if key in self._video_keys_set:
                 continue
 
-            target_frames = []
+            # Collect valid target indices and their positions
+            valid_indices = []
+            valid_positions = []
             is_pad = []
 
-            for delta in delta_indices:
+            for pos, delta in enumerate(delta_indices):
                 target_idx = idx + delta
                 if ep_start <= target_idx < ep_end:
-                    row = self._row_reader.read_row(target_idx)
-                    row_item = item_to_torch(self._row_to_item(row))
-                    target_frames.append(row_item[key])
+                    valid_indices.append(target_idx)
+                    valid_positions.append(pos)
                     is_pad.append(False)
                 else:
-                    target_frames.append(current_item[key])
                     is_pad.append(True)
+
+            # Batch-read all valid indices at once
+            target_frames = []
+            if valid_indices:
+                batch_rows = self._batch_read_indices(valid_indices)
+                idx_to_row = {valid_indices[i]: batch_rows[i] for i in range(len(valid_indices))}
+                for pos, delta in enumerate(delta_indices):
+                    target_idx = idx + delta
+                    if ep_start <= target_idx < ep_end:
+                        row_item = item_to_torch(self._row_to_item(idx_to_row[target_idx]))
+                        target_frames.append(row_item[key])
+                    else:
+                        target_frames.append(current_item[key])
+            else:
+                # All delta indices are padding
+                for _ in delta_indices:
+                    target_frames.append(current_item[key])
 
             if target_frames:
                 query_result[key] = torch.stack(target_frames)
                 padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
 
         return query_result, padding
+
+    def _batch_read_indices(self, indices: list[int]) -> list[dict]:
+        """Batch-read rows for a list of indices by grouping into contiguous ranges."""
+        if not indices:
+            return []
+        rows = []
+        range_start = indices[0]
+        range_end = range_start + 1
+        for i in range(1, len(indices)):
+            if indices[i] == range_end:
+                range_end += 1
+            else:
+                rows.extend(self._row_reader.read_rows_range(range_start, range_end))
+                range_start = indices[i]
+                range_end = range_start + 1
+        rows.extend(self._row_reader.read_rows_range(range_start, range_end))
+        return rows
 
     # ── History actions (map-style, replaces Backtrackable.history()) ─
 
@@ -837,10 +930,17 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
     # ── Video decode (always in getitem) ─────────────────────────────
 
     def _ensure_decoder_cache(self):
-        """No-op — decoders are no longer cached to avoid torchcodec
-        pre-allocated tensor shape mismatch across different-resolution videos.
-        Kept for backward-compatible call sites."""
-        pass
+        """Lazily initialize per-worker decoder caches after fork.
+
+        Initialized in __getitem__ rather than __init__ so that each
+        DataLoader worker (forked from the main process) gets its own
+        cache instance rather than sharing the parent's (which would
+        cause thread-safety issues with torchcodec).
+        """
+        if self.video_decoder_cache is None:
+            self.video_decoder_cache = BoundedVideoDecoderCache(max_size=8)
+        if self._cuda_decoder_cache is None:
+            self._cuda_decoder_cache = BoundedVideoDecoderCache(max_size=4)
 
     def _query_videos(self, query_timestamps, ep_idx, skip_invalid=True):
         """Query video frames, optionally skipping invalid cameras."""
@@ -862,14 +962,23 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             )
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
 
+            # Look up seek_mode from init-time scan mapping
+            # get_video_file_path returns "videos/key/chunk/file.mp4",
+            # scan mapping keys are "key/chunk/file.mp4" (relative to videos/)
+            video_rel = str(self.meta.get_video_file_path(ep_idx, video_key))
+            if video_rel.startswith("videos/"):
+                video_rel = video_rel[len("videos/"):]
+            seek_mode = self._video_seek_modes.get(video_rel, "approximate")
+
             try:
                 if self.decode_device == "cuda":
-                    frames = self._decode_video_cuda(video_path, query_ts)
+                    frames = self._decode_video_cuda(video_path, query_ts, seek_mode=seek_mode)
                 else:
                     frames = decode_video_frames_torchcodec(
                         video_path, query_ts, self.tolerance_s,
                         tolerance_frames=self.tolerance_frames,
                         decoder_cache=self.video_decoder_cache,
+                        seek_mode=seek_mode,
                     )
             except Exception as e:
                 logging.error(
@@ -885,57 +994,62 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
         return item
 
-    def _decode_video_cuda(self, video_path, timestamps):
-        """Decode video frames using CUDA (NVDEC).
+    def _decode_video_cuda(self, video_path, timestamps, seek_mode="approximate"):
+        """Decode video frames using CUDA (NVDEC) with decoder caching.
 
-        Always creates a fresh decoder per call to avoid torchcodec's internal
-        pre-allocated tensor shape mismatch across videos of different resolutions.
+        Uses per-worker _cuda_decoder_cache to avoid expensive per-call
+        VideoDecoder re-initialization.  On "Expected pre-allocated tensor"
+        RuntimeError, evicts the stale decoder and retries with a fresh one.
         """
         from torchcodec.decoders import VideoDecoder
 
         video_path_str = str(video_path)
-        file_handle = fsspec.open(video_path_str).__enter__()
+        decoder = self._cuda_decoder_cache.get_decoder(video_path_str, seek_mode)
+        # Note: we don't manage file_handle — the cache owns it
+
+        metadata = decoder.metadata
+        average_fps = metadata.average_fps
+        num_frames = metadata.num_frames
+
+        # Compute tolerance_s from tolerance_frames if provided
+        effective_tol_s = self.tolerance_s
+        if self.tolerance_frames is not None:
+            effective_tol_s = (self.tolerance_frames + 0.5) / average_fps
+
+        frame_indices = [round(ts * average_fps) for ts in timestamps]
+        clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
+        frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
 
         try:
-            decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-
-            metadata = decoder.metadata
-            average_fps = metadata.average_fps
-            num_frames = metadata.num_frames
-
-            # Compute tolerance_s from tolerance_frames if provided
-            effective_tol_s = self.tolerance_s
-            if self.tolerance_frames is not None:
-                effective_tol_s = (self.tolerance_frames + 0.5) / average_fps
-
-            frame_indices = [round(ts * average_fps) for ts in timestamps]
-            clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
-            frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
-
-            # Batch decode — safe because decoder is fresh, no stale pre-allocated buffer
             frame_batch = decoder.get_frames_at(indices=frame_indices)
-            loaded_frames = frame_batch.data      # (T, C, H, W) uint8 on cuda
-            loaded_ts = frame_batch.pts_seconds   # (T,) float
+        except RuntimeError as e:
+            if "Expected pre-allocated tensor" in str(e):
+                logging.warning(
+                    f"torchcodec CUDA pre-allocated tensor mismatch for "
+                    f"{video_path_str}. Evicting and rebuilding."
+                )
+                decoder = self._cuda_decoder_cache.evict_and_rebuild(video_path_str, seek_mode)
+                frame_batch = decoder.get_frames_at(indices=frame_indices)
+            else:
+                raise
 
-            query_ts_tensor = torch.tensor(timestamps)
-            loaded_ts_tensor = torch.tensor(loaded_ts.tolist()) if not isinstance(loaded_ts, torch.Tensor) else loaded_ts
-            dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
-            min_, argmin_ = dist.min(1)
-            clamped_mask_tensor = torch.tensor(clamped_mask)
-            is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
-            assert is_within_tol.all(), (
-                f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
-                f"video: {video_path}"
-            )
+        loaded_frames = frame_batch.data      # (T, C, H, W) uint8 on cuda
+        loaded_ts = frame_batch.pts_seconds   # (T,) float
 
-            closest_frames = loaded_frames[argmin_].cpu()
-            closest_frames = (closest_frames / 255.0).type(torch.float32)
-            return closest_frames
-        finally:
-            try:
-                file_handle.close()
-            except Exception:
-                pass
+        query_ts_tensor = torch.tensor(timestamps)
+        loaded_ts_tensor = torch.tensor(loaded_ts.tolist()) if not isinstance(loaded_ts, torch.Tensor) else loaded_ts
+        dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
+        min_, argmin_ = dist.min(1)
+        clamped_mask_tensor = torch.tensor(clamped_mask)
+        is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
+        assert is_within_tol.all(), (
+            f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
+            f"video: {video_path}"
+        )
+
+        closest_frames = loaded_frames[argmin_].cpu()
+        closest_frames = (closest_frames / 255.0).type(torch.float32)
+        return closest_frames
 
     # ── Timestamp and padding helpers ────────────────────────────────
 
@@ -946,7 +1060,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
                 for key in self.delta_timestamps
             }
         else:
-            return dict.fromkeys(self.meta.video_keys, [start_ts])
+            return dict.fromkeys(self._cached_video_keys_list, [start_ts])
 
     def _make_padding_camera_frame(self, camera_key):
         return torch.zeros(self.meta.info["features"][camera_key]["shape"]).permute(-1, 0, 1)
@@ -954,7 +1068,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
     def _get_query_timestamps(self, current_ts, query_indices=None, episode_boundaries_ts=None):
         query_timestamps = {}
         keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices)
-        for key in self.meta.video_keys:
+        for key in self._cached_video_keys_list:
             if query_indices is not None and key in query_indices:
                 timestamps = keys_to_timestamps[key]
                 query_timestamps[key] = torch.clamp(
@@ -973,8 +1087,8 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             mask = []
             padding_frame = self._make_padding_camera_frame(video_key)
             for ts in timestamps:
-                if is_float_in_list(ts, query_timestamps[video_key]):
-                    idx = find_float_index(ts, query_timestamps[video_key])
+                idx = find_float_index_or_none(ts, query_timestamps[video_key])
+                if idx >= 0:
                     frames.append(video_frames[video_key][idx, :])
                     mask.append(False)
                 else:
@@ -1003,7 +1117,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         camera_valid_mask = {}
         ep_meta = self.meta.episodes[ep_idx]
 
-        for cam_key in self.meta.camera_keys:
+        for cam_key in self._cached_camera_keys_list:
             is_valid_key = f"videos/{cam_key}/is_valid"
             is_valid = ep_meta.get(is_valid_key, 1)
             camera_valid_mask[cam_key] = (is_valid == 1)
@@ -1019,16 +1133,23 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
 
     # ── Per-sub-dataset normalization ────────────────────────────────
 
+    _norm_mask_cache: dict[int, torch.Tensor] = {}
+
     @staticmethod
     def _make_translation_norm_mask(action_dim: int) -> torch.Tensor:
-        """Build normalization mask: only translation dims need normalization."""
-        mask = torch.zeros(action_dim, dtype=torch.bool)
-        arm_dim = 10
-        num_arms = action_dim // arm_dim
-        for arm in range(num_arms):
-            offset = arm * arm_dim
-            mask[offset : offset + 3] = True
-        return mask
+        """Build normalization mask: only translation dims need normalization.
+
+        Cached per action_dim to avoid repeated allocation.
+        """
+        if action_dim not in LoLAPretrainDataset._norm_mask_cache:
+            mask = torch.zeros(action_dim, dtype=torch.bool)
+            arm_dim = 10
+            num_arms = action_dim // arm_dim
+            for arm in range(num_arms):
+                offset = arm * arm_dim
+                mask[offset : offset + 3] = True
+            LoLAPretrainDataset._norm_mask_cache[action_dim] = mask
+        return LoLAPretrainDataset._norm_mask_cache[action_dim]
 
     def _normalize_per_subdataset(self, item, temp_process=False):
         """Per-sub-dataset normalization for observation.state, action, hist_actions_full."""

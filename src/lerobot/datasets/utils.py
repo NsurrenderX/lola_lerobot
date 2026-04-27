@@ -1209,6 +1209,16 @@ def find_float_index(target, float_list, threshold=1e-6):
     return -1
 
 
+def find_float_index_or_none(target, float_list, threshold=1e-6):
+    """Single-pass: find index of target in float_list, or return -1 if not found.
+    Combines is_float_in_list + find_float_index into one scan.
+    """
+    for i, x in enumerate(float_list):
+        if abs(target - x) <= threshold:
+            return i
+    return -1
+
+
 class LookBackError(Exception):
     """
     Exception raised when trying to look back in the history of a Backtrackable object.

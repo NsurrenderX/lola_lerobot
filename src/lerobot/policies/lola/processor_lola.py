@@ -199,18 +199,17 @@ class LolaImageProcessor(ObservationProcessorStep):
         """
         Extracts and prepares images for Qwen3.5 vision encoder.
 
-        Args:
-            observation: The observation dictionary containing image data.
-
-        Returns:
-            Updated observation with '_lola_images' key containing PIL Images list.
+        Supports both single-item inference and batched training:
+        - Batch mode: observation.images.* values are list[PIL.Image | None] of length B.
+          Produces '_lola_images_per_item': list[list[PIL.Image]] of length B.
+        - Single-item mode: values are single PIL Images or tensors.
+          Produces '_lola_images': list[PIL.Image].
         """
         new_observation = dict(observation)
 
         # Determine camera keys
         camera_keys = self.camera_keys
         if camera_keys is None:
-            # Auto-detect camera keys (keys starting with 'observation.images.')
             camera_keys = [k for k in observation.keys() if k.startswith('observation.images.')]
 
         if not camera_keys:
@@ -222,43 +221,78 @@ class LolaImageProcessor(ObservationProcessorStep):
         # self.transition, mirroring how LolaQwenProcessor reads "task".
         camera_valid_mask = observation.get('camera_valid_mask', {})
         if not camera_valid_mask:
-            # Fallback: check complementary_data via transition
             if hasattr(self, 'transition') and self.transition is not None:
                 from lerobot.processor.core import TransitionKey
                 comp_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
                 camera_valid_mask = comp_data.get('camera_valid_mask', {})
 
-        images = []
+        # Detect batch mode: camera values are lists of B items (from collate)
+        first_cam_data = None
         for cam_key in camera_keys:
-            if cam_key not in observation:
-                continue
+            if cam_key in observation:
+                first_cam_data = observation[cam_key]
+                break
 
-            # Skip invalid cameras
-            if not camera_valid_mask.get(cam_key, True):
-                continue
+        is_batch = (
+            isinstance(first_cam_data, list)
+            and len(first_cam_data) > 0
+            and isinstance(first_cam_data[0], (Image.Image, type(None)))
+        )
 
-            img_data = observation[cam_key]
+        if is_batch:
+            batch_size = len(first_cam_data)
 
-            # Handle list format (dynamic resolution from DataLoader collate)
-            if isinstance(img_data, list):
-                for img in img_data:
+            # camera_valid_mask: list[dict] of length B, or single dict (broadcast)
+            if isinstance(camera_valid_mask, list):
+                per_item_masks = camera_valid_mask
+            else:
+                per_item_masks = [camera_valid_mask] * batch_size
+
+            # Build per-item image lists
+            images_per_item = [[] for _ in range(batch_size)]
+            for cam_key in camera_keys:
+                if cam_key not in observation:
+                    continue
+                cam_images = observation[cam_key]  # list[PIL | None] of length B
+                for i in range(batch_size):
+                    cam_valid = (
+                        per_item_masks[i].get(cam_key, True)
+                        if isinstance(per_item_masks[i], dict)
+                        else True
+                    )
+                    if not cam_valid:
+                        continue
+                    img = cam_images[i]
                     if img is not None:
                         if isinstance(img, Image.Image):
-                            images.append(img)
+                            images_per_item[i].append(img)
                         elif isinstance(img, torch.Tensor) and img.dim() == 3:
-                            # Legacy fallback: convert tensor to PIL
-                            images.append(self._tensor_to_pil(img))
-            elif isinstance(img_data, Image.Image):
-                images.append(img_data)
-            elif isinstance(img_data, torch.Tensor) and img_data.dim() == 3:
-                # Legacy fallback: single tensor [C, H, W]
-                images.append(self._tensor_to_pil(img_data))
-            elif isinstance(img_data, dict) and 'image' in img_data:
-                images.append(img_data['image'])
+                            images_per_item[i].append(self._tensor_to_pil(img))
 
-        # Store processed images for later use in chat template
-        if images:
-            new_observation['_lola_images'] = images
+            new_observation['_lola_images_per_item'] = images_per_item
+        else:
+            # Single-item mode (inference): flatten as before
+            images = []
+            for cam_key in camera_keys:
+                if cam_key not in observation:
+                    continue
+                cam_valid = (
+                    camera_valid_mask.get(cam_key, True)
+                    if isinstance(camera_valid_mask, dict)
+                    else True
+                )
+                if not cam_valid:
+                    continue
+                img_data = observation[cam_key]
+                if isinstance(img_data, Image.Image):
+                    images.append(img_data)
+                elif isinstance(img_data, torch.Tensor) and img_data.dim() == 3:
+                    images.append(self._tensor_to_pil(img_data))
+                elif isinstance(img_data, dict) and 'image' in img_data:
+                    images.append(img_data['image'])
+
+            if images:
+                new_observation['_lola_images'] = images
 
         return new_observation
 
@@ -319,79 +353,83 @@ class LolaQwenProcessor(ObservationProcessorStep):
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
         Processes images and text using Qwen3.5's chat template.
-        
-        Args:
-            observation: The observation dictionary containing:
-                        - '_lola_images': List of PIL Images (from LolaImageProcessor)
-                        - Other observation data
-                        
-        Returns:
-            Updated observation with:
-            - 'input_ids': Token IDs from Qwen3.5 processor
-            - 'attention_mask': Attention mask
-            - 'pixel_values': Processed image tensors (if images present)
-            - 'image_grid_thw': Image grid information (if images present)
+
+        Supports batch mode (_lola_images_per_item) and single-item mode (_lola_images).
+        Batch mode uses apply_chat_template with padding=True for proper [B, seq_len] output.
         """
         new_observation = dict(observation)
-        
+
         # Get task from complementary_data
         task = None
         if hasattr(self, 'transition') and self.transition is not None:
             from lerobot.processor.core import TransitionKey
             complementary_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
             task = complementary_data.get(self.task_key, "Perform the robot task.")
-        
+
         if task is None:
             task = "Perform the robot task."
-        
-        # Get images
-        images = observation.get('_lola_images', [])
-        
-        # Build message for Qwen3.5 chat template
-        # Reference from test.py: uses messages format with image and text content
-        content = []
-        
-        # Add images first (Qwen3.5 expects images before text in content)
-        for img in images:
-            content.append({"type": "image", "image": img})
-        
-        # Add text prompt
-        content.append({"type": "text", "text": task})
-        
-        messages = [
-            {
-                "role": "user",
-                "content": content,
-            }
-        ]
-        
-        # Use apply_chat_template as in test.py
-        # This handles tokenization and image processing internally
-        inputs = self.qwen_processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        
+
+        # Check for batch mode
+        images_per_item = observation.get('_lola_images_per_item', None)
+
+        if images_per_item is not None:
+            # Batch mode: one conversation per item
+            batch_size = len(images_per_item)
+
+            # Handle task: list[str] of length B, or single string (broadcast)
+            if isinstance(task, list):
+                per_item_tasks = task
+            else:
+                per_item_tasks = [task] * batch_size
+
+            messages = []
+            for i in range(batch_size):
+                content = []
+                for img in images_per_item[i]:
+                    content.append({"type": "image", "image": img})
+                content.append({"type": "text", "text": per_item_tasks[i]})
+                messages.append([{"role": "user", "content": content}])
+
+            self.qwen_processor.tokenizer.padding_side = 'left'
+            inputs = self.qwen_processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                padding=True,
+            )
+        else:
+            # Single-item mode (inference)
+            images = observation.get('_lola_images', [])
+            content = []
+            for img in images:
+                content.append({"type": "image", "image": img})
+            content.append({"type": "text", "text": task if isinstance(task, str) else str(task)})
+            messages = [[{"role": "user", "content": content}]]
+
+            inputs = self.qwen_processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+
         # Extract outputs
         new_observation[OBS_LANGUAGE_TOKENS] = inputs["input_ids"]
-        new_observation["attention_mask"] = inputs["attention_mask"]
-        
+        new_observation[OBS_LANGUAGE_ATTENTION_MASK] = inputs["attention_mask"]
+
         # Add visual features if present
         if "pixel_values" in inputs:
             new_observation["pixel_values"] = inputs["pixel_values"]
         if "image_grid_thw" in inputs:
             new_observation["image_grid_thw"] = inputs["image_grid_thw"]
-        
-        # Clean up temporary image storage
-        if '_lola_images' in new_observation:
-            del new_observation['_lola_images']
 
-        # Clean up camera_valid_mask and camera key observations (not needed downstream)
-        if 'camera_valid_mask' in new_observation:
-            del new_observation['camera_valid_mask']
+        # Clean up temporary image storage
+        for key in ['_lola_images', '_lola_images_per_item', 'camera_valid_mask']:
+            if key in new_observation:
+                del new_observation[key]
         # Remove camera key observations (PIL Image / None / tensor) — already processed into pixel_values
         for key in list(new_observation.keys()):
             if key.startswith('observation.images.'):

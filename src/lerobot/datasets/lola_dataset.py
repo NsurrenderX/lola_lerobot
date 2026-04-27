@@ -23,11 +23,13 @@ LoLA专用数据集，支持加载从episode开始到当前帧的完整历史act
 - 支持左侧padding以处理变长历史序列
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from typing import Callable
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.video_utils import decode_video_frames, scan_video_seek_modes
 
 
 class LoLADataset(LeRobotDataset):
@@ -107,11 +109,40 @@ class LoLADataset(LeRobotDataset):
         else:
             self.action_dim = 1  # fallback
 
+        # ── Seek-mode mapping (scan videos at init) ────────────────
+        self._video_seek_modes: dict[str, str] = {}
+        if os.path.isdir(os.path.join(str(self.root), "videos")):
+            self._video_seek_modes = scan_video_seek_modes(str(self.root), num_workers=8)
+            exact_count = sum(1 for v in self._video_seek_modes.values() if v == "exact")
+            print(f"[LoLADataset] seek-mode scan: {len(self._video_seek_modes)} videos, "
+                  f"{exact_count} require exact mode")
+
         print(f"[LoLADataset] max_history_length: {max_history_length}")
         print(f"[LoLADataset] action_chunk_size: {action_chunk_size}")
         print(f"[LoLADataset] history_padding_side: {history_padding_side}")
         print(f"[LoLADataset] action_dim: {self.action_dim}")
-    
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+        """Override parent _query_videos to pass seek_mode from init-time scan."""
+        ep = self.meta.episodes[ep_idx]
+        item = {}
+        for vid_key, query_ts in query_timestamps.items():
+            from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
+            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
+            video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+
+            # Look up seek_mode from init-time scan mapping
+            video_rel = str(self.meta.get_video_file_path(ep_idx, vid_key))
+            if video_rel.startswith("videos/"):
+                video_rel = video_rel[len("videos/"):]
+            seek_mode = self._video_seek_modes.get(video_rel, "approximate")
+
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend, seek_mode=seek_mode)
+            item[vid_key] = frames.squeeze(0)
+
+        return item
+
     def __getitem__(self, idx) -> dict:
         """
         获取数据项，包含完整历史action。

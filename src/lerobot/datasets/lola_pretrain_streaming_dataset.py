@@ -15,62 +15,38 @@
 # limitations under the License.
 
 """
-LoLA Pretrain Streaming Dataset -- pretraining version of LoLAStreamingDataset.
+LoLA Pretrain Streaming Dataset -- episode-aligned chunk loading version.
 
-Additional features over LoLAStreamingDataset:
-- Per-sub-dataset normalization: loads dataset_to_episodes.json to map episodes
-  to sub-datasets, then normalizes observation.state, action, and hist_actions_full
-  using per-sub-dataset stats (mean/std) from each sub-dataset's meta/stats.json.
-- Camera validity handling: supports is_valid=0 camera episodes by skipping
-  decoding and providing None images + camera_valid_mask for the model processor.
-- Dynamic resolution collate: camera keys are kept as lists of PIL Images or None
-  in the collate function, allowing the Qwen3.5 processor to handle transforms.
-- Dimension info: each item includes action_dim and state_dim from the sub-dataset,
-  enabling the model to handle heterogeneous action/state spaces.
+Key design: load contiguous chunks of episodes from parquet, process with
+vectorized numpy operations (no Backtrackable), and shuffle at chunk level
+with strided worker distribution for global diversity + I/O efficiency.
 
-Usage:
-    dataset = LoLAPretrainStreamingDataset(
-        repo_id="lerobot/pusht",
-        max_history_length=100,
-        action_chunk_size=10,
-        delta_timestamps={...},
-        streaming=True,
-        dataset_to_episodes_path="/path/to/dataset_to_episodes.json",
-    )
-
-    for item in dataset:
-        # item["observation.state"]: normalized per sub-dataset
-        # item["action"]: normalized per sub-dataset
-        # item["hist_actions_full"]: normalized (mask=True parts only)
-        # item["camera_valid_mask"]: {cam_key: bool}
-        # item["action_dim"], item["state_dim"]: int
-        # item[cam_key]: PIL Image (valid) or None (invalid)
+Performance vs old streaming version:
+- Memory: ~20-40MB/worker (1 episode + buffer) vs 15-30GB (full DataFrame)
+- Row access: np_array[i] O(1) vs df.row(pos) O(n)
+- History/delta: array slice/index O(1) vs peek_back/peek_ahead O(n)
+- Shuffle: episode chunk shuffle + buffer (5000) vs buffer-only (1000)
 """
 
-import importlib
-import importlib.util
+import bisect
 import concurrent.futures
 import json
 import logging
 import os
 import pickle
-import queue
 import threading
 from dataclasses import dataclass, field
 
 import fsspec
 import numpy as np
-import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
     EPISODES_DIR,
-    Backtrackable,
-    LookAheadError,
-    LookBackError,
     check_version_compatibility,
-    find_float_index,
     get_delta_indices,
     is_float_in_list,
     item_to_torch,
@@ -78,17 +54,11 @@ from lerobot.datasets.utils import (
     load_stats,
     load_tasks,
 )
-from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec
+from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec, scan_video_seek_modes
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
 def _safe_stack_frames(frames: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
-    """Stack frames into a 4D tensor if spatial dims match; return list otherwise.
-
-    Dynamic-resolution AV1 videos can produce frames with different H/W across
-    the same decode call.  torch.stack would raise in that case, so we fall
-    back to returning the raw list and let downstream code handle it.
-    """
     try:
         return torch.stack(frames)
     except RuntimeError:
@@ -96,44 +66,33 @@ def _safe_stack_frames(frames: list[torch.Tensor]) -> torch.Tensor | list[torch.
 
 
 def _frames_get(frames: torch.Tensor | list[torch.Tensor], idx: int) -> torch.Tensor:
-    """Index into decoded frames (4D Tensor or List[Tensor])."""
     if isinstance(frames, list):
         return frames[idx]
     return frames[idx]
 
 
 def _frames_len(frames: torch.Tensor | list[torch.Tensor]) -> int:
-    """Return number of decoded frames."""
     if isinstance(frames, list):
         return len(frames)
     return frames.shape[0]
 
 
 def _maybe_squeeze(frames: torch.Tensor | list[torch.Tensor], n_ts: int):
-    """Squeeze batch dim when only 1 timestamp was queried.
-
-    For a 4D Tensor: squeeze(0) -> [C, H, W].
-    For List[Tensor]: return the single element directly.
-    """
     if n_ts == 1:
         if isinstance(frames, list):
             return frames[0]
         return frames.squeeze(0)
     return frames
 
+
 logger = logging.getLogger(__name__)
 
 
 class BoundedVideoDecoderCache(VideoDecoderCache):
-    """带容量上限的 VideoDecoderCache，避免缓存过多解码器占用内存。
+    """VideoDecoderCache with capacity limit and seek_mode support.
 
-    当缓存数量超过 max_size 时，自动淘汰最早加入的解码器。
-    对于有大量视频文件的场景（如 17 个 mp4），限制缓存大小可显著
-    降低每个 worker 的内存占用（每个 VideoDecoder 约 200MB）。
-
-    Inherits resolution-validation logic from VideoDecoderCache: on cache hit
-    the stored resolution is checked against the decoder's current metadata.
-    If it diverges (dynamic-resolution AV1), the stale entry is evicted.
+    On cache hit, checks stored seek_mode and resolution. Evicts stale entries
+    when they diverge from current requirements.
     """
 
     def __init__(self, max_size: int = 4):
@@ -141,78 +100,99 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
         self._max_size = max_size
         self._key_order: list[str] = []
 
-    def get_decoder(self, video_path: str):
+    def get_decoder(self, video_path: str, seek_mode: str = "approximate"):
         video_path = str(video_path)
 
         with self._lock:
             if video_path in self._cache:
-                decoder, file_handle, cached_res = self._cache[video_path]
-                meta = decoder.metadata
-                current_res = (meta.height, meta.width)
-                if current_res != cached_res:
+                decoder, file_handle, cached_res, cached_seek = self._cache[video_path]
+                # Evict if seek_mode changed
+                if cached_seek != seek_mode:
                     try:
                         file_handle.close()
                     except Exception:
                         pass
                     del self._cache[video_path]
                     self._key_order.remove(video_path)
+                else:
+                    meta = decoder.metadata
+                    current_res = (meta.height, meta.width)
+                    if current_res != cached_res:
+                        try:
+                            file_handle.close()
+                        except Exception:
+                            pass
+                        del self._cache[video_path]
+                        self._key_order.remove(video_path)
 
             if video_path not in self._cache:
-                # 超过容量时淘汰最早的解码器
                 while len(self._cache) >= self._max_size and self._key_order:
                     oldest_key = self._key_order.pop(0)
                     if oldest_key in self._cache:
-                        _, old_handle, _ = self._cache.pop(oldest_key)
+                        _, old_handle, _, _ = self._cache.pop(oldest_key)
                         old_handle.close()
 
-                decoder, file_handle, resolution = self._make_decoder(video_path)
-                self._cache[video_path] = (decoder, file_handle, resolution)
+                decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+                self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
                 self._key_order.append(video_path)
 
             return self._cache[video_path][0]
 
+    def evict_and_rebuild(self, video_path: str, seek_mode: str = "approximate"):
+        video_path = str(video_path)
+        with self._lock:
+            if video_path in self._cache:
+                _, file_handle, _, _ = self._cache[video_path]
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+                del self._cache[video_path]
+                self._key_order.remove(video_path)
+            while len(self._cache) >= self._max_size and self._key_order:
+                oldest_key = self._key_order.pop(0)
+                if oldest_key in self._cache:
+                    _, old_handle, _, _ = self._cache.pop(oldest_key)
+                    old_handle.close()
+            decoder, file_handle, resolution, seek_mode = self._make_decoder(video_path, seek_mode)
+            self._cache[video_path] = (decoder, file_handle, resolution, seek_mode)
+            self._key_order.append(video_path)
+            return decoder
+
     def clear(self):
         with self._lock:
-            for _, file_handle, _ in self._cache.values():
+            for _, file_handle, _, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
             self._key_order.clear()
 
 
 class _DecodeError:
-    """Wrapper to propagate exceptions from decode thread to main thread."""
-
     def __init__(self, exc: Exception):
         self.exception = exc
 
 
 @dataclass
 class DecodeProcessConfig:
-    """可 pickle 的解码配置，传递给解码子进程。
-
-    将解码所需的所有数据集属性提取为纯数据对象，
-    避免传递整个 LoLAPretrainStreamingDataset（含 fsspec 文件句柄等，不可 pickle）。
-    """
-
+    """Picklable decode config for subprocess pipeline."""
     root: str
     streaming_from_local: bool
     tolerance_s: float
+    tolerance_frames: int | None
     camera_keys: list
     delta_indices: object  # dict or None
-    video_path_template: str  # meta.video_path format string
+    video_path_template: str
     url_root: str
-    # 预提取的 episode 视频路径映射: ep_idx -> video_key -> (chunk_index, file_index)
     episode_video_map: dict
-    camera_shapes: dict  # camera_key -> shape list, for padding frame
+    camera_shapes: dict
     decode_device: str
     decode_num_threads: int
     cache_size_per_thread: int
-    # Pre-extracted episode is_valid map: ep_idx -> {cam_key -> bool}
     episode_is_valid_map: dict = field(default_factory=dict)
+    video_seek_modes: dict = field(default_factory=dict)
 
 
 def _resolve_video_path(config: DecodeProcessConfig, ep_idx: int, video_key: str) -> str:
-    """从 config 重建视频文件路径（等价于 meta.get_video_file_path）。"""
     chunk_idx, file_idx = config.episode_video_map[ep_idx][video_key]
     fpath = config.video_path_template.format(
         video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
@@ -222,12 +202,10 @@ def _resolve_video_path(config: DecodeProcessConfig, ep_idx: int, video_key: str
 
 
 def _make_padding_frame(camera_shapes: dict, camera_key: str) -> torch.Tensor:
-    """创建全零 padding 帧（等价于 _make_padding_camera_frame）。"""
     return torch.zeros(camera_shapes[camera_key]).permute(-1, 0, 1)
 
 
 def _compute_padding_mask(config: DecodeProcessConfig, video_frames, query_timestamps, original_timestamps):
-    """计算视频帧 padding mask（等价于 _get_video_frame_padding_mask）。"""
     padding_mask = {}
     for video_key, timestamps in original_timestamps.items():
         if video_key not in video_frames:
@@ -248,24 +226,12 @@ def _decode_process_main(
     result_queue,
     shutdown_event,
 ):
-    """解码子进程入口函数。
-
-    在子进程中重建解码基础设施（ThreadPoolExecutor + per-thread cache），
-    然后进入与旧 AsyncDecodePipeline 相同的解码循环。
-
-    Args:
-        config: 解码配置（可 pickle 的纯数据对象）
-        light_queue: torch.multiprocessing.Queue，接收轻量级帧
-        result_queue: torch.multiprocessing.Queue，返回解码后的帧
-        shutdown_event: torch.multiprocessing.Event，关闭信号
-    """
-    # 1. 创建 ThreadPoolExecutor（batch 内并行解码）
+    """Decode subprocess entry point."""
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=config.decode_num_threads,
         thread_name_prefix="DecodeWorker",
     )
 
-    # 2. Per-thread VideoDecoder cache（与旧 AsyncDecodePipeline 相同机制）
     tls = threading.local()
     all_caches = []
     caches_lock = threading.Lock()
@@ -287,26 +253,32 @@ def _decode_process_main(
                 all_caches.append(cache)
         return tls.cuda_decoder_cache
 
-    # 3. 视频查询函数（等价于旧 AsyncDecodePipeline._query_videos_cached）
     def query_videos(query_timestamps, ep_idx):
         item = {}
         for video_key, query_ts in query_timestamps.items():
             video_path = _resolve_video_path(config, ep_idx, video_key)
 
+            # Look up seek_mode
+            video_rel = video_path
+            if "/videos/" in video_rel:
+                video_rel = video_rel[video_rel.index("/videos/") + len("/videos/"):]
+            seek_mode = config.video_seek_modes.get(video_rel, "approximate")
+
             if config.decode_device == "cuda":
                 frames = _decode_video_cuda_in_process(
-                    config, video_path, query_ts, get_thread_cuda_cache
+                    config, video_path, query_ts, get_thread_cuda_cache, seek_mode
                 )
             else:
                 frames = decode_video_frames_torchcodec(
                     video_path, query_ts, config.tolerance_s,
+                    tolerance_frames=config.tolerance_frames,
                     decoder_cache=get_thread_cache(),
+                    seek_mode=seek_mode,
                 )
 
             item[video_key] = _maybe_squeeze(frames, len(query_ts))
         return item
 
-    # 4. 单 item 解码函数
     def decode_one(item):
         if "_video_lookup" not in item:
             return item
@@ -328,11 +300,8 @@ def _decode_process_main(
 
         video_frames = query_videos(q_timestamps, ep_idx)
 
-        # No image_transforms -- Qwen3.5 processor handles image transforms internally
-
         item_copy.update(video_frames)
 
-        # Handle invalid cameras: replace with padding frame
         is_valid_map = config.episode_is_valid_map.get(ep_idx, {})
         for cam_key in config.camera_keys:
             if not is_valid_map.get(cam_key, True):
@@ -346,15 +315,13 @@ def _decode_process_main(
 
         return item_copy
 
-    # 5. 主循环
     while not shutdown_event.is_set():
         try:
             items = light_queue.get(block=True, timeout=0.5)
         except Exception:
-            # queue.Empty or other queue exceptions
             continue
 
-        if items is None:  # Shutdown sentinel
+        if items is None:
             break
 
         try:
@@ -366,7 +333,6 @@ def _decode_process_main(
             except Exception:
                 pass
 
-    # 6. 清理
     executor.shutdown(wait=False)
     with caches_lock:
         for cache in all_caches:
@@ -376,57 +342,48 @@ def _decode_process_main(
                 pass
 
 
-def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache):
-    """在解码子进程中使用 CUDA 解码视频帧。"""
+def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache, seek_mode="approximate"):
+    """CUDA video decode in subprocess."""
     from torchcodec.decoders import VideoDecoder
 
     cache = get_cuda_cache()
     video_path_str = str(video_path)
 
-    with cache._lock:
-        if video_path_str not in cache._cache:
-            file_handle = fsspec.open(video_path_str).__enter__()
-            decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-            cache._cache[video_path_str] = (decoder, file_handle)
-            cache._key_order.append(video_path_str)
-            # Evict if over capacity
-            while len(cache._cache) > cache._max_size:
-                oldest_key = cache._key_order.pop(0)
-                old_decoder, old_handle = cache._cache.pop(oldest_key)
-                try:
-                    old_handle.close()
-                except Exception:
-                    pass
-        else:
-            # Update access order (LRU)
-            if video_path_str in cache._key_order:
-                cache._key_order.remove(video_path_str)
-            cache._key_order.append(video_path_str)
+    decoder = cache.get_decoder(video_path_str, seek_mode)
 
-    decoder = cache._cache[video_path_str][0]
-
-    # Decode frames
     metadata = decoder.metadata
     average_fps = metadata.average_fps
     num_frames = metadata.num_frames
+
+    effective_tol_s = config.tolerance_s
+    if config.tolerance_frames is not None:
+        effective_tol_s = (config.tolerance_frames + 0.5) / average_fps
+
     frame_indices = [round(ts * average_fps) for ts in timestamps]
     clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
     frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
 
-    # GPU decode -> CPU
+    try:
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+    except RuntimeError as e:
+        if "Expected pre-allocated tensor" in str(e):
+            logging.warning(f"CUDA pre-allocated tensor mismatch for {video_path_str}. Evicting and rebuilding.")
+            decoder = cache.evict_and_rebuild(video_path_str, seek_mode)
+            frames_batch = decoder.get_frames_at(indices=frame_indices)
+        else:
+            raise
+
     loaded_frames = [frame.cpu() for frame in frames_batch.data]
     loaded_ts = [pts.item() for pts in frames_batch.pts_seconds]
 
-    # Tolerance check
     query_ts_tensor = torch.tensor(timestamps)
     loaded_ts_tensor = torch.tensor(loaded_ts)
     dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
     min_, argmin_ = dist.min(1)
     clamped_mask_tensor = torch.tensor(clamped_mask)
-    is_within_tol = (min_ < config.tolerance_s) | clamped_mask_tensor
+    is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
     assert is_within_tol.all(), (
-        f"Timestamp tolerance violated: {min_[~is_within_tol]} > {config.tolerance_s=}. "
+        f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
         f"video: {video_path}"
     )
 
@@ -439,23 +396,7 @@ def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache
 
 
 class DecodeProcessPipeline:
-    """独立子进程视频解码管线，带持久化 per-thread VideoDecoder cache。
-
-    与旧 AsyncDecodePipeline（线程）的区别：
-    - 使用 torch.multiprocessing.Process 而非 threading.Thread
-    - 独立 GIL，Python 层代码也可真并行
-    - torch.multiprocessing.Queue 零拷贝传输 tensor（Linux fd sharing）
-    - 内存由队列深度控制：result_queue(maxsize=1) 最多缓冲 1 个解码 batch
-
-    Pipeline timeline:
-        主进程:       [fetch N] [consume decoded N-1] [train N-1] [consume decoded N] [train N] ...
-        解码子进程:           [decode N (parallel)]                  [decode N+1 (parallel)] ...
-
-    子进程内部:
-        - ThreadPoolExecutor(decode_num_threads) 并行解码 batch 内多个 item
-        - 每个线程有自己的 BoundedVideoDecoderCache（threading.local）
-        - torchcodec 释放 GIL，C 层 FFmpeg 真并行
-    """
+    """Independent subprocess video decode pipeline with per-thread cache."""
 
     def __init__(
         self,
@@ -479,246 +420,121 @@ class DecodeProcessPipeline:
         )
         self._process.start()
 
-        # 注册 atexit 清理，防止主进程 crash 留下僵尸进程
         import atexit
         atexit.register(self.shutdown)
 
     def submit(self, items: list[dict]) -> None:
-        """Submit lightweight items for decoding. Blocks if queue is full."""
         self._light_queue.put(items, block=True)
 
     def consume(self) -> list[dict]:
-        """Get decoded items. Blocks until available. Raises on decode error."""
         result = self._result_queue.get(block=True)
         if isinstance(result, _DecodeError):
             raise result.exception
         return result
 
     def shutdown(self) -> None:
-        """Signal shutdown, drain queues, and wait for process to exit."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
 
         self._shutdown_event.set()
-        # Drain light_queue to unblock the process if it's waiting on put
         try:
             while not self._light_queue.empty():
                 self._light_queue.get_nowait()
         except Exception:
             pass
-        # Put a None sentinel to unblock the process if it's waiting on get
         try:
             self._light_queue.put(None, block=False)
         except Exception:
             pass
-        # Wait for process to finish
         self._process.join(timeout=10.0)
         if self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=5.0)
 
 
+def _safe_concat_tables(tables: list[pa.Table]) -> pa.Table:
+    """Safely concatenate pyarrow Tables with different columns/types.
+    Handles missing columns (null-fill) and type mismatches (promotion).
+    Replaces polars _safe_concat to avoid Rayon fork deadlock."""
+    if len(tables) == 1:
+        return tables[0]
 
-def _safe_concat(dfs: list[pl.DataFrame]) -> pl.DataFrame:
-    """安全合并多个 polars DataFrame，处理列顺序不同和类型不兼容的情况。
-
-    合并多个子数据集的 parquet 文件时可能遇到：
-    1. 列顺序不同（如一个文件 episode_index 在前，另一个 timestamp 在前）
-    2. 同名列类型不同（如 stats/frame_index/min 在不同文件中为 Int64 vs Float64）
-
-    策略：先按第一个 df 的列顺序对齐所有 df，再 vertical_relaxed concat。
-    对于只存在于部分 df 的列，用 null 填充。
-    对于类型不兼容的同名列，尝试统一到兼容类型。
-    """
-    if len(dfs) == 1:
-        return dfs[0]
-
-    # 收集所有列名（按首次出现顺序，保持一致）
     all_cols: list[str] = []
-    seen = set()
-    for df in dfs:
-        for c in df.columns:
+    seen: set[str] = set()
+    for tbl in tables:
+        for c in tbl.column_names:
             if c not in seen:
                 all_cols.append(c)
                 seen.add(c)
 
-    # 对齐每个 df 的列：缺失列补 null，按 all_cols 顺序 select
-    aligned = []
-    for df in dfs:
-        existing = set(df.columns)
-        # 补缺失列
-        null_cols = [c for c in all_cols if c not in existing]
+    unified_types: dict[str, pa.DataType] = {}
+    for tbl in tables:
+        for c in tbl.column_names:
+            col_type = tbl.schema.field(c).type
+            if c not in unified_types:
+                unified_types[c] = col_type
+            else:
+                existing = unified_types[c]
+                if existing != col_type:
+                    if pa.types.is_floating(existing) and pa.types.is_floating(col_type):
+                        unified_types[c] = pa.float64()
+                    elif pa.types.is_integer(existing) and pa.types.is_integer(col_type):
+                        unified_types[c] = pa.int64()
+                    elif pa.types.is_list(existing) and pa.types.is_list(col_type):
+                        existing_val = existing.value_type
+                        new_val = col_type.value_type
+                        if existing_val != new_val:
+                            if pa.types.is_floating(existing_val) and pa.types.is_floating(new_val):
+                                unified_types[c] = pa.list_(pa.float64())
+                            elif pa.types.is_integer(existing_val) and pa.types.is_integer(new_val):
+                                unified_types[c] = pa.list_(pa.int64())
+
+    aligned: list[pa.Table] = []
+    for tbl in tables:
+        existing_cols = set(tbl.column_names)
+
+        cast_fields: dict[str, pa.DataType] = {}
+        for c in tbl.column_names:
+            current_type = tbl.schema.field(c).type
+            target_type = unified_types[c]
+            if current_type != target_type:
+                cast_fields[c] = target_type
+
+        if cast_fields:
+            new_schema = pa.schema([
+                pa.field(c, cast_fields.get(c, tbl.schema.field(c).type))
+                for c in tbl.column_names
+            ])
+            tbl = tbl.cast(new_schema)
+
+        null_cols = [c for c in all_cols if c not in existing_cols]
         if null_cols:
-            df = df.with_columns([pl.lit(None).alias(c) for c in null_cols])
-        # 按 all_cols 顺序 select
-        try:
-            df = df.select(all_cols)
-        except pl.exceptions.SchemaError:
-            # 类型不兼容：逐列处理，将不兼容的列 cast 到公共类型
-            selected = []
-            for col in all_cols:
-                if col in existing:
-                    selected.append(pl.col(col))
-                else:
-                    selected.append(pl.lit(None).alias(col))
-            df = df.select(selected)
-        aligned.append(df)
+            for c in null_cols:
+                null_arr = pa.nulls(tbl.num_rows, type=unified_types[c])
+                tbl = tbl.append_column(c, null_arr)
 
-    return pl.concat(aligned, how="vertical_relaxed")
+        tbl = tbl.select(all_cols)
+        aligned.append(tbl)
 
-
-class PolarsRowIterator:
-    """
-    使用 polars 读取 parquet 文件并逐行生成 dict，替代 HF IterableDataset。
-
-    采用文件级懒加载策略：只读取当前 worker 行范围覆盖的那些 parquet 文件，
-    跳过不相关的文件。对于 2M+ episode 的大规模数据集（~15GB parquet，
-    数十个文件），每个 worker 只需加载 ~1/N 的 parquet 数据到内存，
-    避免所有 worker 都加载全量数据导致内存爆炸。
-
-    生成的 dict 格式与 HF IterableDataset 一致，确保 item_to_torch、
-    make_frame、_add_history_actions 等下游逻辑无需修改。
-    """
-
-    def __init__(self, parquet_paths: list[str], episodes: list[int] | None = None,
-                 row_offset: int = 0, row_limit: int | None = None):
-        """
-        Args:
-            parquet_paths: parquet 文件路径列表（按顺序读取）
-            episodes: 如果指定，只迭代这些 episode 的行
-            row_offset: 全局行偏移（跳过前 N 行）
-            row_limit: 最多读取 N 行（在偏移之后）
-        """
-        import pyarrow.parquet as pq
-
-        # -- episodes 过滤模式：使用 polars lazy scan + filter --
-        if episodes is not None:
-            dfs = []
-            for path in parquet_paths:
-                df = pl.scan_parquet(path).filter(
-                    pl.col("episode_index").is_in(episodes)
-                ).collect()
-                if df.height > 0:
-                    dfs.append(df)
-            if dfs:
-                self._df = _safe_concat(dfs)
-                if self._df.height > 0:
-                    total = self._df.height
-                    start = min(row_offset, total)
-                    end = total if row_limit is None else min(start + row_limit, total)
-                    self._df = self._df.slice(start, end - start)
-            else:
-                self._df = pl.DataFrame()
-            self._pos = 0
-            self._len = self._df.height
-            return
-
-        # -- 无 episodes 过滤：文件级懒加载 --
-        # Step 1: 快速扫描元数据，获取每个文件的行数（不读取数据）
-        file_infos: list[tuple[str, int, int]] = []  # (path, num_rows, global_start)
-        global_offset = 0
-        for path in parquet_paths:
-            pf = pq.ParquetFile(path)
-            n = pf.metadata.num_rows
-            file_infos.append((path, n, global_offset))
-            global_offset += n
-        total_global_rows = global_offset
-
-        if total_global_rows == 0:
-            self._df = pl.DataFrame()
-            self._pos = 0
-            self._len = 0
-            return
-
-        # Step 2: 确定目标行范围
-        target_start = row_offset
-        target_end = total_global_rows if row_limit is None else min(row_offset + row_limit, total_global_rows)
-
-        if target_start >= total_global_rows:
-            self._df = pl.DataFrame()
-            self._pos = 0
-            self._len = 0
-            return
-
-        # Step 3: 只读取与目标行范围有交集的 parquet 文件
-        dfs = []
-        for path, file_rows, file_global_start in file_infos:
-            file_global_end = file_global_start + file_rows
-            # 该文件是否与目标范围有交集？
-            if file_global_end <= target_start or file_global_start >= target_end:
-                continue
-
-            # 计算该文件内的局部切片范围
-            local_start = max(0, target_start - file_global_start)
-            local_end = min(file_rows, target_end - file_global_start)
-
-            # 使用 lazy scan + slice 下推读取
-            df = pl.scan_parquet(path).slice(local_start, local_end - local_start).collect()
-            if df.height > 0:
-                dfs.append(df)
-
-        if not dfs:
-            self._df = pl.DataFrame()
-        else:
-            self._df = _safe_concat(dfs)
-
-        self._pos = 0
-        self._len = self._df.height
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._pos >= self._len:
-            raise StopIteration
-        row = self._df.row(self._pos, named=True)
-        self._pos += 1
-        return self._row_to_dict(row)
-
-    def _row_to_dict(self, row: dict) -> dict:
-        """将 polars 行转为与 HF IterableDataset 输出一致的 dict 格式。"""
-        result = {}
-        for key, val in row.items():
-            if isinstance(val, list):
-                # list columns (observation.state, action) -> numpy array
-                result[key] = np.array(val, dtype=np.float32)
-            elif isinstance(val, (int, np.integer)):
-                result[key] = int(val)
-            elif isinstance(val, (float, np.floating)):
-                result[key] = float(val)
-            else:
-                result[key] = val
-        return result
+    return pa.concat_tables(aligned)
 
 
 def _discover_parquet_files(root: str) -> list[str]:
-    """发现数据目录下所有 chunk/file parquet 文件，按顺序排列。"""
     from pathlib import Path
     data_dir = Path(root) / "data"
     if not data_dir.exists():
-        raise FileNotFoundError(f"数据目录不存在: {data_dir}")
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
     files = sorted(data_dir.glob("*/*.parquet"))
     return [str(f) for f in files]
 
 
 def _load_episodes_polars(root) -> list[dict]:
-    """使用 polars 加载 episodes 元数据，避免 HF datasets 的 CastError。
-
-    当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含
-    不同的列（因为不同子数据集有不同的 camera keys，产生不同的
-    stats/ 和 videos/ 列）。HF datasets 的 Dataset.from_parquet()
-    会尝试统一 schema 并进行 cast，导致 "column names don't match" 错误。
-
-    polars 的 vertical_relaxed 策略可以安全合并列不完全一致的 parquet 文件，
-    缺失的列自动填充 null，不会报错。
-    只保留非 stats/ 列（与原 load_episodes 的 select_columns 行为一致）。
-
-    Returns:
-        list[dict]: 按 episode_index 排序的 episode 元数据列表，
-        每个 dict 包含 data/chunk_index, videos/.../from_timestamp 等字段。
-    """
+    """Load episodes metadata using pyarrow to avoid initializing polars Rust
+    Rayon thread pool in the parent process (which causes fork deadlock in
+    DataLoader workers that later fork)."""
     from pathlib import Path
+    import pandas as pd
 
     episodes_dir = Path(root) / EPISODES_DIR
     if not episodes_dir.exists():
@@ -728,50 +544,32 @@ def _load_episodes_polars(root) -> list[dict]:
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files in {episodes_dir}")
 
-    dfs = []
+    tables = []
     for path in parquet_files:
-        df = pl.scan_parquet(str(path)).collect()
-        if df.height > 0:
-            # Drop stats/ columns before concat to avoid type mismatch
-            # (e.g. stats/frame_index/min may be List(Int64) in some files
-            # and List(Float64) in others, which prevents diagonal concat).
-            # These columns are not needed (same as original load_episodes behavior).
-            non_stats_cols = [c for c in df.columns if not c.startswith("stats/")]
-            dfs.append(df.select(non_stats_cols))
+        table = pq.read_table(str(path))
+        non_stats_cols = [c for c in table.column_names if not c.startswith("stats/")]
+        table = table.select(non_stats_cols)
+        if table.num_rows > 0:
+            tables.append(table)
 
-    if not dfs:
+    if not tables:
         return []
 
-    combined = pl.concat(dfs, how="diagonal")
+    combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    combined = combined.sort_by("episode_index")
 
-    # Sort by episode_index and convert to list of dicts
-    combined = combined.sort("episode_index")
-
-    # Fill null values for known column patterns before converting to dicts.
-    # When sub-datasets have different camera keys, polars diagonal concat
-    # fills missing columns with null. We need appropriate defaults:
-    # - is_valid columns: default 0 (invalid), so episodes without a camera
-    #   are treated as invalid (skip decoding) rather than crashing
-    # - Other video columns (chunk_index, file_index, timestamps): default 0
-    # - Data/meta columns: default 0
-    for col in combined.columns:
+    df = combined.to_pandas()
+    for col in df.columns:
         if col.endswith("/is_valid"):
-            combined = combined.with_columns(
-                pl.col(col).fill_null(0)
-            )
-        elif combined[col].dtype in (pl.Int64, pl.Float64, pl.Int32, pl.Float32):
-            combined = combined.with_columns(
-                pl.col(col).fill_null(0)
-            )
+            df[col] = df[col].fillna(0)
+        elif df[col].dtype in ("int64", "float64", "int32", "float32"):
+            df[col] = df[col].fillna(0)
 
     episodes = []
-    for i in range(combined.height):
-        row = combined.row(i, named=True)
-        # Convert numpy types to Python native types for consistency
+    for _, row in df.iterrows():
         ep_dict = {}
         for key, val in row.items():
-            if val is None:
-                # Skip None values entirely - .get(key, default) will use the default
+            if val is None or (isinstance(val, float) and pd.isna(val)):
                 continue
             if isinstance(val, (np.integer,)):
                 val = int(val)
@@ -786,12 +584,7 @@ def _load_episodes_polars(root) -> list[dict]:
 
 
 class _EpisodeAccessor:
-    """提供与 HF Dataset 兼容的 episodes[idx] 字典式访问接口。
-
-    包装 _load_episodes_polars 返回的 list[dict]，使得
-    self.meta.episodes[ep_idx] 返回的 dict 支持 .get() 方法
-    （HF Dataset row 返回的是 dict，原生支持 .get()）。
-    """
+    """Dict-style episode access compatible with HF Dataset rows."""
 
     def __init__(self, episodes: list[dict]):
         self._episodes = episodes
@@ -803,20 +596,128 @@ class _EpisodeAccessor:
         return len(self._episodes)
 
 
-class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
+class EpisodeChunkReader:
+    """Load contiguous ranges of episodes from parquet into dict-of-numpy-arrays.
+
+    For each episode, returns {col_name: np.ndarray} where list columns
+    (action, state) become 2D arrays [N, dim]. Uses pyarrow read_table + slice
+    for efficient row-level access, reading only the parquet files containing
+    the requested episodes. Avoids polars to prevent Rayon fork deadlock.
     """
-    支持流式加载完整历史 action 的 LoLA 预训练数据集。
 
-    与 LoLAStreamingDataset 的区别：
-    - 不继承 StreamingLeRobotDataset，直接继承 IterableDataset
-    - 支持多子数据集混合预训练，通过 dataset_to_episodes.json 映射 episode 到子数据集
-    - 对 observation.state, action, hist_actions_full 执行 per-sub-dataset 归一化
-    - 支持 is_valid=0 的无效摄像头（跳过解码，返回 None + camera_valid_mask）
-    - 将摄像头帧转为 PIL Image（或 None），由 Qwen3.5 processor 处理图像变换
-    - 每个 item 包含 action_dim 和 state_dim，支持异构动作/状态空间
+    def __init__(self, parquet_files: list[str], file_cumsum: list[int],
+                 episode_starts: np.ndarray, episode_ends: np.ndarray,
+                 episode_file_ranges: list[tuple[int, int]]):
+        self._parquet_files = parquet_files
+        self._file_cumsum = file_cumsum
+        self._episode_starts = episode_starts
+        self._episode_ends = episode_ends
+        self._episode_file_ranges = episode_file_ranges
 
-    数据加载使用 polars 读取 parquet 文件，视频解码使用 torchcodec。
-    make_frame 和 _add_history_actions 逻辑与原 StreamingLeRobotDataset 兼容。
+    def load_episode(self, ep_idx: int) -> dict[str, np.ndarray]:
+        """Load a single episode as dict of numpy arrays."""
+        return self.load_episode_range(ep_idx, ep_idx + 1)[0]
+
+    def load_episode_range(self, start_ep_idx: int, end_ep_idx: int) -> list[dict[str, np.ndarray]]:
+        """Load episodes [start_ep_idx, end_ep_idx) as list of per-episode dicts.
+
+        Reads only the parquet files containing the requested episode range,
+        typically 1 file for small ranges. Uses pyarrow to avoid initializing
+        polars Rayon thread pool (which causes fork deadlocks).
+        """
+        if start_ep_idx >= end_ep_idx:
+            return []
+
+        # Determine file range for the entire episode range
+        first_file, _ = self._episode_file_ranges[start_ep_idx]
+        _, last_file = self._episode_file_ranges[end_ep_idx - 1]
+
+        # Global row range
+        global_start = int(self._episode_starts[start_ep_idx])
+        global_end = int(self._episode_ends[end_ep_idx - 1])
+
+        # Read relevant parquet files with row slicing
+        tables: list[pa.Table] = []
+        for file_idx in range(first_file, last_file + 1):
+            path = self._parquet_files[file_idx]
+            file_global_start = self._file_cumsum[file_idx]
+            file_global_end = self._file_cumsum[file_idx + 1]
+
+            # Compute local slice within this file
+            local_start = max(0, global_start - file_global_start)
+            local_end = min(file_global_end - file_global_start, global_end - file_global_start)
+
+            if local_start >= local_end:
+                continue
+
+            tbl = pq.read_table(path).slice(local_start, local_end - local_start)
+            if tbl.num_rows > 0:
+                tables.append(tbl)
+
+        if not tables:
+            return []
+
+        combined = _safe_concat_tables(tables) if len(tables) > 1 else tables[0]
+
+        # Convert to numpy arrays (columnar)
+        col_arrays: dict[str, np.ndarray] = {}
+        for col_name in combined.column_names:
+            col = combined.column(col_name)
+            col_type = col.type
+
+            if pa.types.is_list(col_type) or pa.types.is_large_list(col_type):
+                value_type = col_type.value_type
+                if pa.types.is_floating(value_type) or pa.types.is_integer(value_type):
+                    pylist = col.to_pylist()
+                    inner_dim = 0
+                    for v in pylist:
+                        if v is not None:
+                            inner_dim = len(v)
+                            break
+                    col_arrays[col_name] = np.array([
+                        np.array(v, dtype=np.float32) if v is not None
+                        else np.zeros(inner_dim, dtype=np.float32)
+                        for v in pylist
+                    ])
+                else:
+                    col_arrays[col_name] = np.array([
+                        np.array(v) if v is not None else np.array([])
+                        for v in col.to_pylist()
+                    ])
+
+            elif pa.types.is_floating(col_type):
+                col_arrays[col_name] = col.to_numpy(zero_copy_only=False).astype(np.float32)
+
+            elif pa.types.is_integer(col_type):
+                filled = pa.compute.fill_null(col, 0)
+                col_arrays[col_name] = filled.to_numpy().astype(np.int64)
+
+            else:
+                col_arrays[col_name] = col.to_numpy(zero_copy_only=False)
+
+        # Split into per-episode dicts
+        result: list[dict[str, np.ndarray]] = []
+        for ep_idx in range(start_ep_idx, end_ep_idx):
+            ep_start = int(self._episode_starts[ep_idx])
+            ep_end = int(self._episode_ends[ep_idx])
+            # Local offset within combined Table
+            local_start = ep_start - global_start
+            local_end = ep_end - global_start
+
+            ep_dict: dict[str, np.ndarray] = {}
+            for col, arr in col_arrays.items():
+                ep_dict[col] = arr[local_start:local_end]
+            result.append(ep_dict)
+
+        return result
+
+
+class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
+    """Episode-aligned streaming dataset for LoLA pretraining.
+
+    Loads contiguous chunks of episodes from parquet, processes with
+    vectorized numpy operations (no Backtrackable), and shuffles at
+    chunk level with strided worker distribution.
     """
 
     def __init__(
@@ -831,10 +732,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         image_transforms=None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
+        tolerance_frames: int | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         streaming: bool = True,
-        buffer_size: int = 1000,
+        buffer_size: int = 5000,
         max_num_shards: int = 16,
         seed: int = 42,
         rng=None,
@@ -846,53 +748,9 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         num_dataloader_workers: int = 0,
         dataset_to_episodes_path: str | None = None,
         temp_process: bool = False,
+        episode_chunk_size: int = 8,
     ):
-        """
-        Args:
-            repo_id: 数据集仓库 ID
-            max_history_length: 历史 action 最大长度，超过则截断
-            action_chunk_size: action 块大小，历史长度补齐到该值的整数倍
-            history_padding_side: padding 方向，"left" 或 "right"
-            root: 本地数据集根目录（挂载路径）
-            sub_root: 子数据集目录
-            episodes: 指定加载的 episode 列表
-            image_transforms: 图像变换（预训练模式下不使用，由 Qwen3.5 processor 处理）
-            delta_timestamps: 时间戳偏移配置
-            tolerance_s: 时间戳容差
-            revision: 版本
-            force_cache_sync: 是否强制同步缓存
-            streaming: 是否流式加载（保留接口兼容，实际始终用 polars）
-            buffer_size: 流式 shuffle 缓冲区大小
-            max_num_shards: 最大分片数（保留接口兼容，实际按行范围分配）
-            seed: 随机种子
-            rng: 随机数生成器
-            shuffle: 是否 shuffle
-            deferred_video_decode: 是否延迟视频解码。默认 True，shuffle buffer
-                只存储轻量级数据（~4KB/帧），yield 时再解码视频帧，内存占用
-                远低于在 make_frame 中解码（~3.5MB/帧 × buffer_size × num_workers）。
-                设为 False 则在 make_frame 中立即解码视频帧存入 buffer，适用于
-                大内存低 IO 场景（如本地 NVMe + 充足内存）。
-            decode_device: 视频解码设备，"cpu" 或 "cuda"。当 deferred_video_decode=True
-                时，指定主进程中视频解码使用的设备。"cuda" 使用 NVDEC 硬件加速解码，
-                可显著提升解码速度。"cpu" 使用 CPU 解码（默认）。
-            decode_num_threads: 主进程中并行解码的线程数。当 decode_device="cpu" 时，
-                使用 ThreadPoolExecutor 并行解码多个 item。设为 1 表示串行解码，
-                设为 >1 表示多线程并行（视频解码是 IO 密集型，线程效果较好）。
-                当 decode_device="cuda" 时此参数无效（CUDA 解码本身已并行）。
-            async_decode: 是否启用异步解码管线。启用后，视频解码在专用子进程中
-                执行，与训练前向传播重叠（训练 batch N 时解码 batch N+1）。
-                子进程内部使用 ThreadPoolExecutor + per-thread BoundedVideoDecoderCache
-                并行解码，缓存容量为 2 * num_dataloader_workers * n_cameras。
-                内存由队列深度控制：result_queue(maxsize=1) 最多缓冲 1 个解码 batch。
-            num_dataloader_workers: DataLoader 的 worker 数量，用于计算异步解码
-                管线的 VideoDecoder 缓存容量。仅在 async_decode=True 时需要。
-            dataset_to_episodes_path: JSON 文件路径，包含 episode 到子数据集的映射。
-                当提供时，启用 per-sub-dataset 归一化。
-            temp_process: 临时处理模式。当子数据集 stats 维度与全局 action_dim 不一致时，
-                若为 True，对 stats 进行 zero-padding 以匹配全局维度（仅适用于单臂数据集）；
-                若为 False（默认），直接 raise ValueError。待所有子数据集 stats 更新后可移除此参数。
-        """
-        super().__init__()  # torch.utils.data.IterableDataset.__init__
+        super().__init__()
 
         self.repo_id = repo_id
         self.root = __import__("pathlib").Path(root) if root else HF_LEROBOT_HOME / repo_id
@@ -902,6 +760,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self.image_transforms = image_transforms
         self.episodes = episodes
         self.tolerance_s = tolerance_s
+        self.tolerance_frames = tolerance_frames
         self.revision = revision if revision else CODEBASE_VERSION
         self.seed = seed
         self.rng = rng if rng is not None else np.random.default_rng(seed)
@@ -913,20 +772,15 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self.decode_device = decode_device
         self.decode_num_threads = decode_num_threads
 
-        # CUDA 解码器缓存（仅 decode_device="cuda" 时使用）
         self._cuda_decoder_cache = None
 
-        # 异步解码管线（仅 async_decode=True 时使用）
         self.async_decode = async_decode
         self._num_dataloader_workers = num_dataloader_workers
         self._decode_pipeline = None
         self.temp_process = temp_process
+        self.episode_chunk_size = episode_chunk_size
 
-        # 加载元数据（使用 polars 加载 episodes，避免 HF datasets CastError）
-        # 当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含不同的列
-        # （因为不同子数据集有不同的 camera keys），导致 HF datasets 的
-        # Dataset.from_parquet() 在统一 schema 时报 CastError。
-        # 直接使用 polars diagonal concat 安全合并，缺失列自动填充 null。
+        # Build metadata
         self.meta = self._build_metadata_polars(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
@@ -943,24 +797,65 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self.action_chunk_size = action_chunk_size
         self.history_padding_side = history_padding_side
 
-        # 获取 action 维度
         if "action" in self.meta.features:
             self.action_dim = self.meta.features["action"]["shape"][0]
         else:
             self.action_dim = 1
 
-        # 发现 parquet 文件（polars 模式用）
         self._parquet_files = _discover_parquet_files(str(self.root))
 
-        # 预计算总行数用于 shard 分配
-        self._total_rows = self.meta.total_frames
+        # ── Episode boundary arrays ────────────────────────────────────
+        num_episodes = len(self.meta.episodes)
+        self._episode_starts = np.empty(num_episodes, dtype=np.int64)
+        self._episode_ends = np.empty(num_episodes, dtype=np.int64)
+        for ep_idx in range(num_episodes):
+            ep = self.meta.episodes[ep_idx]
+            self._episode_starts[ep_idx] = ep["dataset_from_index"]
+            self._episode_ends[ep_idx] = ep["dataset_to_index"]
+
+        # ── File cumulative-sum and per-episode file ranges ────────────
+        self._file_cumsum = [0]
+        for path in self._parquet_files:
+            pf = pq.ParquetFile(path)
+            self._file_cumsum.append(self._file_cumsum[-1] + pf.metadata.num_rows)
+
+        self._total_rows = self._file_cumsum[-1]
+
+        self._episode_file_ranges: list[tuple[int, int]] = []
+        for ep_idx in range(num_episodes):
+            first_file = bisect.bisect_right(self._file_cumsum, self._episode_starts[ep_idx]) - 1
+            last_file = bisect.bisect_right(self._file_cumsum, self._episode_ends[ep_idx] - 1) - 1
+            self._episode_file_ranges.append((first_file, last_file))
+
+        # ── EpisodeChunkReader ─────────────────────────────────────────
+        self._chunk_reader = EpisodeChunkReader(
+            self._parquet_files, self._file_cumsum,
+            self._episode_starts, self._episode_ends,
+            self._episode_file_ranges,
+        )
+
+        # ── Fast membership sets ───────────────────────────────────────
+        self._video_keys_set = set(self.meta.video_keys)
+        self._cached_video_keys_list = self.meta.video_keys
+        self._cached_camera_keys_list = self.meta.camera_keys
+
+        # ── Task name lookup ───────────────────────────────────────────
+        self._task_names = [self.meta.tasks.iloc[i].name for i in range(len(self.meta.tasks))]
+
+        # ── Seek-mode mapping (scan videos at init) ────────────────────
+        self._video_seek_modes: dict[str, str] = {}
+        if self.streaming_from_local and os.path.isdir(os.path.join(str(self.root), "videos")):
+            self._video_seek_modes = scan_video_seek_modes(str(self.root), num_workers=8)
+            exact_count = sum(1 for v in self._video_seek_modes.values() if v == "exact")
+            print(f"[LoLAPretrainStreamingDataset] seek-mode scan: {len(self._video_seek_modes)} videos, "
+                  f"{exact_count} require exact mode")
 
         # ── Per-sub-dataset normalization setup ──────────────────────────
-        self._episode_to_ds_idx = np.full(self.meta.total_episodes, -1, dtype=np.int16)
+        self._episode_to_ds_idx = np.full(num_episodes, -1, dtype=np.int16)
         self._sub_dataset_names: list[str] = []
         self._sub_dataset_paths: list[str] = []
         self._sub_dataset_norm_params: list[dict | None] = []
-        self._sub_dataset_dims: list[tuple[int, int]] = []  # (action_dim, state_dim)
+        self._sub_dataset_dims: list[tuple[int, int]] = []
 
         if dataset_to_episodes_path is not None:
             self._load_dataset_to_episodes(dataset_to_episodes_path)
@@ -971,23 +866,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         print(f"[LoLAPretrainStreamingDataset] action_dim: {self.action_dim}")
         print(f"[LoLAPretrainStreamingDataset] parquet_files: {len(self._parquet_files)}")
         print(f"[LoLAPretrainStreamingDataset] total_rows: {self._total_rows}")
+        print(f"[LoLAPretrainStreamingDataset] total_episodes: {num_episodes}")
+        print(f"[LoLAPretrainStreamingDataset] episode_chunk_size: {episode_chunk_size}")
         print(f"[LoLAPretrainStreamingDataset] sub_datasets: {len(self._sub_dataset_names)}")
 
     @staticmethod
     def _build_metadata_polars(repo_id, root, revision, force_cache_sync=False):
-        """构建元数据对象，使用 polars 加载 episodes 以避免 HF datasets CastError。
-
-        当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含
-        不同的列（因为不同子数据集有不同的 camera keys），导致 HF datasets
-        的 Dataset.from_parquet() 在统一 schema 时报 CastError:
-        "column names don't match"。
-
-        此方法直接使用 polars 加载 episodes，避免触发 HF datasets 的 schema
-        统一逻辑。其余元数据（info, tasks, stats）使用标准加载函数。
-
-        Returns:
-            LeRobotDatasetMetadata 实例（episodes 替换为 _EpisodeAccessor）
-        """
         from pathlib import Path
 
         meta_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
@@ -1004,8 +888,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 local_dir=meta_root, allow_patterns="meta/",
             )
 
-        # 手动构建 metadata 对象，避免触发 LeRobotDatasetMetadata.__init__
-        # 中的 load_metadata() -> load_episodes() -> Dataset.from_parquet() 路径
         meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
         meta.repo_id = repo_id
         meta.revision = _revision
@@ -1015,12 +897,10 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         meta.metadata_buffer = []
         meta.metadata_buffer_size = 10
 
-        # 使用标准函数加载 info/tasks/stats（不涉及 HF datasets schema 统一）
         meta.info = load_info(meta_root)
         meta.tasks = load_tasks(meta_root)
         meta.stats = load_stats(meta_root)
 
-        # 使用 polars 加载 episodes（避免 HF datasets CastError）
         episodes_list = _load_episodes_polars(meta_root)
         meta.episodes = _EpisodeAccessor(episodes_list)
 
@@ -1028,15 +908,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return meta
 
     def _load_dataset_to_episodes(self, dataset_to_episodes_path: str):
-        """Load dataset_to_episodes.json and build per-sub-dataset normalization data.
-
-        Builds:
-            self._episode_to_ds_idx: np.int16 array, episode_index -> sub_dataset_idx (-1 if unknown)
-            self._sub_dataset_names: list[str], sub_dataset_idx -> name
-            self._sub_dataset_paths: list[str], sub_dataset_idx -> path
-            self._sub_dataset_norm_params: list[dict|None], sub_dataset_idx -> stats (mean/std tensors)
-            self._sub_dataset_dims: list[tuple[int,int]], sub_dataset_idx -> (action_dim, state_dim)
-        """
         with open(dataset_to_episodes_path, "r") as f:
             dataset_map = json.load(f)
 
@@ -1046,16 +917,13 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             start_ep = ds_info["start_episode_index"]
             end_ep = ds_info["end_episode_index"]
 
-            # Build reverse mapping: episode_index -> sub_dataset_idx
             for ep_idx in range(start_ep, end_ep + 1):
                 if ep_idx < len(self._episode_to_ds_idx):
                     self._episode_to_ds_idx[ep_idx] = ds_idx
 
-            # Forward mappings
             self._sub_dataset_names.append(ds_name)
             self._sub_dataset_paths.append(ds_path)
 
-            # Load per-sub-dataset stats (skip if sub_root not provided)
             if self.sub_root is not None:
                 stats_path = os.path.join(str(self.sub_root), ds_path, "meta", "stats.json")
             else:
@@ -1069,14 +937,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                     raw_stats = json.load(sf)
 
                 norm_params = {}
-                # Only need observation.state and action stats (no image stats)
                 for key in ("observation.state", "action"):
                     if key in raw_stats:
                         mean = torch.tensor(raw_stats[key]["mean"], dtype=torch.float32)
                         std = torch.tensor(raw_stats[key]["std"], dtype=torch.float32)
                         norm_params[key] = {"mean": mean, "std": std}
 
-                # Infer dimensions
                 if "action" in norm_params:
                     action_dim = len(norm_params["action"]["mean"])
                 if "observation.state" in norm_params:
@@ -1089,7 +955,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                     f"Skipping per-dataset normalization for this sub-dataset."
                 )
                 norm_params = None
-                # Fallback dimensions
                 action_dim = self.action_dim
                 state_dim = 0
 
@@ -1099,49 +964,25 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
     @staticmethod
     def _make_translation_norm_mask(action_dim: int) -> torch.Tensor:
-        """构建 action 维度的归一化 mask: 仅平移维度需要归一化。
-
-        动作空间结构:
-        - 单臂 (10 dim): dim 0-2 为平移(x,y,z), dim 3-8 为 orth6D, dim 9 为夹爪
-        - 双臂 (20 dim): dim 0-2 为臂1平移, dim 10-12 为臂2平移, 其余无需归一化
-        - orth6D 旋转和夹爪状态天然在 [-1, 1] 范围内, 不需归一化
-
-        Returns:
-            BoolTensor [action_dim], True 表示该维度需要归一化
-        """
         mask = torch.zeros(action_dim, dtype=torch.bool)
-        arm_dim = 10  # 单臂动作维度
+        arm_dim = 10
         num_arms = action_dim // arm_dim
         for arm in range(num_arms):
             offset = arm * arm_dim
-            mask[offset:offset + 3] = True  # 平移 (x, y, z)
+            mask[offset:offset + 3] = True
         return mask
 
     def _normalize_per_subdataset(self, item, temp_process=False):
-        """Per-sub-dataset normalization for observation.state, action, and hist_actions_full.
-
-        仅对平移维度 (每臂 dim 0-2) 进行 mean/std 归一化,
-        orth6D 旋转和夹爪状态天然在 [-1, 1] 范围内, 不需归一化。
-
-        当子数据集的 stats 维度与全局 action_dim 不一致时：
-        - temp_process=True: 对 stats 的 mean/std 进行 zero-padding 以匹配全局维度,
-          仅归一化子数据集原生维度（padding 部分的 mean=0, std=1, 归一化后值不变）
-        - temp_process=False (默认): 直接 raise ValueError
-
-        注意: temp_process=True 仅适用于单臂数据集 (stats_dim < action_dim)，
-        双臂数据集的 stats 维度不匹配时应更新子数据集的 stats.json 而非使用 padding。
-        """
         ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
         if ep_idx >= len(self._episode_to_ds_idx) or self._episode_to_ds_idx[ep_idx] < 0:
-            return item  # Unknown sub-dataset, skip normalization
+            return item
 
         ds_idx = self._episode_to_ds_idx[ep_idx]
         stats = self._sub_dataset_norm_params[ds_idx]
 
         if stats is None:
-            return item  # No stats available for this sub-dataset
+            return item
 
-        # Check dimension compatibility and pad stats if needed
         padded_stats = {}
         for key in ("observation.state", "action"):
             if key not in stats:
@@ -1155,7 +996,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                         f"{mean.shape[0]} but global action_dim is {self.action_dim}. "
                         f"Set temp_process=True to pad stats, or update the sub-dataset's stats.json."
                     )
-                # Zero-pad mean and std: padded dims get mean=0, std=1 (no-op normalization)
                 pad_len = self.action_dim - mean.shape[0]
                 mean = torch.cat([mean, torch.zeros(pad_len)])
                 std = torch.cat([std, torch.ones(pad_len)])
@@ -1167,12 +1007,10 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
             padded_stats[key] = {"mean": mean, "std": std}
 
-        # observation.state: (x - mean) / (std + eps)
         if "observation.state" in item and "observation.state" in padded_stats:
             mean, std = padded_stats["observation.state"]["mean"], padded_stats["observation.state"]["std"]
             item["observation.state"] = (item["observation.state"] - mean) / (std + 1e-8)
 
-        # action: 仅归一化平移维度
         if "action" in item and "action" in padded_stats:
             mean, std = padded_stats["action"]["mean"], padded_stats["action"]["std"]
             norm_mask = self._make_translation_norm_mask(mean.shape[0])
@@ -1180,13 +1018,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             normalized = (action - mean) / (std + 1e-8)
             item["action"] = torch.where(norm_mask, normalized, action)
 
-        # hist_actions_full: 仅归一化平移维度 (mask=True 部分)
         if "hist_actions_full" in item and "action" in padded_stats:
             mean, std = padded_stats["action"]["mean"], padded_stats["action"]["std"]
             norm_mask = self._make_translation_norm_mask(mean.shape[0])
-            mask = item["hist_actions_mask"]  # [SeqLen]
+            mask = item["hist_actions_mask"]
             normalized = (item["hist_actions_full"] - mean) / (std + 1e-8)
-            # 只对 padding mask=True 且 translation dim 的位置进行归一化
             mask_expanded = mask.unsqueeze(-1).expand_as(normalized)
             norm_mask_expanded = norm_mask.unsqueeze(0).expand_as(normalized)
             should_normalize = mask_expanded & norm_mask_expanded
@@ -1195,19 +1031,17 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return item
 
     def _tensor_to_pil(self, tensor):
-        """Convert [C, H, W] float32 tensor to PIL Image. Handles List[Tensor] from dynamic resolution."""
         from PIL import Image
         if isinstance(tensor, list):
             return [self._tensor_to_pil(t) for t in tensor]
         if tensor.dim() == 4:
-            tensor = tensor[0]  # [T, C, H, W] -> [C, H, W]
-        img = tensor.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+            tensor = tensor[0]
+        img = tensor.permute(1, 2, 0)
         if img.dtype in [torch.float32, torch.float64]:
             img = (img * 255).clamp(0, 255).to(torch.uint8)
         return Image.fromarray(img.cpu().numpy())
 
     def _apply_camera_valid_mask(self, item, ep_idx):
-        """Add camera_valid_mask to item and convert video frames to PIL Image (valid) or None (invalid)."""
         from PIL import Image
 
         camera_valid_mask = {}
@@ -1220,16 +1054,14 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
             if cam_key in item:
                 if is_valid == 0:
-                    # Invalid camera: set to None (skip in processor)
                     item[cam_key] = None
                 elif isinstance(item[cam_key], (torch.Tensor, list)):
-                    # Valid camera: convert tensor(s) to PIL Image(s)
                     item[cam_key] = self._tensor_to_pil(item[cam_key])
 
         item["camera_valid_mask"] = camera_valid_mask
         return item
 
-    # ── 从 StreamingLeRobotDataset 继承的属性 ──────────────────────────────
+    # ── Properties ──────────────────────────────────────────────────────
 
     @property
     def num_frames(self):
@@ -1243,85 +1075,209 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
     def fps(self):
         return self.meta.fps
 
-    # ── 从 StreamingLeRobotDataset 继承的静态方法 ──────────────────────────
+    # ── Core: process one episode ───────────────────────────────────────
 
-    @staticmethod
-    def _iter_random_indices(
-        rng: np.random.Generator, buffer_size: int, random_batch_size=100
-    ):
-        while True:
-            yield from (int(i) for i in rng.integers(0, buffer_size, size=random_batch_size))
+    def _process_episode_frames(self, ep_data: dict[str, np.ndarray], ep_idx: int) -> list[dict]:
+        """Process all frames of an episode into list of item dicts.
 
-    @staticmethod
-    def _infinite_generator_over_elements(rng: np.random.Generator, elements: list[int]):
-        while True:
-            yield rng.choice(elements)
+        Uses vectorized numpy operations for history actions and delta frames
+        instead of Backtrackable peek_back/peek_ahead.
+        """
+        ep_length = len(ep_data["action"])
+        ep_start = int(self._episode_starts[ep_idx])
 
-    # ── 核心方法 ──────────────────────────────────────────────────────────
+        # Pre-extract action array as numpy for vectorized history
+        action_array = ep_data["action"]  # [N, action_dim] or [N]
+        if action_array.ndim == 1:
+            action_array = action_array.reshape(-1, 1)
 
-    def _get_window_steps(self, delta_timestamps=None, dynamic_bounds=False):
-        """计算 lookback/lookahead 窗口大小"""
-        from lerobot.utils.constants import LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
+        # Pre-compute delta frame arrays (non-video keys only)
+        delta_arrays = {}
+        delta_padding = {}
+        if self.delta_indices is not None:
+            for key, delta_indices in self.delta_indices.items():
+                if key in self._video_keys_set:
+                    continue
+                if key not in ep_data:
+                    continue
+                arr = ep_data[key]
+                if arr.ndim == 1:
+                    arr = arr.reshape(-1, 1)
+                delta_arrays[key] = (arr, delta_indices)
 
-        if delta_timestamps is None:
-            return 1, 1
+        items = []
+        for frame_in_ep in range(ep_length):
+            global_idx = ep_start + frame_in_ep
 
-        if not dynamic_bounds:
-            lookback = LOOKBACK_BACKTRACKTABLE
-            lookahead = LOOKAHEAD_BACKTRACKTABLE
-        else:
-            all_timestamps = sum(delta_timestamps.values(), [])
-            lookback = min(all_timestamps) * self.fps
-            lookahead = max(all_timestamps) * self.fps
-            lookback = 0 if lookback >= 0 else (lookback * -1)
+            # Build base item from row data
+            item = {}
+            for key, arr in ep_data.items():
+                val = arr[frame_in_ep]
+                if isinstance(val, np.ndarray):
+                    item[key] = torch.tensor(val, dtype=torch.float32)
+                elif isinstance(val, (np.integer,)):
+                    item[key] = int(val)
+                elif isinstance(val, (np.floating,)):
+                    item[key] = float(val)
+                else:
+                    item[key] = val
 
-        # lookback 需要至少 max_history_length 以支持完整历史加载
-        lookback = max(lookback, self.max_history_length)
+            # ── Delta frames (vectorized) ──────────────────────────
+            if self.delta_indices is not None:
+                query_result = {}
+                padding = {}
+                for key, (arr, delta_indices) in delta_arrays.items():
+                    target_frames = []
+                    is_pad = []
+                    for delta in delta_indices:
+                        target_pos = frame_in_ep + delta
+                        if 0 <= target_pos < ep_length:
+                            val = arr[target_pos]
+                            target_frames.append(torch.tensor(val, dtype=torch.float32))
+                            is_pad.append(False)
+                        else:
+                            target_frames.append(item[key])
+                            is_pad.append(True)
+                    if target_frames:
+                        query_result[key] = torch.stack(target_frames)
+                        padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
+                item.update(query_result)
+                item.update(padding)
 
-        return lookback, lookahead
+            # ── History actions (vectorized) ───────────────────────
+            current_action = item.get("action")
+            if current_action is not None:
+                if current_action.dim() > 1:
+                    current_action = current_action[0] if current_action.shape[0] == 1 else current_action[-1]
 
-    def _make_polars_backtrackable(self, row_offset: int = 0, row_limit: int | None = None) -> Backtrackable:
-        """创建基于 polars 的 Backtrackable 迭代器。"""
-        lookback, lookahead = self._get_window_steps(self.delta_timestamps)
+                max_lookback = min(self.max_history_length - 1, frame_in_ep)
 
-        row_iter = PolarsRowIterator(
-            self._parquet_files,
-            episodes=self.episodes,
-            row_offset=row_offset,
-            row_limit=row_limit,
-        )
+                past_actions = []
+                past_masks = []
 
-        if row_iter._len == 0:
-            raise StopIteration("No data available")
+                if max_lookback > 0:
+                    past_actions_np = action_array[frame_in_ep - max_lookback : frame_in_ep]
+                    for j in range(past_actions_np.shape[0]):
+                        pa = torch.tensor(past_actions_np[j], dtype=torch.float32)
+                        if pa.dim() > 1:
+                            pa = pa[0] if pa.shape[0] == 1 else pa[-1]
+                        past_actions.append(pa)
+                        past_masks.append(True)
 
-        return Backtrackable(row_iter, history=lookback, lookahead=lookahead)
+                past_actions.append(current_action)
+                past_masks.append(True)
+
+                hist_actions = torch.stack(past_actions)
+                hist_actions_mask = torch.BoolTensor(past_masks)
+
+                actual_history_length = len(past_actions)
+                padded_length = (
+                    ((actual_history_length + self.action_chunk_size - 1) // self.action_chunk_size)
+                    * self.action_chunk_size
+                )
+
+                if padded_length > self.max_history_length:
+                    padded_length = (self.max_history_length // self.action_chunk_size) * self.action_chunk_size
+                    if actual_history_length > padded_length:
+                        truncate_length = actual_history_length - padded_length
+                        hist_actions = hist_actions[truncate_length:]
+                        hist_actions_mask = hist_actions_mask[truncate_length:]
+                        actual_history_length = padded_length
+
+                if actual_history_length < padded_length:
+                    pad_length = padded_length - actual_history_length
+                    padding_actions = torch.zeros(pad_length, self.action_dim, dtype=hist_actions.dtype)
+                    padding_mask_val = torch.zeros(pad_length, dtype=torch.bool)
+                    if self.history_padding_side == "left":
+                        hist_actions = torch.cat([padding_actions, hist_actions], dim=0)
+                        hist_actions_mask = torch.cat([padding_mask_val, hist_actions_mask], dim=0)
+                    else:
+                        hist_actions = torch.cat([hist_actions, padding_actions], dim=0)
+                        hist_actions_mask = torch.cat([hist_actions_mask, padding_mask_val], dim=0)
+
+                item["hist_actions_full"] = hist_actions
+                item["hist_actions_mask"] = hist_actions_mask
+                item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
+
+            # ── Task name ──────────────────────────────────────────
+            task_index = item.get("task_index", 0)
+            if isinstance(task_index, torch.Tensor):
+                task_index = task_index.item()
+            item["task"] = self._task_names[task_index] if task_index < len(self._task_names) else ""
+
+            # ── Video lookup (deferred) or immediate decode ────────
+            ep_meta = self.meta.episodes[ep_idx]
+            current_ts = global_idx / self.fps
+
+            if len(self.meta.video_keys) > 0:
+                episode_boundaries_ts = {
+                    key: (
+                        ep_meta[f"videos/{key}/from_timestamp"],
+                        ep_meta[f"videos/{key}/to_timestamp"],
+                    )
+                    for key in self.meta.video_keys
+                }
+
+                original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
+                query_timestamps = self._get_query_timestamps(
+                    current_ts, self.delta_indices, episode_boundaries_ts
+                )
+
+                if self.deferred_video_decode:
+                    item["_video_lookup"] = {
+                        "ep_idx": ep_idx,
+                        "query_timestamps": query_timestamps,
+                        "original_timestamps": original_timestamps,
+                        "camera_valid_mask": {
+                            cam_key: ep_meta.get(f"videos/{cam_key}/is_valid", 1) == 1
+                            for cam_key in self.meta.video_keys
+                        },
+                    }
+                else:
+                    video_frames = self._query_videos(query_timestamps, ep_idx)
+                    item.update(video_frames)
+                    if self.delta_indices is not None:
+                        padding_mask = self._get_video_frame_padding_mask(
+                            video_frames, query_timestamps, original_timestamps
+                        )
+                        item.update(padding_mask)
+
+            # ── Per-sub-dataset normalization ──────────────────────
+            item = self._normalize_per_subdataset(item, temp_process=self.temp_process)
+
+            # ── Camera valid mask + PIL conversion ─────────────────
+            if not self.deferred_video_decode:
+                item = self._apply_camera_valid_mask(item, ep_idx)
+            else:
+                # For deferred mode, add camera_valid_mask but don't decode
+                camera_valid_mask = {}
+                for cam_key in self.meta.camera_keys:
+                    is_valid_key = f"videos/{cam_key}/is_valid"
+                    is_valid = ep_meta.get(is_valid_key, 1)
+                    camera_valid_mask[cam_key] = (is_valid == 1)
+                item["camera_valid_mask"] = camera_valid_mask
+
+            # ── Dimension info ─────────────────────────────────────
+            ds_idx_val = self._episode_to_ds_idx[ep_idx] if ep_idx < len(self._episode_to_ds_idx) and self._episode_to_ds_idx[ep_idx] >= 0 else 0
+            action_dim, state_dim = self._sub_dataset_dims[ds_idx_val] if ds_idx_val < len(self._sub_dataset_dims) else (self.action_dim, 0)
+            item["action_dim"] = action_dim
+            item["state_dim"] = state_dim
+
+            items.append(item)
+
+        return items
+
+    # ── __iter__: episode-aware shuffle ─────────────────────────────────
 
     def __iter__(self):
-        """使用 polars 读取数据并支持分布式数据分片。
-
-        用 polars 读取 parquet 替代 HF IterableDataset.shard()。
-        polars 读取是 stateless 的，在 DataLoader fork 的子进程中安全运行。
-        不调用 load_dataset，避免 HF IterableDataset 在 fork 后导致死锁。
-
-        shard 分配逻辑：将总行数按 parallel_id 分配不重叠的行范围，
-        每个 worker 处理 [row_offset, row_offset + row_limit) 范围内的行。
-
-        三种视频解码模式：
-        1. deferred_video_decode=True（默认）：
-           worker yield 轻量级帧（~4KB），主进程 decode_items_batch() 解码，
-           或通过 async_decode=True 启用独立解码子进程管线。
-
-        2. deferred_video_decode=False：
-           make_frame 中立即解码，buffer 存完整帧（~3.5MB/帧）。
-           速度快但 flush 阶段内存飙升（10 workers × 1000 帧 × 3.5MB ≈ 35GB）。
-        """
-        # 初始化视频解码缓存，容量按视角数调整（每视角缓存 2 个 decoder）
+        """Episode-aware streaming with chunk-level strided sharding."""
+        # Initialize video decoder cache
         if self.video_decoder_cache is None:
             n_cameras = max(1, len(self.meta.video_keys))
             cache_size = max(4, n_cameras * 2)
             self.video_decoder_cache = BoundedVideoDecoderCache(max_size=cache_size)
 
-        # 获取分布式信息
+        # Distributed info
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
@@ -1329,67 +1285,90 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             rank = 0
             world_size = 1
 
-        # 获取 DataLoader worker 信息
         worker_info = torch.utils.data.get_worker_info()
         num_workers = worker_info.num_workers if worker_info is not None else 1
         worker_id = worker_info.id if worker_info is not None else 0
 
-        # 总并行度 = world_size × num_workers
         total_parallel = world_size * num_workers
         parallel_id = rank * num_workers + worker_id
 
-        # 按行范围分配 shard：每个 worker 处理不重叠的行范围
-        rows_per_worker = self._total_rows // total_parallel
-        remainder = self._total_rows % total_parallel
+        # ── Chunk-level strided sharding ────────────────────────────
+        num_episodes = len(self.meta.episodes)
+        chunk_size = self.episode_chunk_size
+        num_chunks = (num_episodes + chunk_size - 1) // chunk_size
 
-        # 前 remainder 个 worker 多处理一行
-        if parallel_id < remainder:
-            row_offset = parallel_id * (rows_per_worker + 1)
-            row_limit = rows_per_worker + 1
-        else:
-            row_offset = remainder * (rows_per_worker + 1) + (parallel_id - remainder) * rows_per_worker
-            row_limit = rows_per_worker
+        # Each worker gets strided chunks: worker 0 gets chunks [0, total_parallel, 2*total_parallel, ...]
+        worker_chunk_indices = list(range(parallel_id, num_chunks, total_parallel))
 
-        if row_offset >= self._total_rows:
-            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no rows assigned "
-                  f"(total={self._total_rows}, parallel={total_parallel})", flush=True)
+        if not worker_chunk_indices:
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no chunks assigned "
+                  f"(num_chunks={num_chunks}, total_parallel={total_parallel})", flush=True)
             return
 
-        print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} assigned rows "
-              f"[{row_offset}, {row_offset + row_limit})", flush=True)
+        # Shuffle chunk order
+        rng = np.random.default_rng(
+            self.seed + rank if not self.shuffle else self.rng.integers(0, 2**31) + rank
+        )
+        chunk_indices_shuffled = np.array(worker_chunk_indices)
+        if self.shuffle:
+            rng.shuffle(chunk_indices_shuffled)
 
-        # 创建 polars backtrackable 迭代器
-        try:
-            backtrack_dataset = self._make_polars_backtrackable(row_offset, row_limit)
-        except StopIteration:
-            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} no data available", flush=True)
-            return
+        print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} processing "
+              f"{len(worker_chunk_indices)} chunks (chunk_size={chunk_size}, "
+              f"total_episodes={num_episodes})", flush=True)
 
-        # 随机数生成器
-        rng = np.random.default_rng(self.seed + rank) if not self.shuffle else np.random.default_rng(self.rng.integers(0, 2**31) + rank)
-
-        # 选择帧生成方式：
-        # - deferred + async: buffer 存轻量级帧（~4KB），yield 轻量帧，子进程解码
-        # - deferred + 非 async: buffer 存轻量级帧（~4KB），yield 时解码
-        #   （速度和内存的最佳平衡：buffer 省内存，worker 进程解码快于主进程）
-        # - 非 deferred: make_frame 中立即解码，buffer 存完整帧（~3.5MB）
-        if self.deferred_video_decode:
-            frame_generator = self._make_frame_lightweight
-        else:
-            frame_generator = self.make_frame
-
-        # deferred + 非 async 时，yield 前解码视频（在 worker 进程中执行）
+        # ── Decode mode ─────────────────────────────────────────────
+        # Decode video inside DataLoader workers using BoundedVideoDecoderCache.
+        # Safe because this file no longer uses polars at all (replaced with
+        # pyarrow), so Rayon is never initialized in the parent process.
         decode_on_yield = self.deferred_video_decode and not self.async_decode
 
-        # 单 shard 模式：直接迭代，使用 buffer shuffle
+        # ── Shuffle buffer ──────────────────────────────────────────
         buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
         frames_buffer = []
         yield_count = 0
+        buffer_full = False
 
-        while True:
+        print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} filling buffer "
+              f"(target={self.buffer_size}, decode_on_yield={decode_on_yield})", flush=True)
+
+        for chunk_idx in chunk_indices_shuffled:
+            ep_start_idx = int(chunk_idx) * chunk_size
+            ep_end_idx = min(ep_start_idx + chunk_size, num_episodes)
+
+            # Load contiguous episode range
             try:
-                for frame in frame_generator(backtrack_dataset):
+                ep_data_list = self._chunk_reader.load_episode_range(ep_start_idx, ep_end_idx)
+            except Exception as e:
+                logger.warning(f"Failed to load episodes [{ep_start_idx}, {ep_end_idx}): {e}")
+                continue
+
+            # Optional: shuffle episodes within chunk
+            ep_order = list(range(len(ep_data_list)))
+            if self.shuffle:
+                rng.shuffle(ep_order)
+
+            for local_ep_idx in ep_order:
+                ep_idx = ep_start_idx + local_ep_idx
+                ep_data = ep_data_list[local_ep_idx]
+
+                # Process all frames in this episode
+                try:
+                    frame_items = self._process_episode_frames(ep_data, ep_idx)
+                except Exception as e:
+                    logger.warning(f"Failed to process episode {ep_idx}: {e}")
+                    continue
+
+                # Optional: shuffle frames within episode
+                if self.shuffle and len(frame_items) > 1:
+                    rng.shuffle(frame_items)
+
+                # Feed into shuffle buffer
+                for frame in frame_items:
                     if len(frames_buffer) == self.buffer_size:
+                        if not buffer_full:
+                            buffer_full = True
+                            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} buffer full, starting yield", flush=True)
                         i = next(buffer_indices_generator)
                         yield_count += 1
                         to_yield = frames_buffer[i]
@@ -1399,14 +1378,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                         frames_buffer[i] = frame
                     else:
                         frames_buffer.append(frame)
-                    break
-            except (RuntimeError, StopIteration) as e:
-                print(
-                    f"[LoLAPretrainStreamingDataset] Worker {parallel_id} "
-                    f"finished after yielding {yield_count} items: {type(e).__name__}: {e}",
-                    flush=True,
-                )
-                break
 
         # Flush remaining buffer
         rng.shuffle(frames_buffer)
@@ -1421,153 +1392,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         else:
             yield from frames_buffer
 
-    def make_frame(self, dataset_iterator):
-        """生成帧数据，包含完整历史 action 和视频帧。"""
-        item = next(dataset_iterator)
-        item = item_to_torch(item)
-
-        updates = []
-
-        ep_idx = item["episode_index"]
-        current_ts = item["index"] / self.fps
-
-        episode_boundaries_ts = {
-            key: (
-                self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
-                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
-            )
-            for key in self.meta.video_keys
-        }
-
-        # Apply delta querying logic if necessary
-        if self.delta_indices is not None:
-            query_result, padding = self._get_delta_frames(dataset_iterator, item)
-            updates.append(query_result)
-            updates.append(padding)
-
-        # Load video frames
-        if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
-            query_timestamps = self._get_query_timestamps(
-                current_ts, self.delta_indices, episode_boundaries_ts
-            )
-            video_frames = self._query_videos(query_timestamps, ep_idx)
-
-            # No image_transforms for camera frames -- Qwen3.5 processor handles transforms
-            updates.append(video_frames)
-
-            if self.delta_indices is not None:
-                padding_mask = self._get_video_frame_padding_mask(
-                    video_frames, query_timestamps, original_timestamps
-                )
-                updates.append(padding_mask)
-
-        result = item.copy()
-        for update in updates:
-            result.update(update)
-
-        result["task"] = self.meta.tasks.iloc[item["task_index"]].name
-
-        # Apply camera valid mask: convert tensors to PIL Image / None
-        result = self._apply_camera_valid_mask(result, ep_idx)
-
-        # 添加历史 action
-        result = self._add_history_actions(result, dataset_iterator)
-
-        # Per-sub-dataset normalization (after history actions and camera valid mask)
-        result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
-
-        # Add dimension info
-        ds_idx = self._episode_to_ds_idx[ep_idx] if ep_idx < len(self._episode_to_ds_idx) and self._episode_to_ds_idx[ep_idx] >= 0 else 0
-        action_dim, state_dim = self._sub_dataset_dims[ds_idx] if ds_idx < len(self._sub_dataset_dims) else (self.action_dim, 0)
-        result["action_dim"] = action_dim
-        result["state_dim"] = state_dim
-
-        yield result
-
-    def _make_frame_lightweight(self, dataset_iterator):
-        """生成轻量级帧数据（不含解码后的视频帧），用于低内存 shuffle buffer。
-
-        与 make_frame 的区别：
-        - 不调用 _query_videos 解码视频帧
-        - 将视频查找信息存入 _video_lookup 字段
-        - 返回的帧不含视频图像数据（~4KB vs ~3.5MB）
-
-        视频帧在 yield 时通过 _decode_videos 按需解码。
-        """
-        item = next(dataset_iterator)
-        item = item_to_torch(item)
-
-        updates = []
-
-        ep_idx = item["episode_index"]
-        current_ts = item["index"] / self.fps
-
-        ep_meta = self.meta.episodes[ep_idx]
-
-        episode_boundaries_ts = {
-            key: (
-                ep_meta[f"videos/{key}/from_timestamp"],
-                ep_meta[f"videos/{key}/to_timestamp"],
-            )
-            for key in self.meta.video_keys
-        }
-
-        # Apply delta querying logic if necessary
-        if self.delta_indices is not None:
-            query_result, padding = self._get_delta_frames(dataset_iterator, item)
-            updates.append(query_result)
-            updates.append(padding)
-
-        # 不解码视频帧，改为存储视频查找信息
-        if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
-            query_timestamps = self._get_query_timestamps(
-                current_ts, self.delta_indices, episode_boundaries_ts
-            )
-            # 存储查找信息，yield 时再解码
-            # Include camera_valid_mask in _video_lookup for decode pipeline
-            item["_video_lookup"] = {
-                "ep_idx": ep_idx,
-                "query_timestamps": query_timestamps,
-                "original_timestamps": original_timestamps,
-                "camera_valid_mask": {
-                    cam_key: ep_meta.get(f"videos/{cam_key}/is_valid", 1) == 1
-                    for cam_key in self.meta.video_keys
-                },
-            }
-
-        result = item.copy()
-        for update in updates:
-            result.update(update)
-
-        result["task"] = self.meta.tasks.iloc[item["task_index"]].name
-
-        # 添加历史 action
-        result = self._add_history_actions(result, dataset_iterator)
-
-        # Per-sub-dataset normalization (after history actions)
-        result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
-
-        # Add dimension info
-        ds_idx = self._episode_to_ds_idx[ep_idx] if ep_idx < len(self._episode_to_ds_idx) and self._episode_to_ds_idx[ep_idx] >= 0 else 0
-        action_dim, state_dim = self._sub_dataset_dims[ds_idx] if ds_idx < len(self._sub_dataset_dims) else (self.action_dim, 0)
-        result["action_dim"] = action_dim
-        result["state_dim"] = state_dim
-
-        yield result
+    # ── Video decode ────────────────────────────────────────────────────
 
     def _decode_videos(self, lightweight_frame):
-        """对轻量级帧执行延迟的视频解码。
-
-        从 _video_lookup 中读取视频查找信息，解码视频帧，
-        添加到结果中并删除 _video_lookup 字段。
-        """
         video_lookup = lightweight_frame.pop("_video_lookup", None)
 
         if video_lookup is None:
-            # 无视频（非视频数据集或无 camera keys）
-            # 为 camera key 添加 placeholder（保持接口一致）
             for cam_key in self.meta.camera_keys:
                 if cam_key not in lightweight_frame:
                     lightweight_frame[cam_key] = self._make_padding_camera_frame(cam_key)
@@ -1579,17 +1409,13 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         original_timestamps = video_lookup["original_timestamps"]
         camera_valid_mask = video_lookup.get("camera_valid_mask", {})
 
-        # 执行视频解码
         video_frames = self._query_videos(query_timestamps, ep_idx)
-
-        # No image_transforms for camera frames -- Qwen3.5 processor handles transforms
 
         lightweight_frame.update(video_frames)
 
-        # Handle invalid cameras: set to None for those marked invalid
         for cam_key in self.meta.camera_keys:
             if not camera_valid_mask.get(cam_key, True):
-                lightweight_frame[cam_key] = None  # Invalid camera
+                lightweight_frame[cam_key] = None
 
         if self.delta_indices is not None:
             padding_mask = self._get_video_frame_padding_mask(
@@ -1597,94 +1423,37 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             )
             lightweight_frame.update(padding_mask)
 
-        # Apply camera valid mask: convert tensors to PIL Image / None
         lightweight_frame = self._apply_camera_valid_mask(lightweight_frame, ep_idx)
-
-        # Per-sub-dataset normalization (after camera valid mask)
-        lightweight_frame = self._normalize_per_subdataset(lightweight_frame, temp_process=self.temp_process)
 
         return lightweight_frame
 
     def decode_item(self, item):
-        """在主进程中解码轻量级帧的视频数据。
-
-        当 deferred_video_decode=True 时，worker 只 yield 轻量级帧（~4KB），
-        通过 DataLoader 的 multiprocessing.Queue 传输到主进程。
-        此方法在主进程中对轻量级帧执行视频解码，避免 decoded frames
-        在 worker 进程中堆积导致内存飙升（flush 阶段可达 50GB+）。
-
-        重要：PyTorch DataLoader 的 collate_fn 在 worker 进程中运行，
-        因此不能在 collate_fn 中调用此方法。正确的用法是在主进程中
-        通过 decode_and_collate() 辅助函数调用：
-
-            def passthrough_collate(batch):
-                return batch  # 直接传递，不做解码
-
-            loader = DataLoader(dataset, collate_fn=passthrough_collate, ...)
-
-            for items in loader:
-                # items 是 list of dicts
-                decoded = [dataset.decode_item(item) for item in items]
-                # ... collate decoded items
-        """
         if "_video_lookup" not in item:
             return item
         return self._decode_videos(item)
 
     def decode_items_batch(self, items):
-        """批量解码多个轻量级帧的视频数据（主进程调用）。
-
-        支持三种解码模式：
-        1. CUDA 解码 (decode_device="cuda"): 使用 NVDEC 硬件加速，串行调用
-        2. 多 decoder 并行 CPU 解码 (decode_device="cpu", decode_num_threads > 1):
-           为每个 item 创建独立的 VideoDecoder(num_ffmpeg_threads=2)，
-           使用 ThreadPoolExecutor 并行解码。多个 decoder 在 C 层面真正并行，
-           不受 Python GIL 限制，比单 decoder 多 ffmpeg 线程更高效。
-        3. 串行 CPU 解码 (decode_device="cpu", decode_num_threads=1): 默认方案
-
-        Args:
-            items: 轻量级帧列表（从 DataLoader 获取）
-
-        Returns:
-            解码后的帧列表
-        """
         if not self.deferred_video_decode:
             return items
 
-        # 过滤出需要解码的 items
         need_decode = ["_video_lookup" in item for item in items]
-
         if not any(need_decode):
             return items
 
         if self.decode_device == "cuda":
-            # CUDA 解码：串行调用（NVDEC 本身已高效）
             return [self.decode_item(item) for item in items]
 
         if self.decode_num_threads <= 1:
-            # 串行 CPU 解码：使用共享 cache
             return [self.decode_item(item) for item in items]
 
-        # 多 decoder 并行 CPU 解码：每个 item 独立 decoder，C 层面并行
         return self._decode_items_parallel(items)
 
     def _decode_items_parallel(self, items):
-        """多 decoder 并行解码：每个 item 独立 VideoDecoder，真正 C 层并行。
-
-        与共享 cache 的 ThreadPoolExecutor 方案不同：
-        - 共享 cache: 多线程争抢同一把锁，GIL 限制了 Python 层并行
-        - 独立 decoder: 每个 decoder 是独立的 C 对象，FFmpeg 线程不受 GIL 限制
-        - 每个 decoder 使用 num_ffmpeg_threads=2（经验最优值）
-        - ThreadPoolExecutor 只负责调度，实际解码在 C 层并行
-        """
         from concurrent.futures import ThreadPoolExecutor
-        from torchcodec.decoders import VideoDecoder as _VideoDecoder
-        import fsspec as _fsspec
 
-        num_ffmpeg_threads = 2  # 每个 decoder 的 ffmpeg 线程数
+        num_ffmpeg_threads = 2
 
         def _decode_one_item(item):
-            """在独立线程中解码单个 item，使用独立的 VideoDecoder。"""
             if "_video_lookup" not in item:
                 return item
 
@@ -1701,21 +1470,17 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             original_timestamps = video_lookup["original_timestamps"]
             camera_valid_mask = video_lookup.get("camera_valid_mask", {})
 
-            # 使用独立的 VideoDecoder（不经过 cache）
             video_frames = self._query_videos_independent(
                 query_timestamps, ep_idx, num_ffmpeg_threads
             )
 
             result = item.copy()
-            # No image_transforms for camera frames -- Qwen3.5 processor handles transforms
-
             result.update(video_frames)
             del result["_video_lookup"]
 
-            # Handle invalid cameras: set to None for those marked invalid
             for cam_key in self.meta.camera_keys:
                 if not camera_valid_mask.get(cam_key, True):
-                    result[cam_key] = None  # Invalid camera
+                    result[cam_key] = None
 
             if self.delta_indices is not None:
                 padding_mask = self._get_video_frame_padding_mask(
@@ -1723,11 +1488,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 )
                 result.update(padding_mask)
 
-            # Apply camera valid mask: convert tensors to PIL Image / None
             result = self._apply_camera_valid_mask(result, ep_idx)
-
-            # Per-sub-dataset normalization
-            result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
 
             return result
 
@@ -1737,11 +1498,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return decoded
 
     def _query_videos_independent(self, query_timestamps, ep_idx, num_ffmpeg_threads=2):
-        """使用独立的 VideoDecoder 解码视频（不使用缓存，线程安全）。
-
-        每个 decoder 使用独立的文件句柄和 FFmpeg 上下文，
-        多个线程可以真正并行解码而不争抢锁。
-        """
         from torchcodec.decoders import VideoDecoder as _VideoDecoder
         import fsspec as _fsspec
 
@@ -1750,12 +1506,23 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             root = self.meta.url_root if hasattr(self.meta, 'url_root') and self.streaming_from_local is False else self.root
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
 
+            # Look up seek_mode
+            video_rel = str(self.meta.get_video_file_path(ep_idx, video_key))
+            if video_rel.startswith("videos/"):
+                video_rel = video_rel[len("videos/"):]
+            seek_mode = self._video_seek_modes.get(video_rel, "approximate")
+
             fh = _fsspec.open(video_path).__enter__()
             try:
-                decoder = _VideoDecoder(fh, seek_mode="approximate", num_ffmpeg_threads=num_ffmpeg_threads)
+                decoder = _VideoDecoder(fh, seek_mode=seek_mode, num_ffmpeg_threads=num_ffmpeg_threads)
                 metadata = decoder.metadata
                 average_fps = metadata.average_fps
                 num_frames = metadata.num_frames
+
+                effective_tol_s = self.tolerance_s
+                if self.tolerance_frames is not None:
+                    effective_tol_s = (self.tolerance_frames + 0.5) / average_fps
+
                 frame_indices = [round(ts * average_fps) for ts in query_ts]
                 clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
                 frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
@@ -1764,15 +1531,14 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 loaded_frames = [frame for frame in frames_batch.data]
                 loaded_ts = [pts.item() for pts in frames_batch.pts_seconds]
 
-                # Tolerance check
                 query_ts_tensor = torch.tensor(query_ts)
                 loaded_ts_tensor = torch.tensor(loaded_ts)
                 dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
                 min_, argmin_ = dist.min(1)
                 clamped_mask_tensor = torch.tensor(clamped_mask)
-                is_within_tol = (min_ < self.tolerance_s) | clamped_mask_tensor
+                is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
                 assert is_within_tol.all(), (
-                    f"Timestamp tolerance violated: {min_[~is_within_tol]} > {self.tolerance_s=}. "
+                    f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
                     f"video: {video_path}"
                 )
 
@@ -1789,16 +1555,14 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                     pass
         return item
 
-    # ── 异步解码管线 ──────────────────────────────────────────────────
+    # ── Async decode pipeline ───────────────────────────────────────────
 
     def _ensure_decode_pipeline(self):
-        """Lazily create the DecodeProcessPipeline if not already created."""
         if self._decode_pipeline is None:
             n_cameras = max(1, len(self.meta.video_keys))
             cache_size = max(4, 2 * self._num_dataloader_workers * n_cameras)
             num_threads = self.decode_num_threads if self.decode_num_threads > 1 else self._num_dataloader_workers
 
-            # 预提取 episode 视频路径映射（避免传递不可 pickle 的 HF datasets.Dataset）
             episode_video_map = {}
             episode_is_valid_map = {}
             for ep_idx in range(len(self.meta.episodes)):
@@ -1809,7 +1573,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                         ep[f"videos/{vid_key}/chunk_index"],
                         ep[f"videos/{vid_key}/file_index"],
                     )
-                # Extract is_valid info for camera keys
                 episode_is_valid_map[ep_idx] = {
                     cam_key: ep.get(f"videos/{cam_key}/is_valid", 1) == 1
                     for cam_key in self.meta.camera_keys
@@ -1823,6 +1586,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 root=str(self.root),
                 streaming_from_local=self.streaming_from_local,
                 tolerance_s=self.tolerance_s,
+                tolerance_frames=self.tolerance_frames,
                 camera_keys=list(self.meta.camera_keys),
                 delta_indices=self.delta_indices,
                 video_path_template=self.meta.video_path,
@@ -1833,53 +1597,34 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 decode_num_threads=num_threads,
                 cache_size_per_thread=cache_size,
                 episode_is_valid_map=episode_is_valid_map,
+                video_seek_modes=self._video_seek_modes,
             )
 
-            # 预检查 config 可 pickle 性
             try:
                 pickle.dumps(config)
             except (pickle.PicklingError, TypeError, AttributeError) as e:
                 raise ValueError(
-                    f"DecodeProcessConfig 包含不可 pickle 的属性，无法启动解码子进程: {e}. "
-                    f"请确保 delta_indices 等属性是可 pickle 的。"
+                    f"DecodeProcessConfig contains unpicklable attributes: {e}. "
+                    f"Ensure delta_indices and other attributes are picklable."
                 ) from e
 
             self._decode_pipeline = DecodeProcessPipeline(config)
 
     def shutdown_decode_pipeline(self):
-        """Clean up the async decode pipeline. Call at end of training."""
         if self._decode_pipeline is not None:
             self._decode_pipeline.shutdown()
             self._decode_pipeline = None
 
     def decode_iter(self, dataloader):
-        """Async decode iterator: overlaps video decode with training.
-
-        While the main process trains on batch N, the decode subprocess
-        decodes batch N+1 using a persistent per-thread VideoDecoder cache.
-        This hides decode latency behind training compute.
-
-        Usage:
-            for decoded_items in dataset.decode_iter(loader):
-                batch = collate_decoded(decoded_items)
-                loss = model(batch)  # decode process works on N+1 here
-
-        Timeline:
-            Main:    [fetch N] [consume N-1 + submit N] [train N-1] [consume N + submit N+1] ...
-            Decode:            [decode N]                              [decode N+1]            ...
-        """
         items_iter = iter(dataloader)
 
-        # Create pipeline lazily
         self._ensure_decode_pipeline()
 
-        # Prefetch: submit first batch for decoding
         try:
             first_items = next(items_iter)
         except StopIteration:
             return
 
-        # If no video decode needed, pass through directly
         if not self.deferred_video_decode or not any(
             "_video_lookup" in item for item in first_items
         ):
@@ -1890,17 +1635,14 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self._decode_pipeline.submit(first_items)
 
         for items in items_iter:
-            # Get decoded PREVIOUS batch (blocks until ready)
             decoded = self._decode_pipeline.consume()
-
-            # Submit CURRENT items for decoding (non-blocking if queue has space)
             self._decode_pipeline.submit(items)
-
             yield decoded
 
-        # Get the last decoded batch
         decoded = self._decode_pipeline.consume()
         yield decoded
+
+    # ── Video helpers ───────────────────────────────────────────────────
 
     def _make_timestamps_from_indices(self, start_ts, indices=None):
         if indices is not None:
@@ -1942,14 +1684,6 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return query_timestamps
 
     def _query_videos(self, query_timestamps, ep_idx, skip_invalid=True):
-        """Query video frames, optionally skipping invalid cameras.
-
-        Args:
-            query_timestamps: dict of video_key -> list of timestamps
-            ep_idx: episode index
-            skip_invalid: if True, skip decoding for cameras with is_valid=0
-                and use zero padding frames instead.
-        """
         item = {}
         ep_meta = self.meta.episodes[ep_idx]
 
@@ -1958,86 +1692,85 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             is_valid = ep_meta.get(is_valid_key, 1)
 
             if skip_invalid and is_valid == 0:
-                # Skip decoding, use zero padding frame
                 item[video_key] = self._make_padding_camera_frame(video_key)
                 continue
 
-            # Normal decode logic
-            root = self.meta.url_root if hasattr(self.meta, 'url_root') and self.streaming_from_local is False else self.root
+            root = (
+                self.meta.url_root
+                if hasattr(self.meta, "url_root") and not self.streaming_from_local
+                else self.root
+            )
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
 
-            if self.decode_device == "cuda":
-                # CUDA 解码路径：使用 GPU 硬件加速 (NVDEC)
-                frames = self._decode_video_cuda(video_path, query_ts)
-            else:
-                # CPU 解码路径：使用缓存的 decoder
-                frames = decode_video_frames_torchcodec(
-                    video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
+            # Look up seek_mode
+            video_rel = str(self.meta.get_video_file_path(ep_idx, video_key))
+            if video_rel.startswith("videos/"):
+                video_rel = video_rel[len("videos/"):]
+            seek_mode = self._video_seek_modes.get(video_rel, "approximate")
+
+            try:
+                if self.decode_device == "cuda":
+                    frames = self._decode_video_cuda(video_path, query_ts, seek_mode=seek_mode)
+                else:
+                    frames = decode_video_frames_torchcodec(
+                        video_path, query_ts, self.tolerance_s,
+                        tolerance_frames=self.tolerance_frames,
+                        decoder_cache=self.video_decoder_cache,
+                        seek_mode=seek_mode,
+                    )
+            except Exception as e:
+                logging.error(
+                    f"Video decode failed for ep_idx={ep_idx}, video_key={video_key}: "
+                    f"video_path={video_path}, query_ts={query_ts}, err={e}"
                 )
+                raise
 
             item[video_key] = _maybe_squeeze(frames, len(query_ts))
         return item
 
-    def _decode_video_cuda(self, video_path, timestamps):
-        """使用 CUDA (NVDEC) 解码视频帧。
-
-        在主进程中使用 device="cuda" 的 VideoDecoder，
-        利用 GPU 硬件加速视频解码，解码后转回 CPU tensor。
-        """
+    def _decode_video_cuda(self, video_path, timestamps, seek_mode="approximate"):
         from torchcodec.decoders import VideoDecoder
-        import fsspec
 
-        # 使用 CUDA 解码器缓存
+        video_path_str = str(video_path)
+
         if self._cuda_decoder_cache is None:
             self._cuda_decoder_cache = BoundedVideoDecoderCache(max_size=4)
 
-        cache = self._cuda_decoder_cache
-        video_path_str = str(video_path)
+        decoder = self._cuda_decoder_cache.get_decoder(video_path_str, seek_mode)
 
-        with cache._lock:
-            if video_path_str not in cache._cache:
-                file_handle = fsspec.open(video_path_str).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-                cache._cache[video_path_str] = (decoder, file_handle)
-                cache._key_order.append(video_path_str)
-                # 淘汰超出容量的解码器
-                while len(cache._cache) > cache._max_size:
-                    oldest_key = cache._key_order.pop(0)
-                    old_decoder, old_handle = cache._cache.pop(oldest_key)
-                    try:
-                        old_handle.close()
-                    except Exception:
-                        pass
-            else:
-                # 更新访问顺序
-                if video_path_str in cache._key_order:
-                    cache._key_order.remove(video_path_str)
-                cache._key_order.append(video_path_str)
-
-        decoder = cache._cache[video_path_str][0]
-
-        # 解码帧
         metadata = decoder.metadata
         average_fps = metadata.average_fps
         num_frames = metadata.num_frames
+
+        effective_tol_s = self.tolerance_s
+        if self.tolerance_frames is not None:
+            effective_tol_s = (self.tolerance_frames + 0.5) / average_fps
+
         frame_indices = [round(ts * average_fps) for ts in timestamps]
         clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
         frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
-        frames_batch = decoder.get_frames_at(indices=frame_indices)
 
-        # GPU 解码后转回 CPU
+        try:
+            frames_batch = decoder.get_frames_at(indices=frame_indices)
+        except RuntimeError as e:
+            if "Expected pre-allocated tensor" in str(e):
+                logging.warning(f"CUDA pre-allocated tensor mismatch for {video_path_str}. Evicting and rebuilding.")
+                decoder = self._cuda_decoder_cache.evict_and_rebuild(video_path_str, seek_mode)
+                frames_batch = decoder.get_frames_at(indices=frame_indices)
+            else:
+                raise
+
         loaded_frames = [frame.cpu() for frame in frames_batch.data]
         loaded_ts = [pts.item() for pts in frames_batch.pts_seconds]
 
-        # Tolerance check (same as decode_video_frames_torchcodec)
         query_ts_tensor = torch.tensor(timestamps)
         loaded_ts_tensor = torch.tensor(loaded_ts)
         dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
         min_, argmin_ = dist.min(1)
         clamped_mask_tensor = torch.tensor(clamped_mask)
-        is_within_tol = (min_ < self.tolerance_s) | clamped_mask_tensor
+        is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
         assert is_within_tol.all(), (
-            f"Timestamp tolerance violated: {min_[~is_within_tol]} > {self.tolerance_s=}. "
+            f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
             f"video: {video_path}"
         )
 
@@ -2048,203 +1781,14 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             closest_frames = [(f / 255.0).type(torch.float32) for f in closest_frames]
         return closest_frames
 
-    def _get_delta_frames(self, dataset_iterator, current_item):
-        current_episode_idx = current_item["episode_index"]
-        query_result = {}
-        padding = {}
-
-        for key, delta_indices in self.delta_indices.items():
-            if key in self.meta.video_keys:
-                continue
-
-            target_frames = []
-            is_pad = []
-            delta_results = {}
-
-            negative_deltas = sorted([d for d in delta_indices if d < 0], reverse=True)
-            positive_deltas = sorted([d for d in delta_indices if d > 0])
-            zero_deltas = [d for d in delta_indices if d == 0]
-
-            for delta in zero_deltas:
-                delta_results[delta] = (current_item[key], False)
-
-            lookback_failed = False
-            last_successful_frame = current_item[key]
-            for delta in negative_deltas:
-                if lookback_failed:
-                    delta_results[delta] = (last_successful_frame, True)
-                    continue
-                try:
-                    steps_back = abs(delta)
-                    if dataset_iterator.can_peek_back(steps_back):
-                        past_item = dataset_iterator.peek_back(steps_back)
-                        past_item = item_to_torch(past_item)
-                        if past_item["episode_index"] == current_episode_idx:
-                            delta_results[delta] = (past_item[key], False)
-                            last_successful_frame = past_item[key]
-                        else:
-                            raise LookBackError("Retrieved frame is from different episode!")
-                    else:
-                        raise LookBackError("Cannot go back further than the history buffer!")
-                except LookBackError:
-                    delta_results[delta] = (last_successful_frame, True)
-                    lookback_failed = True
-
-            lookahead_failed = False
-            last_successful_frame = current_item[key]
-            for delta in positive_deltas:
-                if lookahead_failed:
-                    delta_results[delta] = (last_successful_frame, True)
-                    continue
-                try:
-                    if dataset_iterator.can_peek_ahead(delta):
-                        future_item = dataset_iterator.peek_ahead(delta)
-                        future_item = item_to_torch(future_item)
-                        if future_item["episode_index"] == current_episode_idx:
-                            delta_results[delta] = (future_item[key], False)
-                            last_successful_frame = future_item[key]
-                        else:
-                            raise LookAheadError("Retrieved frame is from different episode!")
-                    else:
-                        raise LookAheadError("Cannot go ahead further than the lookahead buffer!")
-                except LookAheadError:
-                    delta_results[delta] = (last_successful_frame, True)
-                    lookahead_failed = True
-
-            for delta in delta_indices:
-                frame, is_padded = delta_results[delta]
-                target_frames.append(frame)
-                is_pad.append(is_padded)
-
-            if target_frames:
-                query_result[key] = torch.stack(target_frames)
-                padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
-
-        return query_result, padding
-
-    def _add_history_actions(self, item, dataset_iterator):
-        """为当前帧添加完整历史 action。
-
-        优化：使用单次 history() 调用替代 1023 次 peek_back + item_to_torch，
-        仅提取 episode_index 和 action 字段，在 episode 边界处提前终止。
-        """
-        current_episode_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
-
-        current_action = item.get("action")
-        if current_action is None:
-            return item
-
-        if current_action.dim() > 1:
-            current_action = current_action[0] if current_action.shape[0] == 1 else current_action[-1]
-
-        # 单次获取整个历史缓冲区，替代逐个 peek_back 调用
-        hist = dataset_iterator.history()  # 按时间顺序 (oldest first)
-
-        past_actions = []
-        past_masks = []
-
-        # 从最近的历史项向前遍历，遇到 episode 边界即终止
-        # 因为 episode 是连续的，一旦找到不同 episode 的项，更早的项也属于不同 episode
-        for i in range(len(hist) - 1, -1, -1):
-            if len(past_actions) >= self.max_history_length - 1:
-                break
-
-            past_item = hist[i]
-
-            # 仅提取 episode_index（最小化转换）
-            ep_idx = past_item.get("episode_index")
-            if isinstance(ep_idx, (np.ndarray, list)):
-                ep_idx = torch.tensor(ep_idx)
-                past_item["episode_index"] = ep_idx  # 缓存转换结果
-            ep_val = ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
-
-            if ep_val != current_episode_idx:
-                break  # Episode 边界，更早的项也属于不同 episode，提前终止
-
-            # 仅提取 action 字段（最小化转换）
-            past_action = past_item.get("action")
-            if past_action is not None:
-                if isinstance(past_action, (np.ndarray, list)):
-                    past_action = torch.tensor(past_action)
-                    past_item["action"] = past_action  # 缓存转换结果
-                if past_action.dim() > 1:
-                    past_action = past_action[0] if past_action.shape[0] == 1 else past_action[-1]
-                past_actions.append(past_action)
-                past_masks.append(True)
-            else:
-                past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                past_masks.append(False)
-
-        # 反转为时间顺序 (oldest first)
-        past_actions.reverse()
-        past_masks.reverse()
-
-        past_actions.append(current_action)
-        past_masks.append(True)
-
-        hist_actions = torch.stack(past_actions)
-        hist_actions_mask = torch.BoolTensor(past_masks)
-
-        actual_history_length = len(past_actions)
-
-        padded_length = ((actual_history_length + self.action_chunk_size - 1) // self.action_chunk_size) * self.action_chunk_size
-
-        if padded_length > self.max_history_length:
-            padded_length = (self.max_history_length // self.action_chunk_size) * self.action_chunk_size
-            if actual_history_length > padded_length:
-                truncate_length = actual_history_length - padded_length
-                hist_actions = hist_actions[truncate_length:]
-                hist_actions_mask = hist_actions_mask[truncate_length:]
-                actual_history_length = padded_length
-
-        if actual_history_length < padded_length:
-            pad_length = padded_length - actual_history_length
-            padding_actions = torch.zeros(pad_length, self.action_dim, dtype=hist_actions.dtype)
-            padding_mask = torch.zeros(pad_length, dtype=torch.bool)
-
-            if self.history_padding_side == "left":
-                hist_actions = torch.cat([padding_actions, hist_actions], dim=0)
-                hist_actions_mask = torch.cat([padding_mask, hist_actions_mask], dim=0)
-            else:
-                hist_actions = torch.cat([hist_actions, padding_actions], dim=0)
-                hist_actions_mask = torch.cat([hist_actions_mask, padding_mask], dim=0)
-
-        item["hist_actions_full"] = hist_actions
-        item["hist_actions_mask"] = hist_actions_mask
-        item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
-
-        return item
+    @staticmethod
+    def _iter_random_indices(rng: np.random.Generator, buffer_size: int, random_batch_size=100):
+        while True:
+            yield from (int(i) for i in rng.integers(0, buffer_size, size=random_batch_size))
 
 
 class AsyncDecodeDataLoader:
-    """Wraps a DataLoader with video decode + collate for PyTorch Lightning.
-
-    Supports three decode modes based on dataset configuration:
-
-    1. deferred_video_decode=True + async_decode=False (yield-time decode, best balance):
-       Workers store lightweight frames in shuffle buffer, decode on yield.
-       Items arrive at DataLoader already decoded. Throughput: ~9-10 batch/s.
-       Memory: only DataLoader's prefetch queue holds decoded frames (~1.8GB).
-
-    2. deferred_video_decode=True + async_decode=True (subprocess pipeline):
-       Workers yield lightweight frames. A dedicated decode subprocess decodes
-       them via decode_iter. Memory-safe with bounded queues.
-
-    3. deferred_video_decode=False (worker decode, fastest):
-       Workers decode video inside make_frame. Items are already decoded.
-       Throughput: ~9-10 batch/s. But flush phase causes memory spike.
-
-    Usage:
-        raw_loader = DataLoader(dataset, ...)
-        async_loader = AsyncDecodeDataLoader(raw_loader, dataset, collate_fn=collate_decoded)
-
-        for batch in async_loader:
-            # batch is already decoded and collated
-            loss = model(batch)
-
-    For PyTorch Lightning:
-        trainer.fit(model, train_dataloaders=async_loader)
-    """
+    """Wraps a DataLoader with video decode + collate for PyTorch Lightning."""
 
     VARIABLE_LENGTH_KEYS = {"hist_actions_full", "hist_actions_mask"}
 
@@ -2255,17 +1799,6 @@ class AsyncDecodeDataLoader:
 
     @staticmethod
     def make_collate_fn():
-        """Create a collate function that handles variable-length tensors and dynamic resolution.
-
-        This collate fn handles:
-        - hist_actions_full and hist_actions_mask by left-padding shorter sequences
-          to the max length in the batch, then stacking.
-        - Camera keys (observation.images.*) as lists of PIL Images or None,
-          supporting dynamic resolution for Qwen3.5 processor.
-        - camera_valid_mask as a list of dicts.
-        - action_dim and state_dim as tensors.
-        - All other tensors are stacked normally.
-        """
         variable_length_keys = AsyncDecodeDataLoader.VARIABLE_LENGTH_KEYS
 
         def collate_fn(batch):
@@ -2275,10 +1808,8 @@ class AsyncDecodeDataLoader:
                 if key == "task":
                     result[key] = values
                 elif key.startswith("observation.images."):
-                    # Dynamic resolution: PIL Image or None, keep as list
                     result[key] = values
                 elif key == "camera_valid_mask":
-                    # dict, keep as list
                     result[key] = values
                 elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
                     max_len = max(v.shape[0] for v in values)
@@ -2305,15 +1836,19 @@ class AsyncDecodeDataLoader:
 
     def __iter__(self):
         if self._dataset.async_decode and self._dataset.deferred_video_decode:
-            # Mode 2: Subprocess decode pipeline (memory-safe).
             for decoded_items in self._dataset.decode_iter(self._loader):
                 if self._collate_fn is not None:
                     yield self._collate_fn(decoded_items)
                 else:
                     yield decoded_items
         else:
-            # Mode 1 & 3: Items already decoded (yield-time or worker decode).
+            # In decode_on_yield mode, workers already decoded items (no _video_lookup).
+            # Only call decode_items_batch when items still have _video_lookup
+            # (deferred + async path, where DecodeProcessPipeline handles decode).
+            decode_on_yield = self._dataset.deferred_video_decode and not self._dataset.async_decode
             for batch in self._loader:
+                if self._dataset.deferred_video_decode and not decode_on_yield:
+                    batch = self._dataset.decode_items_batch(batch)
                 if self._collate_fn is not None:
                     batch = self._collate_fn(batch)
                 yield batch

@@ -836,6 +836,8 @@ class LoLAPolicy(PreTrainedPolicy):
         # 1. 提取 input_ids
         if "input_ids" in batch:
             input_ids = batch["input_ids"]
+        elif "observation.language.tokens" in batch:
+            input_ids = batch["observation.language.tokens"]
         elif "observation.language_tokens" in batch:
             input_ids = batch["observation.language_tokens"]
         else:
@@ -846,7 +848,7 @@ class LoLAPolicy(PreTrainedPolicy):
         # 2. 提取视觉输入（如果有）
         pixel_values = batch.get("pixel_values", None)
         image_grid_thw = batch.get("image_grid_thw", None)
-        attention_mask = batch.get("attention_mask", None)
+        attention_mask = batch.get("attention_mask", None) or batch.get("observation.language.attention_mask", None)
 
         # 3. 调用 Qwen3.5 获取 hidden_states
         # 如果 batch 中已经提供了预计算的 hidden_states，直接使用
