@@ -520,12 +520,17 @@ def _safe_concat_tables(tables: list[pa.Table]) -> pa.Table:
     return pa.concat_tables(aligned)
 
 
+def _is_valid_parquet_file(path) -> bool:
+    """Filter out hidden and temporary files (e.g. Azure .azDownload-* partial downloads)."""
+    return not path.name.startswith(".")
+
+
 def _discover_parquet_files(root: str) -> list[str]:
     from pathlib import Path
     data_dir = Path(root) / "data"
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    files = sorted(data_dir.glob("*/*.parquet"))
+    files = sorted(f for f in data_dir.glob("*/*.parquet") if _is_valid_parquet_file(f))
     return [str(f) for f in files]
 
 
@@ -540,7 +545,7 @@ def _load_episodes_polars(root) -> list[dict]:
     if not episodes_dir.exists():
         raise FileNotFoundError(f"Episodes directory not found: {episodes_dir}")
 
-    parquet_files = sorted(episodes_dir.glob("*/*.parquet"))
+    parquet_files = sorted(f for f in episodes_dir.glob("*/*.parquet") if _is_valid_parquet_file(f))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files in {episodes_dir}")
 

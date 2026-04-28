@@ -595,13 +595,18 @@ class PolarsRowIterator:
         return result
 
 
+def _is_valid_parquet_file(path) -> bool:
+    """Filter out hidden and temporary files (e.g. Azure .azDownload-* partial downloads)."""
+    return not path.name.startswith(".")
+
+
 def _discover_parquet_files(root: str) -> list[str]:
     """发现数据目录下所有 chunk/file parquet 文件，按顺序排列。"""
     from pathlib import Path
     data_dir = Path(root) / "data"
     if not data_dir.exists():
         raise FileNotFoundError(f"数据目录不存在: {data_dir}")
-    files = sorted(data_dir.glob("*/*.parquet"))
+    files = sorted(f for f in data_dir.glob("*/*.parquet") if _is_valid_parquet_file(f))
     return [str(f) for f in files]
 
 
