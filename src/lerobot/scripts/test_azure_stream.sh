@@ -98,7 +98,7 @@ CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-0th-pretrain"
 TRAIN_VLM=false
 
 # 模型维度参数
-ACTION_DIM=14
+ACTION_DIM=20
 ACTION_CHUNK_SIZE=10
 PRED_CHUNK_SIZE=50
 N_OBS_STEPS=1

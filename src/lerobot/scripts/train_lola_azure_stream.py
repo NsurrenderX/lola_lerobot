@@ -41,6 +41,12 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+try:
+    import pynvml
+    HAS_NVML = True
+except ImportError:
+    HAS_NVML = False
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 
@@ -100,6 +106,192 @@ def setup_distributed():
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+class InterconnectMonitor:
+    """Monitor NVLink, PCIe, and InfiniBand throughput via NVML and sysfs."""
+
+    def __init__(self, device: torch.device):
+        self.available = HAS_NVML
+        if not self.available:
+            logger.info("InterconnectMonitor: pynvml not available, skipping interconnect metrics")
+            return
+
+        self.gpu_index = device.index or 0
+        try:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+        except Exception as e:
+            logger.warning(f"InterconnectMonitor: NVML init failed ({e}), skipping")
+            self.available = False
+            return
+
+        # Detect NVLink capability
+        self._nvlink_supported = True
+        self._active_nvlink_links = []
+        for link in range(pynvml.NVML_NVLINK_MAX_LINKS):
+            try:
+                state = pynvml.nvmlDeviceGetNvLinkState(self.handle, link)
+                if state == pynvml.NVML_NVLINK_STATE_ACTIVE:
+                    self._active_nvlink_links.append(link)
+            except pynvml.NVMLError:
+                pass
+
+        # Pre-check NVLink byte counter fields
+        if self._active_nvlink_links:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_RCV_BYTES,
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_XMIT_BYTES,
+                ])
+                if any(v.nvmlReturn != 0 for v in vals):
+                    logger.info("InterconnectMonitor: NVLink byte counters not supported, skipping NVLink metrics")
+                    self._nvlink_supported = False
+            except Exception:
+                self._nvlink_supported = False
+        else:
+            logger.info(f"InterconnectMonitor: No active NVLink links (GPU {self.gpu_index}), skipping NVLink metrics")
+            self._nvlink_supported = False
+
+        # Pre-check PCIe byte counter fields
+        self._pcie_supported = True
+        try:
+            vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                pynvml.NVML_FI_DEV_PCIE_COUNT_RX_BYTES,
+                pynvml.NVML_FI_DEV_PCIE_COUNT_TX_BYTES,
+            ])
+            if any(v.nvmlReturn != 0 for v in vals):
+                logger.info("InterconnectMonitor: PCIe byte counters not supported, will use nvmlDeviceGetPcieThroughput")
+                self._pcie_supported = False
+        except Exception:
+            self._pcie_supported = False
+
+        # Discover IB devices from sysfs
+        self._ib_supported = True
+        self._ib_counter_paths = []
+        ib_base = "/sys/class/infiniband"
+        try:
+            ib_devs = os.listdir(ib_base)
+        except OSError:
+            ib_devs = []
+
+        for dev_name in ib_devs:
+            dev_path = os.path.join(ib_base, dev_name)
+            try:
+                ports = os.listdir(os.path.join(dev_path, "ports"))
+            except OSError:
+                continue
+            for port_name in ports:
+                counters_dir = os.path.join(dev_path, "ports", port_name, "counters")
+                rcv_path = os.path.join(counters_dir, "port_rcv_data")
+                xmit_path = os.path.join(counters_dir, "port_xmit_data")
+                if os.path.isfile(rcv_path) and os.path.isfile(xmit_path):
+                    self._ib_counter_paths.append((rcv_path, xmit_path))
+
+        if not self._ib_counter_paths:
+            logger.info("InterconnectMonitor: No IB devices found, skipping IB metrics")
+            self._ib_supported = False
+
+        # State for delta computation
+        self._prev_pcie_rx = None
+        self._prev_pcie_tx = None
+        self._prev_nvlink_rcv = None
+        self._prev_nvlink_xmit = None
+        self._prev_ib_rcv = None
+        self._prev_ib_xmit = None
+        self._prev_timestamp = None
+
+        logger.info(
+            f"InterconnectMonitor initialized for GPU {self.gpu_index}: "
+            f"PCIe={self._pcie_supported} NVLink={self._nvlink_supported} IB={self._ib_supported}"
+        )
+
+    def snapshot(self) -> dict:
+        """Take a snapshot and compute throughput from delta with previous snapshot."""
+        if not self.available:
+            return {}
+
+        now = time.monotonic()
+        metrics = {}
+
+        # PCIe throughput
+        if self._pcie_supported:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_PCIE_COUNT_RX_BYTES,
+                    pynvml.NVML_FI_DEV_PCIE_COUNT_TX_BYTES,
+                ])
+                rx = vals[0].value.ullVal
+                tx = vals[1].value.ullVal
+                if self._prev_pcie_rx is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["pcie_rx_gb_s"] = (rx - self._prev_pcie_rx) / dt / 1e9
+                        metrics["pcie_tx_gb_s"] = (tx - self._prev_pcie_tx) / dt / 1e9
+                self._prev_pcie_rx = rx
+                self._prev_pcie_tx = tx
+            except Exception:
+                pass
+
+        if not self._pcie_supported and not metrics:
+            # Fallback: use instantaneous PCIe throughput (KB/s -> GB/s)
+            try:
+                rx_kbs = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_RX_BYTES)
+                tx_kbs = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_TX_BYTES)
+                metrics["pcie_rx_gb_s"] = rx_kbs / 1e6
+                metrics["pcie_tx_gb_s"] = tx_kbs / 1e6
+            except Exception:
+                pass
+
+        # NVLink throughput
+        if self._nvlink_supported:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_RCV_BYTES,
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_XMIT_BYTES,
+                ])
+                rcv = vals[0].value.ullVal
+                xmit = vals[1].value.ullVal
+                if self._prev_nvlink_rcv is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["nvlink_rx_gb_s"] = (rcv - self._prev_nvlink_rcv) / dt / 1e9
+                        metrics["nvlink_tx_gb_s"] = (xmit - self._prev_nvlink_xmit) / dt / 1e9
+                self._prev_nvlink_rcv = rcv
+                self._prev_nvlink_xmit = xmit
+            except Exception:
+                pass
+
+        # IB throughput
+        if self._ib_supported:
+            try:
+                total_rcv = 0
+                total_xmit = 0
+                for rcv_path, xmit_path in self._ib_counter_paths:
+                    with open(rcv_path) as f:
+                        total_rcv += int(f.read().strip())
+                    with open(xmit_path) as f:
+                        total_xmit += int(f.read().strip())
+                if self._prev_ib_rcv is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["ib_rx_gb_s"] = (total_rcv - self._prev_ib_rcv) / dt / 1e9
+                        metrics["ib_tx_gb_s"] = (total_xmit - self._prev_ib_xmit) / dt / 1e9
+                self._prev_ib_rcv = total_rcv
+                self._prev_ib_xmit = total_xmit
+            except Exception:
+                pass
+
+        self._prev_timestamp = now
+        return metrics
+
+    def close(self):
+        if self.available:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self.available = False
 
 
 def create_lola_streaming_dataset(
@@ -285,6 +477,7 @@ class LoLATrainer:
 
         self.global_step = 0
         self.best_loss = float("inf")
+        self.interconnect_monitor = None
 
     def setup_model(self):
         """设置模型"""
@@ -320,6 +513,8 @@ class LoLATrainer:
                 self._setup_ddp()
         else:
             self.model = self.policy
+
+        self.interconnect_monitor = InterconnectMonitor(self.device)
 
     def _setup_ddp(self):
         """设置 DDP"""
@@ -503,16 +698,50 @@ class LoLATrainer:
                 lr = self.scheduler.get_last_lr()[0]
                 gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
                 gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                interconnect_metrics = self.interconnect_monitor.snapshot() if self.interconnect_monitor else {}
 
                 if self.is_main_process:
+                    grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
+
+                    # ── Console logging (mirrors all wandb metrics) ──
                     logger.info(
-                        f"Step {self.global_step}/{self.max_steps} | "
-                        f"Loss: {loss.item():.4f} | "
-                        f"LR: {lr:.2e} | "
-                        f"Update: {update_s:.2f}s | "
-                        f"Throughput: {batch_per_s:.2f} batch/s | "
-                        f"GPU: {gpu_mem_alloc:.1f}/{gpu_mem_reserved:.1f} GB"
+                        f"[Step {self.global_step}/{self.max_steps}] "
+                        f"Loss={loss.item():.4f} LR={lr:.2e} "
+                        f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
                     )
+                    if grad_norm_val is not None:
+                        logger.info(f"  grad_norm={grad_norm_val:.4f}")
+                    logger.info(
+                        f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
+                        f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
+                    )
+                    logger.info(
+                        f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
+                        f"reserved={gpu_mem_reserved:.1f}GB"
+                    )
+                    if interconnect_metrics:
+                        parts = []
+                        if "pcie_rx_gb_s" in interconnect_metrics:
+                            parts.append(
+                                f"PCIe rx={interconnect_metrics['pcie_rx_gb_s']:.2f} "
+                                f"tx={interconnect_metrics['pcie_tx_gb_s']:.2f} GB/s"
+                            )
+                        if "nvlink_rx_gb_s" in interconnect_metrics:
+                            parts.append(
+                                f"NVLink rx={interconnect_metrics['nvlink_rx_gb_s']:.2f} "
+                                f"tx={interconnect_metrics['nvlink_tx_gb_s']:.2f} GB/s"
+                            )
+                        if "ib_rx_gb_s" in interconnect_metrics:
+                            parts.append(
+                                f"IB rx={interconnect_metrics['ib_rx_gb_s']:.2f} "
+                                f"tx={interconnect_metrics['ib_tx_gb_s']:.2f} GB/s"
+                            )
+                        logger.info(f"  Interconnect: {' | '.join(parts)}")
+                    for k, v in loss_dict.items():
+                        if k != "loss" and isinstance(v, (int, float)):
+                            logger.info(f"  {k}={v:.4f}")
+
+                    # ── Wandb logging ──────────────────────────────
                     if self.use_wandb:
                         log_dict = {
                             "train/loss": loss.item(),
@@ -527,11 +756,13 @@ class LoLATrainer:
                             "train/gpu_mem_alloc_gb": gpu_mem_alloc,
                             "train/gpu_mem_reserved_gb": gpu_mem_reserved,
                         }
-                        if grad_norm is not None:
-                            log_dict["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                        if grad_norm_val is not None:
+                            log_dict["train/grad_norm"] = grad_norm_val
                         for k, v in loss_dict.items():
                             if k != "loss" and isinstance(v, (int, float)):
                                 log_dict[f"train/{k}"] = v
+                        for k, v in interconnect_metrics.items():
+                            log_dict[f"interconnect/{k}"] = v
                         wandb.log(log_dict)
 
             if self.global_step % self.save_every_n_steps == 0:
@@ -539,6 +770,9 @@ class LoLATrainer:
 
         self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
         logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+
+        if self.interconnect_monitor:
+            self.interconnect_monitor.close()
 
         if self.use_wandb:
             wandb.finish()
@@ -634,7 +868,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None)
 
     # LoLA 参数
-    parser.add_argument("--action_dim", type=int, default=14)
+    parser.add_argument("--action_dim", type=int, default=20)
     parser.add_argument("--action_chunk_size", type=int, default=10)
     parser.add_argument("--pred_chunk_size", type=int, default=50)
     parser.add_argument("--n_obs_steps", type=int, default=1)
