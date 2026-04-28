@@ -312,10 +312,10 @@ echo "========================================"
 # 构建训练命令
 # ----------------------------------------------------------------------
 if [ "$NNODES" -eq 1 ]; then
-    cmd="torchrun --nproc_per_node=${NPROC_PER_NODE} \
+    cmd="/opt/conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
         src/lerobot/scripts/train_lola_azure_stream.py"
 else
-    cmd="torchrun \
+    cmd="/opt/conda/envs/lerobot/bin/torchrun \
         --nnodes=${NNODES} \
         --nproc_per_node=${NPROC_PER_NODE} \
         --node_rank=${NODE_RANK} \
