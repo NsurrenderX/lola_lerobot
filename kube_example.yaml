@@ -24,21 +24,19 @@ environment: # select the image, clone your code, install the packages
     # Set LD_LIBRARY_PATH so torchcodec can find ffmpeg shared libs (libavutil.so etc.)
     # Also prefer conda's newer libstdc++ over the system's older version (CXXABI_1.3.15)
     - conda run --name lerobot bash -c 'mkdir -p $CONDA_PREFIX/etc/conda/activate.d && echo "export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\${LD_LIBRARY_PATH:-}" > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh'
-    # Install torch cu128 FIRST to set correct nvidia-* CUDA 12.8.x runtime libs
-    # (Blackwell B200 requires sm_100 kernels only available in 12.8.x, not 12.6.x)
+    # Step 1: Install lerobot normally to get ALL deps (including serial, pyserial, etc.)
+    - conda run --name lerobot pip install -e ".[pi]"
+    # Step 2: Force-reinstall torch cu128 to override nvidia-* CUDA runtime libs from 12.6.x → 12.8.x
+    # Blackwell B200 requires sm_100 kernels only in 12.8.x, not 12.6.x
     # torch 2.10 + torchcodec 0.10 (version-matched per torchcodec compatibility table)
-    - conda run --name lerobot pip install torch==2.10 torchvision==0.25 torchcodec==0.10 --index-url https://download.pytorch.org/whl/cu128
-    # Install lerobot with --no-deps to prevent pip from overriding torch/nvidia-* back to cu124/12.6.x
-    - conda run --name lerobot pip install -e ".[pi]" --no-deps
-    # Install remaining lerobot deps individually (without touching torch/nvidia packages)
-    - conda run --name lerobot pip install accelerate>=1.10.0 datasets>=4.0.0,<4.2.0 "diffusers>=0.27.2,<0.36.0" "huggingface-hub[hf-transfer,cli]>=0.34.2" einops>=0.8.0 opencv-python-headless>=4.9.0 av>=15.0.0 jsonlines>=4.0.0 packaging>=24.2 wandb>=0.20.0 draccus==0.10.0 gymnasium>=1.1.1 deepdiff>=7.0.1 "imageio[ffmpeg]>=2.34.0" termcolor>=2.4.0
-    - conda run --name lerobot pip install accelerate pytest deepspeed polars
-    - conda run --name lerobot pip install pytorch_lightning
-    - conda run --name lerobot pip install datasets==4.1.1
-    - conda run --name lerobot pip install transformers==5.2.0 diffusers==0.37.0
+    - conda run --name lerobot pip install --force-reinstall torch==2.10 torchvision==0.25 torchcodec==0.10 --index-url https://download.pytorch.org/whl/cu128
+    # Step 3: Override specific packages that must be pinned
     # numpy 1.26.4 required — numpy 2.x has known torch.from_numpy buffer protocol issues on B200
     # Python 3.12 required — numpy 1.26.4 only supports up to Python 3.12
-    - conda run --name lerobot pip install numpy==1.26.4
+    - conda run --name lerobot pip install --force-reinstall numpy==1.26.4
+    - conda run --name lerobot pip install --force-reinstall transformers==5.2.0 diffusers==0.37.0
+    - conda run --name lerobot pip install datasets==4.1.1
+    - conda run --name lerobot pip install accelerate pytest deepspeed polars pytorch_lightning
     - conda clean -afy
 
 code:
