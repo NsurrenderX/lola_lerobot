@@ -21,9 +21,13 @@ environment: # select the image, clone your code, install the packages
     - export PATH="/opt/conda/bin:$$PATH"
     - conda create -n lerobot python==3.12 -y
     - conda run --name lerobot conda install ffmpeg==7.1.1 -c conda-forge -y
+    # Set LD_LIBRARY_PATH so torchcodec can find ffmpeg shared libs (libavutil.so etc.)
+    # Also prefer conda's newer libstdc++ over the system's older version (CXXABI_1.3.15)
+    - conda run --name lerobot bash -c 'mkdir -p $CONDA_PREFIX/etc/conda/activate.d && echo "export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\${LD_LIBRARY_PATH:-}" > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh'
     # Install torch cu128 FIRST to set correct nvidia-* CUDA 12.8.x runtime libs
     # (Blackwell B200 requires sm_100 kernels only available in 12.8.x, not 12.6.x)
-    - conda run --name lerobot pip install torch==2.7.1 torchvision==0.22.1 torchcodec==0.5.0 --index-url https://download.pytorch.org/whl/cu128
+    # torch 2.10 + torchcodec 0.10 (version-matched per torchcodec compatibility table)
+    - conda run --name lerobot pip install torch==2.10 torchvision==0.25 torchcodec==0.10 --index-url https://download.pytorch.org/whl/cu128
     # Install lerobot with --no-deps to prevent pip from overriding torch/nvidia-* back to cu124/12.6.x
     - conda run --name lerobot pip install -e ".[pi]" --no-deps
     # Install remaining lerobot deps individually (without touching torch/nvidia packages)
