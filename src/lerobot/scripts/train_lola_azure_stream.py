@@ -68,6 +68,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _log(msg: str):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rank = os.environ.get("RANK", "0")
+    print(f"[{ts}] [Rank {rank}] {msg}", flush=True)
+
+
 def setup_distributed():
     """从环境变量初始化分布式训练"""
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -89,9 +95,9 @@ def setup_distributed():
             timeout=timedelta(minutes=60),
             rank=world_rank,
         )
-        logger.info(f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, world_size={world_size}")
+        _log(f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, world_size={world_size}")
     else:
-        logger.info(f"Single GPU mode: local_rank={local_rank}")
+        _log(f"Single GPU mode: local_rank={local_rank}")
 
     return {
         "world_size": world_size,
@@ -114,7 +120,7 @@ class InterconnectMonitor:
     def __init__(self, device: torch.device):
         self.available = HAS_NVML
         if not self.available:
-            logger.info("InterconnectMonitor: pynvml not available, skipping interconnect metrics")
+            _log("InterconnectMonitor: pynvml not available, skipping interconnect metrics")
             return
 
         self.gpu_index = device.index or 0
@@ -122,7 +128,7 @@ class InterconnectMonitor:
             pynvml.nvmlInit()
             self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
         except Exception as e:
-            logger.warning(f"InterconnectMonitor: NVML init failed ({e}), skipping")
+            _log(f"InterconnectMonitor: NVML init failed ({e}), skipping")
             self.available = False
             return
 
@@ -145,12 +151,12 @@ class InterconnectMonitor:
                     pynvml.NVML_FI_DEV_NVLINK_COUNT_XMIT_BYTES,
                 ])
                 if any(v.nvmlReturn != 0 for v in vals):
-                    logger.info("InterconnectMonitor: NVLink byte counters not supported, skipping NVLink metrics")
+                    _log("InterconnectMonitor: NVLink byte counters not supported, skipping NVLink metrics")
                     self._nvlink_supported = False
             except Exception:
                 self._nvlink_supported = False
         else:
-            logger.info(f"InterconnectMonitor: No active NVLink links (GPU {self.gpu_index}), skipping NVLink metrics")
+            _log(f"InterconnectMonitor: No active NVLink links (GPU {self.gpu_index}), skipping NVLink metrics")
             self._nvlink_supported = False
 
         # Pre-check PCIe byte counter fields
@@ -161,7 +167,7 @@ class InterconnectMonitor:
                 pynvml.NVML_FI_DEV_PCIE_COUNT_TX_BYTES,
             ])
             if any(v.nvmlReturn != 0 for v in vals):
-                logger.info("InterconnectMonitor: PCIe byte counters not supported, will use nvmlDeviceGetPcieThroughput")
+                _log("InterconnectMonitor: PCIe byte counters not supported, will use nvmlDeviceGetPcieThroughput")
                 self._pcie_supported = False
         except Exception:
             self._pcie_supported = False
@@ -189,7 +195,7 @@ class InterconnectMonitor:
                     self._ib_counter_paths.append((rcv_path, xmit_path))
 
         if not self._ib_counter_paths:
-            logger.info("InterconnectMonitor: No IB devices found, skipping IB metrics")
+            _log("InterconnectMonitor: No IB devices found, skipping IB metrics")
             self._ib_supported = False
 
         # State for delta computation
@@ -201,7 +207,7 @@ class InterconnectMonitor:
         self._prev_ib_xmit = None
         self._prev_timestamp = None
 
-        logger.info(
+        _log(
             f"InterconnectMonitor initialized for GPU {self.gpu_index}: "
             f"PCIe={self._pcie_supported} NVLink={self._nvlink_supported} IB={self._ib_supported}"
         )
@@ -323,7 +329,7 @@ def create_lola_streaming_dataset(
     for key in dataset_metadata.camera_keys:
         delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
 
-    logger.info(f"delta_timestamps: {delta_timestamps}")
+    _log(f"delta_timestamps: {delta_timestamps}")
 
     dataset = LoLAStreamingDataset(
         repo_id=repo_id,
@@ -382,7 +388,7 @@ def create_lola_pretrain_streaming_dataset(
     for key in dataset_metadata.camera_keys:
         delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
 
-    logger.info(f"delta_timestamps: {delta_timestamps}")
+    _log(f"delta_timestamps: {delta_timestamps}")
 
     dataset = LoLAPretrainStreamingDataset(
         repo_id=repo_id,
@@ -481,7 +487,7 @@ class LoLATrainer:
 
     def setup_model(self):
         """设置模型"""
-        logger.info(f"Loading LoLA Policy on {self.device}...")
+        _log(f"Loading LoLA Policy on {self.device}...")
 
         self.policy = LoLAPolicy(self.config)
         self.policy._device = self.device
@@ -494,19 +500,19 @@ class LoLATrainer:
         )
 
         if not self.train_vlm and hasattr(self.policy, "vlm"):
-            logger.info("Freezing VLM parameters...")
+            _log("Freezing VLM parameters...")
             for param in self.policy.vlm.parameters():
                 param.requires_grad = False
             self.policy.vlm.eval()
 
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.policy.parameters())
-        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+        _log(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
         if self.is_distributed:
             cap = torch.cuda.get_device_capability(self.device)
             torch_cuda_ver = torch.version.cuda
-            logger.info(f"GPU compute capability: sm_{cap[0]}{cap[1]}, torch CUDA: {torch_cuda_ver}")
+            _log(f"GPU compute capability: sm_{cap[0]}{cap[1]}, torch CUDA: {torch_cuda_ver}")
             if self.strategy == "fsdp":
                 self._setup_fsdp()
             else:
@@ -518,7 +524,7 @@ class LoLATrainer:
 
     def _setup_ddp(self):
         """设置 DDP"""
-        logger.info("Setting up DDP...")
+        _log("Setting up DDP...")
         self.model = DDP(
             self.policy,
             device_ids=[self.local_rank],
@@ -528,7 +534,7 @@ class LoLATrainer:
 
     def _setup_fsdp(self):
         """设置 FSDP"""
-        logger.info("Setting up FSDP...")
+        _log("Setting up FSDP...")
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -615,7 +621,7 @@ class LoLATrainer:
         ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-stream-{time_str}")
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
-            logger.info(f"Checkpoint directory: {ckpt_dir}")
+            _log(f"Checkpoint directory: {ckpt_dir}")
 
         if self.use_wandb:
             wandb_run_name = self.wandb_name or f"lola-stream-{self.strategy}-{time_str}"
@@ -636,9 +642,9 @@ class LoLATrainer:
                     "gradient_clip_val": self.gradient_clip_val,
                 },
             )
-            logger.info(f"Wandb initialized: {wandb_run_name}")
+            _log(f"Wandb initialized: {wandb_run_name}")
 
-        logger.info(f"Starting training from step {start_step} to {self.max_steps}")
+        _log(f"Starting training from step {start_step} to {self.max_steps}")
 
         # 数据跳过由 dataset.start_index 在 __iter__ 内部处理，
         # 这里无需 skip_epochs/skip_batches 逻辑
@@ -704,35 +710,21 @@ class LoLATrainer:
                     grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
 
                     # ── Console logging (mirrors all wandb metrics) ──
-                    logger.info(
-                        f"[Step {self.global_step}/{self.max_steps}] "
-                        f"Loss={loss.item():.4f} LR={lr:.2e} "
-                        f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
-                    )
-                    print(
+                    _log(
                         f"[Step {self.global_step}/{self.max_steps}] "
                         f"Loss={loss.item():.4f} LR={lr:.2e} "
                         f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
                     )
                     if grad_norm_val is not None:
-                        logger.info(f"  grad_norm={grad_norm_val:.4f}")
-                        print(f"  grad_norm={grad_norm_val:.4f}")
-                    logger.info(
+                        _log(f"  grad_norm={grad_norm_val:.4f}")
+                    _log(
                         f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
                         f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
                     )
-                    print(
-                        f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
-                        f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
-                    )
-                    logger.info(
+                    _log(
                         f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
                         f"reserved={gpu_mem_reserved:.1f}GB"
                     )
-                    print(
-                        f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
-                        f"reserved={gpu_mem_reserved:.1f}GB"
-                        )
                     if interconnect_metrics:
                         parts = []
                         if "pcie_rx_gb_s" in interconnect_metrics:
@@ -750,12 +742,10 @@ class LoLATrainer:
                                 f"IB rx={interconnect_metrics['ib_rx_gb_s']:.2f} "
                                 f"tx={interconnect_metrics['ib_tx_gb_s']:.2f} GB/s"
                             )
-                        logger.info(f"  Interconnect: {' | '.join(parts)}")
-                        print(f"  Interconnect: {' | '.join(parts)}")
+                        _log(f"  Interconnect: {' | '.join(parts)}")
                     for k, v in loss_dict.items():
                         if k != "loss" and isinstance(v, (int, float)):
-                            logger.info(f"  {k}={v:.4f}")
-                            print(f"  {k}={v:.4f}")
+                            _log(f"  {k}={v:.4f}")
 
                     # ── Wandb logging ──────────────────────────────
                     if self.use_wandb:
@@ -785,7 +775,7 @@ class LoLATrainer:
                 self.save_checkpoint(ckpt_dir, self.global_step)
 
         self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
-        logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+        _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
 
         if self.interconnect_monitor:
             self.interconnect_monitor.close()
@@ -825,7 +815,7 @@ class LoLATrainer:
                 "scheduler_state_dict": self.scheduler.state_dict(),
             }, ckpt_path)
 
-        logger.info(f"Checkpoint saved: {ckpt_path}")
+        _log(f"Checkpoint saved: {ckpt_path}")
 
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
@@ -855,7 +845,7 @@ class LoLATrainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             self.global_step = checkpoint.get("step", 0)
 
-        logger.info(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
+        _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
 
 def main():
@@ -937,26 +927,26 @@ def main():
         raise ValueError("Either --dataset_repo_id or --dataset_root must be provided.")
 
     if dist_info["world_rank"] == 0:
-        logger.info("=" * 60)
-        logger.info("LoLA Azure Streaming Training")
-        logger.info("=" * 60)
-        logger.info(f"Dataset: {args.dataset_repo_id or args.dataset_root}")
-        logger.info(f"Strategy: {args.strategy}")
-        logger.info(f"World Size: {dist_info['world_size']}")
-        logger.info(f"Batch Size: {args.batch_size}")
-        logger.info(f"Streaming: True")
-        logger.info(f"Buffer Size: {args.buffer_size}")
-        logger.info(f"VLM Path: {args.vlm_path}")
+        _log("=" * 60)
+        _log("LoLA Azure Streaming Training")
+        _log("=" * 60)
+        _log(f"Dataset: {args.dataset_repo_id or args.dataset_root}")
+        _log(f"Strategy: {args.strategy}")
+        _log(f"World Size: {dist_info['world_size']}")
+        _log(f"Batch Size: {args.batch_size}")
+        _log(f"Streaming: True")
+        _log(f"Buffer Size: {args.buffer_size}")
+        _log(f"VLM Path: {args.vlm_path}")
         if args.pretrain:
-            logger.info(f"Pretrain Mode: True")
-            logger.info(f"Dataset to Episodes: {args.dataset_to_episodes_path}")
-            logger.info(f"Sub Root: {args.sub_root}")
-            logger.info(f"Temp Process: {args.temp_process}")
-            logger.info(f"Episode Chunk Size: {args.episode_chunk_size}")
-        logger.info("=" * 60)
+            _log(f"Pretrain Mode: True")
+            _log(f"Dataset to Episodes: {args.dataset_to_episodes_path}")
+            _log(f"Sub Root: {args.sub_root}")
+            _log(f"Temp Process: {args.temp_process}")
+            _log(f"Episode Chunk Size: {args.episode_chunk_size}")
+        _log("=" * 60)
 
     # 获取数据集元数据
-    logger.info("Loading dataset metadata...")
+    _log("Loading dataset metadata...")
     dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(
         args.dataset_repo_id,
         root=args.dataset_root,
@@ -969,7 +959,7 @@ def main():
     else:
         action_dim = args.action_dim
 
-    logger.info(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
+    _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
 
     # 创建 LoLA 配置
     config = LoLAConfig(
@@ -1000,7 +990,7 @@ def main():
 
     if args.pretrain:
         # dataset_to_episodes_path is optional for local testing without per-sub-dataset normalization
-        logger.info("Creating pretrain streaming dataset...")
+        _log("Creating pretrain streaming dataset...")
         train_dataset = create_lola_pretrain_streaming_dataset(
             repo_id=args.dataset_repo_id,
             config=config,
@@ -1022,7 +1012,7 @@ def main():
             episode_chunk_size=args.episode_chunk_size,
         )
     else:
-        logger.info("Creating streaming dataset...")
+        _log("Creating streaming dataset...")
         train_dataset = create_lola_streaming_dataset(
             repo_id=args.dataset_repo_id,
             config=config,
@@ -1077,7 +1067,7 @@ def main():
     # Resume: 设置数据跳过的 start_index（总样本数 = 步数 × batch_size × world_size）
     if start_step > 0:
         train_dataset.start_index = start_step * args.batch_size * dist_info.world_size
-        logger.info(f"Resuming from step {start_step}, dataset.start_index = {train_dataset.start_index}")
+        _log(f"Resuming from step {start_step}, dataset.start_index = {train_dataset.start_index}")
 
     # 创建 DataLoader（必须在 start_index 设置之后，worker fork 时会读取 dataset 属性）
     raw_loader = DataLoader(
@@ -1095,7 +1085,7 @@ def main():
     trainer.train(train_loader, start_step=start_step)
 
     cleanup_distributed()
-    logger.info("Training completed!")
+    _log("Training completed!")
 
 
 if __name__ == "__main__":
