@@ -119,6 +119,7 @@ def create_lola_streaming_dataset(
     decode_device: str = "cpu",
     decode_num_threads: int = 1,
     num_dataloader_workers: int = 0,
+    start_index: int = 0,
 ):
     """创建 LoLA 流式数据集"""
     dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
@@ -150,6 +151,7 @@ def create_lola_streaming_dataset(
         decode_device=decode_device,
         decode_num_threads=decode_num_threads,
         num_dataloader_workers=num_dataloader_workers,
+        start_index=start_index,
     )
 
     return dataset
@@ -176,6 +178,7 @@ def create_lola_pretrain_streaming_dataset(
     dataset_to_episodes_path: str | None = None,
     temp_process: bool = False,
     episode_chunk_size: int = 8,
+    start_index: int = 0,
 ):
     """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
     dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id, root=root, revision=None)
@@ -211,6 +214,7 @@ def create_lola_pretrain_streaming_dataset(
         dataset_to_episodes_path=dataset_to_episodes_path,
         temp_process=temp_process,
         episode_chunk_size=episode_chunk_size,
+        start_index=start_index,
     )
 
     return dataset
@@ -330,7 +334,7 @@ class LoLATrainer:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -340,7 +344,7 @@ class LoLATrainer:
 
         auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
             module, recurse, nonwrapped_numel,
-            transformer_layer_cls={Qwen3_5DecoderLayer}
+            transformer_layer_cls={Qwen3_5DecoderLayer, Qwen3_5VisionBlock}
         )
 
         self.model = FSDP(
@@ -348,6 +352,7 @@ class LoLATrainer:
             sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
             mixed_precision=mixed_precision,
             auto_wrap_policy=auto_wrap_policy,
+            use_orig_params=True,
             device_id=self.local_rank,
         )
 
@@ -437,135 +442,100 @@ class LoLATrainer:
 
         logger.info(f"Starting training from step {start_step} to {self.max_steps}")
 
-        try:
-            batches_per_epoch = len(train_loader)
-            logger.info(f"Total batches per epoch: {batches_per_epoch}")
-        except TypeError:
-            batches_per_epoch = None
-            logger.info("IterableDataset detected: cannot determine batches per epoch")
+        # 数据跳过由 dataset.start_index 在 __iter__ 内部处理，
+        # 这里无需 skip_epochs/skip_batches 逻辑
 
-        if start_step > 0 and batches_per_epoch is not None:
-            skip_epochs = start_step // batches_per_epoch
-            skip_batches = start_step % batches_per_epoch
-            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
-        elif start_step > 0 and batches_per_epoch is None:
-            skip_epochs = 0
-            skip_batches = 0
-            logger.warning(
-                f"Resuming from step {start_step} with IterableDataset: "
-                "data will restart from the beginning (model/optimizer/scheduler states are restored). "
-                "For precise data resume, use map-style dataset or add start_index to IterableDataset."
-            )
-        else:
-            skip_epochs = 0
-            skip_batches = 0
+        for batch_idx, batch in enumerate(train_loader):
+            if self.global_step >= self.max_steps:
+                break
 
-        epoch = 0
-        while self.global_step < self.max_steps:
-            epoch += 1
-            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
-                train_loader.sampler.set_epoch(epoch)
+            step_start = time.monotonic()
 
-            for batch_idx, batch in enumerate(train_loader):
-                if self.global_step >= self.max_steps:
-                    break
+            self.optimizer.zero_grad()
 
-                if skip_epochs > 0 or skip_batches > 0:
-                    if skip_epochs > 0:
-                        skip_epochs -= 1
-                        break
-                    skip_batches -= 1
-                    continue
+            # ── Forward pass (with timing) ───────────────────────
+            fwd_start = time.monotonic()
+            loss, loss_dict = self.training_step(batch)
+            fwd_s = time.monotonic() - fwd_start
 
-                step_start = time.monotonic()
+            # ── Backward pass (with timing) ──────────────────────
+            bwd_start = time.monotonic()
+            if self.use_bf16:
+                loss.backward()
+            else:
+                self.scaler.scale(loss).backward()
+            bwd_s = time.monotonic() - bwd_start
 
-                self.optimizer.zero_grad()
+            # ── Gradient clipping ─────────────────────────────────
+            clip_start = time.monotonic()
+            if self.gradient_clip_val > 0:
+                if not self.use_bf16:
+                    self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.gradient_clip_val,
+                )
+            else:
+                grad_norm = None
+            clip_s = time.monotonic() - clip_start
 
-                # ── Forward pass (with timing) ───────────────────────
-                fwd_start = time.monotonic()
-                loss, loss_dict = self.training_step(batch)
-                fwd_s = time.monotonic() - fwd_start
+            # ── Optimizer step ────────────────────────────────────
+            opt_start = time.monotonic()
+            if self.use_bf16:
+                self.optimizer.step()
+            else:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            opt_s = time.monotonic() - opt_start
 
-                # ── Backward pass (with timing) ──────────────────────
-                bwd_start = time.monotonic()
-                if self.use_bf16:
-                    loss.backward()
-                else:
-                    self.scaler.scale(loss).backward()
-                bwd_s = time.monotonic() - bwd_start
+            self.scheduler.step()
 
-                # ── Gradient clipping ─────────────────────────────────
-                clip_start = time.monotonic()
-                if self.gradient_clip_val > 0:
-                    if not self.use_bf16:
-                        self.scaler.unscale_(self.optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.gradient_clip_val,
+            self.global_step += 1
+
+            update_s = time.monotonic() - step_start
+            batch_per_s = 1.0 / update_s if update_s > 0 else 0
+
+            # ── Logging (enhanced wandb metrics) ──────────────────
+            if self.global_step % self.log_every_n_steps == 0:
+                lr = self.scheduler.get_last_lr()[0]
+                gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+
+                if self.is_main_process:
+                    logger.info(
+                        f"Step {self.global_step}/{self.max_steps} | "
+                        f"Loss: {loss.item():.4f} | "
+                        f"LR: {lr:.2e} | "
+                        f"Update: {update_s:.2f}s | "
+                        f"Throughput: {batch_per_s:.2f} batch/s | "
+                        f"GPU: {gpu_mem_alloc:.1f}/{gpu_mem_reserved:.1f} GB"
                     )
-                else:
-                    grad_norm = None
-                clip_s = time.monotonic() - clip_start
+                    if self.use_wandb:
+                        log_dict = {
+                            "train/loss": loss.item(),
+                            "train/learning_rate": lr,
+                            "train/step": self.global_step,
+                            "train/update_s": update_s,
+                            "train/batch_per_s": batch_per_s,
+                            "train/fwd_s": fwd_s,
+                            "train/bwd_s": bwd_s,
+                            "train/clip_s": clip_s,
+                            "train/opt_s": opt_s,
+                            "train/gpu_mem_alloc_gb": gpu_mem_alloc,
+                            "train/gpu_mem_reserved_gb": gpu_mem_reserved,
+                        }
+                        if grad_norm is not None:
+                            log_dict["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                        for k, v in loss_dict.items():
+                            if k != "loss" and isinstance(v, (int, float)):
+                                log_dict[f"train/{k}"] = v
+                        wandb.log(log_dict)
 
-                # ── Optimizer step ────────────────────────────────────
-                opt_start = time.monotonic()
-                if self.use_bf16:
-                    self.optimizer.step()
-                else:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                opt_s = time.monotonic() - opt_start
+            if self.global_step % self.save_every_n_steps == 0:
+                self.save_checkpoint(ckpt_dir, self.global_step)
 
-                self.scheduler.step()
-
-                self.global_step += 1
-
-                update_s = time.monotonic() - step_start
-                batch_per_s = 1.0 / update_s if update_s > 0 else 0
-
-                # ── Logging (enhanced wandb metrics) ──────────────────
-                if self.global_step % self.log_every_n_steps == 0:
-                    lr = self.scheduler.get_last_lr()[0]
-                    gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
-                    gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
-
-                    if self.is_main_process:
-                        logger.info(
-                            f"Step {self.global_step}/{self.max_steps} | "
-                            f"Loss: {loss.item():.4f} | "
-                            f"LR: {lr:.2e} | "
-                            f"Update: {update_s:.2f}s | "
-                            f"Throughput: {batch_per_s:.2f} batch/s | "
-                            f"GPU: {gpu_mem_alloc:.1f}/{gpu_mem_reserved:.1f} GB"
-                        )
-                        if self.use_wandb:
-                            log_dict = {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": lr,
-                                "train/step": self.global_step,
-                                "train/epoch": epoch,
-                                "train/update_s": update_s,
-                                "train/batch_per_s": batch_per_s,
-                                "train/fwd_s": fwd_s,
-                                "train/bwd_s": bwd_s,
-                                "train/clip_s": clip_s,
-                                "train/opt_s": opt_s,
-                                "train/gpu_mem_alloc_gb": gpu_mem_alloc,
-                                "train/gpu_mem_reserved_gb": gpu_mem_reserved,
-                            }
-                            if grad_norm is not None:
-                                log_dict["train/grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                            for k, v in loss_dict.items():
-                                if k != "loss" and isinstance(v, (int, float)):
-                                    log_dict[f"train/{k}"] = v
-                            wandb.log(log_dict)
-
-                if self.global_step % self.save_every_n_steps == 0 and self.is_main_process:
-                    self.save_checkpoint(ckpt_dir, self.global_step)
-
-        if self.is_main_process:
-            self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
-            logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+        self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
+        logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
 
         if self.use_wandb:
             wandb.finish()
@@ -817,19 +787,8 @@ def main():
             num_dataloader_workers=args.num_workers,
         )
 
-    # IterableDataset 不使用 DistributedSampler，由数据集内部处理分片
-    # passthrough collate：AsyncDecodeDataLoader 会处理解码和 collate
-    raw_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        collate_fn=lambda x: x,
-    )
-    train_loader = AsyncLoaderClass(
-        dataloader=raw_loader,
-        dataset=train_dataset,
-        collate_fn=AsyncLoaderClass.make_collate_fn(),
-    )
+    # IterableDataset 数据跳过由 dataset.start_index 内部处理，
+    # 需要在 load_checkpoint 之后才能计算 start_index，所以 DataLoader 创建延后
 
     # 创建训练器
     dataset_stats = {} if args.pretrain else dataset_metadata.stats
@@ -861,6 +820,24 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
         start_step = trainer.global_step
+
+    # Resume: 设置数据跳过的 start_index（总样本数 = 步数 × batch_size × world_size）
+    if start_step > 0:
+        train_dataset.start_index = start_step * args.batch_size * dist_info.world_size
+        logger.info(f"Resuming from step {start_step}, dataset.start_index = {train_dataset.start_index}")
+
+    # 创建 DataLoader（必须在 start_index 设置之后，worker fork 时会读取 dataset 属性）
+    raw_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=lambda x: x,
+    )
+    train_loader = AsyncLoaderClass(
+        dataloader=raw_loader,
+        dataset=train_dataset,
+        collate_fn=AsyncLoaderClass.make_collate_fn(),
+    )
 
     trainer.train(train_loader, start_step=start_step)
 

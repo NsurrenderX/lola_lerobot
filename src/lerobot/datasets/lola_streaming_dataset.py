@@ -641,6 +641,7 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         decode_num_threads: int = 1,
         async_decode: bool = False,
         num_dataloader_workers: int = 0,
+        start_index: int = 0,
     ):
         """
         Args:
@@ -680,6 +681,8 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
                 内存由队列深度控制：result_queue(maxsize=1) 最多缓冲 1 个解码 batch。
             num_dataloader_workers: DataLoader 的 worker 数量，用于计算异步解码
                 管线的 VideoDecoder 缓存容量。仅在 async_decode=True 时需要。
+            start_index: Resume 时跳过的全局样本数。每个 worker 按 start_index // total_parallel
+                跳过对应数量的 yield item，rng/buffer 状态正常推进但不输出，实现数据级断点续训。
         """
         super().__init__()  # torch.utils.data.IterableDataset.__init__
 
@@ -708,6 +711,7 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         self.async_decode = async_decode
         self._num_dataloader_workers = num_dataloader_workers
         self._decode_pipeline = None
+        self.start_index = start_index
 
         # 加载元数据（不加载 HF dataset）
         self.meta = LeRobotDatasetMetadata(
@@ -902,13 +906,22 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         frames_buffer = []
         yield_count = 0
 
+        # Resume: fast-forward through start_index items per worker
+        skip_remaining = self.start_index // total_parallel
+        if skip_remaining > 0:
+            print(f"[LoLAStreamingDataset] Worker {parallel_id} skipping {skip_remaining} items for resume...", flush=True)
+
         while True:
             try:
                 for frame in frame_generator(backtrack_dataset):
                     if len(frames_buffer) == self.buffer_size:
                         i = next(buffer_indices_generator)
-                        yield_count += 1
                         to_yield = frames_buffer[i]
+                        if skip_remaining > 0:
+                            skip_remaining -= 1
+                            frames_buffer[i] = frame
+                            continue  # fast-forward: advance rng/buffer state but don't yield
+                        yield_count += 1
                         if decode_on_yield and "_video_lookup" in to_yield:
                             to_yield = self._decode_videos(to_yield)
                         yield to_yield

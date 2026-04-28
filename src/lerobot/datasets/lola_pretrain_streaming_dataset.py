@@ -749,6 +749,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         dataset_to_episodes_path: str | None = None,
         temp_process: bool = False,
         episode_chunk_size: int = 8,
+        start_index: int = 0,
     ):
         super().__init__()
 
@@ -779,6 +780,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self._decode_pipeline = None
         self.temp_process = temp_process
         self.episode_chunk_size = episode_chunk_size
+        self.start_index = start_index
 
         # Build metadata
         self.meta = self._build_metadata_polars(
@@ -1329,6 +1331,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         yield_count = 0
         buffer_full = False
 
+        # Resume: fast-forward through start_index items per worker
+        skip_remaining = self.start_index // total_parallel
+        if skip_remaining > 0:
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} skipping {skip_remaining} items for resume...", flush=True)
+
         print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} filling buffer "
               f"(target={self.buffer_size}, decode_on_yield={decode_on_yield})", flush=True)
 
@@ -1370,8 +1377,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                             buffer_full = True
                             print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} buffer full, starting yield", flush=True)
                         i = next(buffer_indices_generator)
-                        yield_count += 1
                         to_yield = frames_buffer[i]
+                        if skip_remaining > 0:
+                            skip_remaining -= 1
+                            frames_buffer[i] = frame
+                            continue  # fast-forward: advance rng/buffer state but don't yield
+                        yield_count += 1
                         if decode_on_yield and "_video_lookup" in to_yield:
                             to_yield = self._decode_videos(to_yield)
                         yield to_yield

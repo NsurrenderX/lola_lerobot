@@ -357,9 +357,9 @@ def create_lola_pretrain_streaming_dataset(
 # ----------------------------------------------------------------------
 def get_fsdp_strategy():
     """获取 FSDP 策略配置"""
-    from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, StateDictType
+    from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
 
     mixed_precision = MixedPrecision(
         param_dtype=torch.bfloat16,
@@ -369,7 +369,7 @@ def get_fsdp_strategy():
 
     auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
         module, recurse, nonwrapped_numel,
-        transformer_layer_cls={Qwen3_5DecoderLayer}
+        transformer_layer_cls={Qwen3_5DecoderLayer, Qwen3_5VisionBlock}
     )
 
     strategy = FSDPStrategy(
@@ -378,7 +378,7 @@ def get_fsdp_strategy():
         mixed_precision=mixed_precision,
         auto_wrap_policy=auto_wrap_policy,
         use_orig_params=True,
-        state_dict_type=StateDictType.FULL_STATE_DICT,
+        state_dict_type="full",
     )
     return strategy
 

@@ -409,7 +409,7 @@ if __name__ == "__main__":
     for task in tasks:
         src_url = f"{base_url}/{task['cloud_path']}"
         success = run_azcopy_transfer(azcopy_bin, src_url, task["local_path"], max_retries=args.max_retries)
-        fallback_fuse_copy(task["fuse_path"], task["local_path"])
+        # fallback_fuse_copy(task["fuse_path"], task["local_path"])
         if not success:
             failed_tasks.append(task)
 

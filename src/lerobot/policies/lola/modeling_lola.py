@@ -640,25 +640,16 @@ class LoLAPolicy(PreTrainedPolicy):
         # 对于分布式训练（DeepSpeed/FSDP），VLM 需要特殊处理
         # 方案：先加载到 CPU，然后让分布式策略管理设备分配
         if self.config.vlm_path is not None:
-            try:
-                self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
-                    self.config.vlm_path, 
-                    torch_dtype=self._dtype,
-                    device_map=None,  # 不自动分配，让分布式策略管理
-                    low_cpu_mem_usage=True,
-                )
-            except Exception as e:
-                print(f"Failed to load Qwen3.5 model from local path: {self.config.vlm_path}, try to load from HuggingFace Hub")
-                print(f"Error: {e}")
-                self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
-                    self.config.vlm_model_name, 
-                    torch_dtype=self._dtype,
-                    device_map=None,
-                    low_cpu_mem_usage=True,
-                )
+            self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
+                self.config.vlm_path,
+                torch_dtype=self._dtype,
+                device_map=None,  # 不自动分配，让分布式策略管理
+                low_cpu_mem_usage=True,
+                local_files_only=True,
+            )
         else:
             self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
-                self.config.vlm_model_name, 
+                self.config.vlm_model_name,
                 torch_dtype=self._dtype,
                 device_map=None,
                 low_cpu_mem_usage=True,
