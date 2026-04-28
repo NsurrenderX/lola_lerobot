@@ -709,9 +709,19 @@ class LoLATrainer:
                         f"Loss={loss.item():.4f} LR={lr:.2e} "
                         f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
                     )
+                    print(
+                        f"[Step {self.global_step}/{self.max_steps}] "
+                        f"Loss={loss.item():.4f} LR={lr:.2e} "
+                        f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
+                    )
                     if grad_norm_val is not None:
                         logger.info(f"  grad_norm={grad_norm_val:.4f}")
+                        print(f"  grad_norm={grad_norm_val:.4f}")
                     logger.info(
+                        f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
+                        f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
+                    )
+                    print(
                         f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
                         f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
                     )
@@ -719,6 +729,10 @@ class LoLATrainer:
                         f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
                         f"reserved={gpu_mem_reserved:.1f}GB"
                     )
+                    print(
+                        f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
+                        f"reserved={gpu_mem_reserved:.1f}GB"
+                        )
                     if interconnect_metrics:
                         parts = []
                         if "pcie_rx_gb_s" in interconnect_metrics:
@@ -737,9 +751,11 @@ class LoLATrainer:
                                 f"tx={interconnect_metrics['ib_tx_gb_s']:.2f} GB/s"
                             )
                         logger.info(f"  Interconnect: {' | '.join(parts)}")
+                        print(f"  Interconnect: {' | '.join(parts)}")
                     for k, v in loss_dict.items():
                         if k != "loss" and isinstance(v, (int, float)):
                             logger.info(f"  {k}={v:.4f}")
+                            print(f"  {k}={v:.4f}")
 
                     # ── Wandb logging ──────────────────────────────
                     if self.use_wandb:
