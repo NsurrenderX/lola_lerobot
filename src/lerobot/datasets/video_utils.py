@@ -132,8 +132,9 @@ def scan_video_seek_modes(dataset_root: str, num_workers: int = 8) -> dict[str, 
 
     video_files = []
     for root, dirs, files in os.walk(videos_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]  # skip hidden dirs
         for f in files:
-            if f.endswith(".mp4"):
+            if f.endswith(".mp4") and not f.startswith("."):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, videos_dir)
                 video_files.append((full_path, rel_path))

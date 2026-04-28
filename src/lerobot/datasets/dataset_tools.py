@@ -964,7 +964,7 @@ def _copy_data_with_feature_changes(
 ) -> None:
     """Copy data while adding or removing features."""
     data_dir = dataset.root / DATA_DIR
-    parquet_files = sorted(data_dir.glob("*/*.parquet"))
+    parquet_files = sorted(f for f in data_dir.glob("*/*.parquet") if not f.name.startswith("."))
 
     if not parquet_files:
         raise ValueError(f"No parquet files found in {data_dir}")
