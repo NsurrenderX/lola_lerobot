@@ -311,6 +311,9 @@ class LoLATrainer:
         logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
         if self.is_distributed:
+            cap = torch.cuda.get_device_capability(self.device)
+            torch_cuda_ver = torch.version.cuda
+            logger.info(f"GPU compute capability: sm_{cap[0]}{cap[1]}, torch CUDA: {torch_cuda_ver}")
             if self.strategy == "fsdp":
                 self._setup_fsdp()
             else:

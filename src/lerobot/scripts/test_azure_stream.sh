@@ -22,6 +22,47 @@ export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
 export TOKENIZERS_PARALLELISM=false
 
 # ----------------------------------------------------------------------
+# CUDA / GPU Compatibility Diagnostic
+# For Blackwell (B200, sm_100) GPUs, ensure CUDA 12.8 runtime libraries
+# are installed. The "no kernel image" error means nvidia-* pip packages
+# are too old (12.6.x lacks sm_100 kernels).
+# Reference: https://download.pytorch.org/whl/cu128
+# ----------------------------------------------------------------------
+PYTHON=/opt/conda/envs/lerobot/bin/python
+if [ -x "$PYTHON" ]; then
+    echo "=== CUDA Compatibility Check ==="
+    TORCH_CUDA=$($PYTHON -c "import torch; print(torch.version.cuda)")
+    GPU_CAP=$($PYTHON -c "import torch; cap=torch.cuda.get_device_capability(0); print(f'{cap[0]}.{cap[1]}')")
+    CUBLAS_VER=$($PYTHON -c "import importlib.metadata as im; print(im.version('nvidia-cublas-cu12'))" 2>/dev/null || echo "NOT_FOUND")
+    CUDNN_VER=$($PYTHON -c "import importlib.metadata as im; print(im.version('nvidia-cudnn-cu12'))" 2>/dev/null || echo "NOT_FOUND")
+    echo "PyTorch CUDA: ${TORCH_CUDA}"
+    echo "GPU Compute Capability: sm_${GPU_CAP}"
+    echo "nvidia-cublas-cu12: ${CUBLAS_VER}"
+    echo "nvidia-cudnn-cu12: ${CUDNN_VER}"
+
+    # Check for Blackwell + mismatched runtime
+    SM_MAJOR=$(echo "$GPU_CAP" | cut -d. -f1)
+    if [ "$SM_MAJOR" -ge 10 ] 2>/dev/null; then
+        if ! echo "${TORCH_CUDA}" | grep -q "^12.8"; then
+            echo "ERROR: Blackwell GPU requires CUDA 12.8, got torch CUDA ${TORCH_CUDA}"
+            echo "  Fix: pip install torch --index-url https://download.pytorch.org/whl/cu128"
+            exit 1
+        fi
+        if ! echo "${CUBLAS_VER}" | grep -q "^12\.8"; then
+            echo "ERROR: nvidia-cublas-cu12 is ${CUBLAS_VER}, needs 12.8.x for Blackwell"
+            echo "  Fix: pip install --force-reinstall nvidia-cublas-cu12==12.8.4.1"
+            exit 1
+        fi
+        if ! echo "${CUDNN_VER}" | grep -q "^9\.10"; then
+            echo "ERROR: nvidia-cudnn-cu12 is ${CUDNN_VER}, needs 9.10.x for Blackwell"
+            echo "  Fix: pip install --force-reinstall nvidia-cudnn-cu12==9.10.2.21"
+            exit 1
+        fi
+    fi
+    echo "=== CUDA Check Passed ==="
+fi
+
+# ----------------------------------------------------------------------
 # 默认参数（可被命令行参数覆盖）
 # ----------------------------------------------------------------------
 # Azure 分布式参数
