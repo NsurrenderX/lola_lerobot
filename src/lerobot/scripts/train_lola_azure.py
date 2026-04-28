@@ -348,7 +348,9 @@ class LoLATrainer:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
+        from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
+        from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -358,7 +360,13 @@ class LoLATrainer:
 
         auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
             module, recurse, nonwrapped_numel,
-            transformer_layer_cls={Qwen3_5DecoderLayer}
+            transformer_layer_cls={
+                Qwen3_5DecoderLayer,
+                Qwen3_5VisionBlock,
+                Flux2TransformerBlock,
+                Flux2SingleTransformerBlock,
+                LolaVLMFeatureExtractor,
+            }
         )
 
         self.model = FSDP(

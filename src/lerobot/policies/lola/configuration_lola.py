@@ -82,6 +82,10 @@ class LoLAConfig(PreTrainedConfig):
     max_history_length: int = 100  # Maximum history length for padding/truncation
     history_padding_side: str = "left"  # Padding side: "left" or "right"
 
+    # Image resolution limits for VLM visual token balancing
+    max_image_pixels: int = 230400  # Enforces max visual tokens per image (230400 → max_h≈360p for 720p → 220 tokens)
+    min_image_pixels: int = 65536   # Enforces min visual tokens per image (65536 → min 64 tokens, 256x256)
+
     default_image_resolution: tuple[int, int] = (256, 256)  # see openpi `preprocessing_pytorch.py`
 
     # Add empty images. Used to add empty cameras when no image features are present.

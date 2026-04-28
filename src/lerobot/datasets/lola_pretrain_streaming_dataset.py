@@ -834,6 +834,32 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             last_file = bisect.bisect_right(self._file_cumsum, self._episode_ends[ep_idx] - 1) - 1
             self._episode_file_ranges.append((first_file, last_file))
 
+        # ── Chunk-to-file mapping + visual cost estimation ──────────
+        # Each chunk's primary file = most frequent file across its episodes.
+        # Visual cost = estimated number of visual tokens per chunk
+        # (valid cameras count × target visual tokens per image).
+        chunk_size = self.episode_chunk_size
+        num_chunks = (num_episodes + chunk_size - 1) // chunk_size
+        self._chunk_primary_file = []
+        self._chunk_visual_cost = []
+        for c in range(num_chunks):
+            ep_start = c * chunk_size
+            ep_end = min(ep_start + chunk_size, num_episodes)
+            # Primary file = first file of the first episode (most representative)
+            primary_file = self._episode_file_ranges[ep_start][0]
+            self._chunk_primary_file.append(primary_file)
+            # Visual cost = sum of valid cameras across episodes in this chunk
+            cost = 0
+            for ep_i in range(ep_start, ep_end):
+                ep_meta = self.meta.episodes[ep_i]
+                valid_cameras = 0
+                for cam_key in self.meta.camera_keys:
+                    is_valid = ep_meta.get(f"videos/{cam_key}/is_valid", 1)
+                    if is_valid == 1:
+                        valid_cameras += 1
+                cost += valid_cameras
+            self._chunk_visual_cost.append(cost)
+
         # ── EpisodeChunkReader ─────────────────────────────────────────
         self._chunk_reader = EpisodeChunkReader(
             self._parquet_files, self._file_cumsum,
@@ -1143,7 +1169,9 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                             target_frames.append(torch.tensor(val, dtype=torch.float32))
                             is_pad.append(False)
                         else:
-                            target_frames.append(item[key])
+                            # Zero-fill for out-of-bounds frames (semantic: "stop action")
+                            # rather than repeating the last frame which is semantically wrong.
+                            target_frames.append(torch.zeros(arr.shape[1], dtype=torch.float32))
                             is_pad.append(True)
                     if target_frames:
                         query_result[key] = torch.stack(target_frames)
@@ -1299,13 +1327,34 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         total_parallel = world_size * num_workers
         parallel_id = rank * num_workers + worker_id
 
-        # ── Chunk-level strided sharding ────────────────────────────
+        # ── File-aligned + visual-cost-balanced chunk assignment ─────
         num_episodes = len(self.meta.episodes)
         chunk_size = self.episode_chunk_size
         num_chunks = (num_episodes + chunk_size - 1) // chunk_size
 
-        # Each worker gets strided chunks: worker 0 gets chunks [0, total_parallel, 2*total_parallel, ...]
-        worker_chunk_indices = list(range(parallel_id, num_chunks, total_parallel))
+        # Group chunks by primary parquet file
+        file_to_chunks: dict[int, list[int]] = {}
+        for c in range(num_chunks):
+            pf = self._chunk_primary_file[c]
+            file_to_chunks.setdefault(pf, []).append(c)
+
+        # Sort file groups by their maximum chunk visual cost (descending)
+        file_groups = sorted(
+            file_to_chunks.values(),
+            key=lambda group: max(self._chunk_visual_cost[c] for c in group),
+            reverse=True,
+        )
+
+        # Greedy round-robin: assign each file group to the worker with lowest current cost
+        worker_indices: list[list[int]] = [[] for _ in range(total_parallel)]
+        worker_costs: list[float] = [0.0] * total_parallel
+        for group in file_groups:
+            min_worker = worker_costs.index(min(worker_costs))
+            worker_indices[min_worker].extend(group)
+            for c in group:
+                worker_costs[min_worker] += self._chunk_visual_cost[c]
+
+        worker_chunk_indices = worker_indices[parallel_id]
 
         if not worker_chunk_indices:
             print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no chunks assigned "
@@ -1322,7 +1371,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
         print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} processing "
               f"{len(worker_chunk_indices)} chunks (chunk_size={chunk_size}, "
-              f"total_episodes={num_episodes})", flush=True)
+              f"total_episodes={num_episodes}, visual_cost={worker_costs[parallel_id]:.0f})", flush=True)
 
         # ── Decode mode ─────────────────────────────────────────────
         # Decode video inside DataLoader workers using BoundedVideoDecoderCache.

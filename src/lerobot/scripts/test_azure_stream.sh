@@ -79,6 +79,7 @@ MASTER_PORT=29500
 
 # 训练参数
 STRATEGY="fsdp"
+FSDP_SHARDING="full_shard"
 BATCH_SIZE=4
 MAX_STEPS=10000
 LEARNING_RATE=2.5e-5
@@ -96,6 +97,10 @@ DATASET_TO_EPISODES_PATH=""  # pretrain 模式：episode 映射 JSON 路径
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
 CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-0th-pretrain"
 TRAIN_VLM=false
+
+# VLM 图像分辨率参数
+MAX_IMAGE_PIXELS=230400  # max_h≈360p for 720p images
+MIN_IMAGE_PIXELS=65536   # min 64 visual tokens per image
 
 # 模型维度参数
 ACTION_DIM=20
@@ -164,6 +169,10 @@ while [[ $# -gt 0 ]]; do
             STRATEGY="$2"
             shift 2
             ;;
+        --fsdp_sharding)
+            FSDP_SHARDING="$2"
+            shift 2
+            ;;
         --batch_size)
             BATCH_SIZE="$2"
             shift 2
@@ -219,6 +228,14 @@ while [[ $# -gt 0 ]]; do
         --train_vlm)
             TRAIN_VLM=true
             shift
+            ;;
+        --max_image_pixels)
+            MAX_IMAGE_PIXELS="$2"
+            shift 2
+            ;;
+        --min_image_pixels)
+            MIN_IMAGE_PIXELS="$2"
+            shift 2
             ;;
 
         # 模型维度参数
@@ -373,6 +390,7 @@ fi
 # 通用训练参数
 cmd="${cmd} \
     --strategy ${STRATEGY} \
+    --fsdp_sharding ${FSDP_SHARDING} \
     --batch_size ${BATCH_SIZE} \
     --max_steps ${MAX_STEPS} \
     --learning_rate ${LEARNING_RATE} \
@@ -381,6 +399,8 @@ cmd="${cmd} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --vlm_path ${VLM_PATH} \
     --ckpt_dir ${CKPT_DIR} \
+    --max_image_pixels ${MAX_IMAGE_PIXELS} \
+    --min_image_pixels ${MIN_IMAGE_PIXELS} \
     --action_dim ${ACTION_DIM} \
     --action_chunk_size ${ACTION_CHUNK_SIZE} \
     --pred_chunk_size ${PRED_CHUNK_SIZE} \

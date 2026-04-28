@@ -257,7 +257,7 @@ class LoLADiT(nn.Module):
         return context_rope, target_rope, all_rope
 
     def forward(self, target_actions, hist_actions, vlm_features, empty_emb, timestep,
-                hist_actions_mask=None, return_chunks: bool = False,
+                hist_actions_mask=None, vlm_attention_mask=None, return_chunks: bool = False,
                 use_gradient_checkpointing: bool = False):
         """
         Args:
@@ -277,36 +277,40 @@ class LoLADiT(nn.Module):
 
         context_features = torch.cat([vlm_features, hist_actions], dim=1)
 
-        # 构建 attention_mask（如果提供了 hist_actions_mask）
+        # 构建 attention_mask（如果提供了 mask 信息）
         # 注意：Flux2Attention 内部会拼接 encoder_hidden_states 和 hidden_states
         # 所以 mask 需要覆盖完整序列
         joint_attention_kwargs = {}
-        if hist_actions_mask is not None:
-            # hist_actions_mask: [B, hist_chunk_len] 值为 1 表示有效 chunk，0 表示 padding
-            # 我们需要构建一个适用于 full attention 的 mask
-
-            # VLM features 全部有效
+        if hist_actions_mask is not None or vlm_attention_mask is not None:
             vlm_len = vlm_features.shape[1]
             hist_len = hist_actions.shape[1]
             target_len = target_actions.shape[1]
 
-            # 对于 Flow Matching 训练，我们使用 full attention:
-            # - 所有 token 都可以 attend to 所有有效 token
-            # - Padding token 不应该被 attend to，也不应该作为 query
+            # vlm_attention_mask: [B, vlm_seq_len+1] (original VLM mask including empty token)
+            # vlm_features excludes the empty token ([:, :-1, :]), so mask must also exclude it
+            if vlm_attention_mask is not None:
+                vlm_mask = vlm_attention_mask[:, :-1].bool()  # [B, vlm_len]
+            else:
+                vlm_mask = torch.ones(
+                    vlm_features.shape[0], vlm_len,
+                    dtype=torch.bool,
+                    device=target_actions.device
+                )
 
-            # 构建完整的 mask: [VLM(全1), hist_actions(来自mask), target(全1)]
-            vlm_mask = torch.ones(
-                vlm_features.shape[0], vlm_len,
-                dtype=torch.bool,
-                device=hist_actions_mask.device
-            )
+            if hist_actions_mask is not None:
+                hist_mask_bool = hist_actions_mask.bool()
+            else:
+                hist_mask_bool = torch.ones(
+                    hist_actions.shape[0], hist_len,
+                    dtype=torch.bool,
+                    device=target_actions.device
+                )
+
             target_mask = torch.ones(
                 target_actions.shape[0], target_len,
                 dtype=torch.bool,
-                device=hist_actions_mask.device
+                device=target_actions.device
             )
-            # 将 hist_actions_mask 转换为 bool 类型 (1 -> True, 0 -> False)
-            hist_mask_bool = hist_actions_mask.bool()
 
             # 拼接: [B, full_seq_len]
             # True 表示该位置有效，False 表示 padding
@@ -315,8 +319,7 @@ class LoLADiT(nn.Module):
             # scaled_dot_product_attention 的 boolean mask:
             # True 表示该位置应该被 MASK OUT（不参与 attention）
             # False 表示该位置有效（参与 attention）
-            # 所以我们需要反转 mask
-            attn_mask = ~full_mask  # [B, full_seq_len], True=mask out, False=attend
+            attn_mask = ~full_mask
 
             joint_attention_kwargs['attention_mask'] = attn_mask
 
@@ -418,7 +421,7 @@ class LoLAPytorch(nn.Module):
         return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
-                hist_actions_mask=None, time=None, noise=None):
+                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None):
         """
         训练时的前向传播，实现 x-pred + v-loss 的 Flow Matching
 
@@ -485,6 +488,7 @@ class LoLAPytorch(nn.Module):
         pred_x0_chunks = self.dit(
             x_t, hist_chunks, vlm_features, empty_emb, time,
             hist_actions_mask=hist_chunks_mask,
+            vlm_attention_mask=vlm_attention_mask,
             return_chunks=True,
             use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
         )
@@ -891,6 +895,9 @@ class LoLAPolicy(PreTrainedPolicy):
         target_actions = self.prepare_target_actions(batch)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
 
+        # Extract VLM attention_mask for DiT (to fix vlm_mask bug)
+        vlm_attention_mask = batch.get("attention_mask", None) or batch.get("observation.language.attention_mask", None)
+
         # 转换为正确的精度
         hist_actions = hist_actions.to(self.dtype)
         target_actions = target_actions.to(self.dtype)
@@ -905,6 +912,7 @@ class LoLAPolicy(PreTrainedPolicy):
             hist_actions=hist_actions,
             target_actions=target_actions,
             hist_actions_mask=hist_actions_mask,
+            vlm_attention_mask=vlm_attention_mask,
         )
 
         loss = losses.mean()

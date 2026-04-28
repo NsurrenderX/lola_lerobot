@@ -325,10 +325,12 @@ class LolaQwenProcessor(ObservationProcessorStep):
     """
     
     def __init__(
-        self, 
+        self,
         processor_name: str = "Qwen/Qwen3.5-4B",
         max_length: int = 512,
         task_key: str = "task",
+        max_image_pixels: int = 230400,
+        min_image_pixels: int = 65536,
         **kwargs
     ):
         """
@@ -336,19 +338,26 @@ class LolaQwenProcessor(ObservationProcessorStep):
             processor_name: The HuggingFace model name for the processor.
             max_length: Maximum sequence length for tokenization.
             task_key: Key in complementary_data containing the task description.
+            max_image_pixels: Maximum pixels per image for Qwen3.5 smart_resize.
+                230400 → max_height≈360p for 720p images (220 visual tokens/image).
+                Controls the maximum number of visual tokens per image.
+            min_image_pixels: Minimum pixels per image for Qwen3.5 smart_resize.
+                65536 → minimum 64 visual tokens per image (256x256).
         """
         super().__init__(**kwargs)
         self.processor_name = processor_name
         self.max_length = max_length
         self.task_key = task_key
-        
+
         if not _transformers_available:
             raise ImportError(
                 "The 'transformers' library is not installed. "
                 "Please install it with `pip install transformers`."
             )
-        
+
         self.qwen_processor = AutoProcessor.from_pretrained(processor_name)
+        self.qwen_processor.image_processor.max_pixels = max_image_pixels
+        self.qwen_processor.image_processor.min_pixels = min_image_pixels
     
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
@@ -528,6 +537,8 @@ def make_lola_pre_post_processors(
         LolaQwenProcessor(  # Process text + images with Qwen3.5's apply_chat_template
             processor_name=vlm_model_name,
             max_length=max_length,
+            max_image_pixels=config.max_image_pixels,
+            min_image_pixels=config.min_image_pixels,
         ),
         LolaEmptyTokenProcessor(empty_token_id=config.empty_token_id),  # Append empty token for LoLA
         AddBatchDimensionProcessorStep(),

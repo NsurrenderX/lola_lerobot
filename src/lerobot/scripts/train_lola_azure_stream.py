@@ -435,6 +435,7 @@ class LoLATrainer:
         max_steps: int = 30000,
         train_vlm: bool = False,
         strategy: str = "ddp",
+        fsdp_sharding: str = "full_shard",
         gradient_clip_val: float = 1.0,
         ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
         save_every_n_steps: int = 500,
@@ -453,6 +454,7 @@ class LoLATrainer:
         self.max_steps = max_steps
         self.train_vlm = train_vlm
         self.strategy = strategy
+        self.fsdp_sharding = fsdp_sharding
         self.gradient_clip_val = gradient_clip_val
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
@@ -539,6 +541,8 @@ class LoLATrainer:
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
+        from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
+        from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -548,12 +552,24 @@ class LoLATrainer:
 
         auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
             module, recurse, nonwrapped_numel,
-            transformer_layer_cls={Qwen3_5DecoderLayer, Qwen3_5VisionBlock}
+            transformer_layer_cls={
+                Qwen3_5DecoderLayer,
+                Qwen3_5VisionBlock,
+                Flux2TransformerBlock,
+                Flux2SingleTransformerBlock,
+                LolaVLMFeatureExtractor,
+            }
         )
+
+        sharding_strategy = (
+            ShardingStrategy.FULL_SHARD if self.fsdp_sharding == "full_shard"
+            else ShardingStrategy.SHARD_GRAD_OP
+        )
+        _log(f"FSDP sharding strategy: {self.fsdp_sharding} ({sharding_strategy})")
 
         self.model = FSDP(
             self.policy,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision,
             auto_wrap_policy=auto_wrap_policy,
             use_orig_params=True,
@@ -706,6 +722,21 @@ class LoLATrainer:
                 gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
                 interconnect_metrics = self.interconnect_monitor.snapshot() if self.interconnect_monitor else {}
 
+                # ── Per-rank memory distribution ──────────────────
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+                local_reserved_pct = torch.cuda.memory_reserved(self.device) / total_mem * 100
+                local_alloc_pct = torch.cuda.memory_allocated(self.device) / total_mem * 100
+                if self.is_distributed:
+                    reserved_tensor = torch.tensor([local_reserved_pct], device=self.device)
+                    alloc_tensor = torch.tensor([local_alloc_pct], device=self.device)
+                    reserved_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                    alloc_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                    dist.all_gather(reserved_gathered, reserved_tensor)
+                    dist.all_gather(alloc_gathered, alloc_tensor)
+                else:
+                    reserved_gathered = [torch.tensor([local_reserved_pct])]
+                    alloc_gathered = [torch.tensor([local_alloc_pct])]
+
                 if self.is_main_process:
                     grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
 
@@ -725,6 +756,12 @@ class LoLATrainer:
                         f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
                         f"reserved={gpu_mem_reserved:.1f}GB"
                     )
+                    # ── Per-rank memory distribution ──
+                    mem_str = " | ".join(
+                        f"GPU{i}: r={r.item():.1f}% a={a.item():.1f}%"
+                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered))
+                    )
+                    _log(f"  Memory Distribution: {mem_str}")
                     if interconnect_metrics:
                         parts = []
                         if "pcie_rx_gb_s" in interconnect_metrics:
@@ -769,6 +806,9 @@ class LoLATrainer:
                                 log_dict[f"train/{k}"] = v
                         for k, v in interconnect_metrics.items():
                             log_dict[f"interconnect/{k}"] = v
+                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
+                            log_dict[f"train/gpu{i}_reserved_pct"] = r.item()
+                            log_dict[f"train/gpu{i}_alloc_pct"] = a.item()
                         wandb.log(log_dict)
 
             if self.global_step % self.save_every_n_steps == 0:
@@ -860,6 +900,9 @@ def main():
 
     # 训练参数
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
+    parser.add_argument("--fsdp_sharding", type=str, default="full_shard",
+                        choices=["full_shard", "shard_grad_op"],
+                        help="FSDP sharding strategy: full_shard (ZeRO-3) or shard_grad_op (ZeRO-2)")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--learning_rate", type=float, default=2.5e-5)
@@ -872,6 +915,12 @@ def main():
     parser.add_argument("--train_vlm", action="store_true")
     parser.add_argument("--ckpt_dir", type=str, default="/data_16T/deepseek/checkpoints/lola")
     parser.add_argument("--resume", type=str, default=None)
+
+    # VLM 图像分辨率参数
+    parser.add_argument("--max_image_pixels", type=int, default=230400,
+                        help="Max pixels per image for Qwen3.5 smart_resize (230400 → max_h≈360p)")
+    parser.add_argument("--min_image_pixels", type=int, default=65536,
+                        help="Min pixels per image for Qwen3.5 smart_resize (65536 → min 64 visual tokens)")
 
     # LoLA 参数
     parser.add_argument("--action_dim", type=int, default=20)
@@ -975,6 +1024,8 @@ def main():
         load_full_history=True,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
+        max_image_pixels=args.max_image_pixels,
+        min_image_pixels=args.min_image_pixels,
     )
 
     # 预训练模式：归一化由 dataset 内部完成，processor 使用 IDENTITY
@@ -1043,6 +1094,7 @@ def main():
         max_steps=args.max_steps,
         train_vlm=args.train_vlm,
         strategy=args.strategy,
+        fsdp_sharding=args.fsdp_sharding,
         gradient_clip_val=args.gradient_clip_val,
         ckpt_dir=args.ckpt_dir,
         save_every_n_steps=args.save_every_n_steps,
