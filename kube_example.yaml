@@ -32,11 +32,11 @@ environment: # select the image, clone your code, install the packages
     - conda run --name lerobot pip install --force-reinstall torch==2.10 torchvision==0.25 torchcodec==0.10 --index-url https://download.pytorch.org/whl/cu128
     # Step 3: Override specific packages that must be pinned
     # numpy 1.26.4 required — numpy 2.x has known torch.from_numpy buffer protocol issues on B200
-    # Python 3.12 required — numpy 1.26.4 only supports up to Python 3.12
-    - conda run --name lerobot pip install --force-reinstall numpy==1.26.4
+    # Python 3.12 required — numpy 1.26.4 only supports up to Python 3.12 
     - conda run --name lerobot pip install --force-reinstall transformers==5.2.0 diffusers==0.37.0
     - conda run --name lerobot pip install datasets==4.1.1
     - conda run --name lerobot pip install accelerate pytest deepspeed polars pytorch_lightning
+    - conda run --name lerobot pip install --force-reinstall numpy==1.26.4
     - conda clean -afy
 
 code:
@@ -63,13 +63,21 @@ jobs:
         memory: 1404GI
 
     command:
-      - cd /mnt/pvc
-      - ls
       - nvidia-smi
+      - cd /mnt/pvc
+      - echo "hello world"
+      - ls
       - cd && cd lola_lerobot
       - which conda
       - which python
       - conda run --name lerobot python -c "import sys; print(sys.executable)"
       - conda run --name lerobot which python
       - conda run --name lerobot which torchrun
+      - cd && cd lola_lerobot
+      - >-
+        bash src/lerobot/scripts/test_azure_stream.sh --nnodes $NODES --nproc_per_node $GPUS --node_rank $$AZUREML_CR_NODE_RANK --master_addr $$AZ_BATCHAI_JOB_MASTER_NODE_IP --master_port 9901 
+        --batch_size 64 --train_vlm --pretrain --temp_process 
+        --dataset_root /mnt/pvc/training_data/lerobot_v30/merged_0422_sub1 --vlm_path /mnt/pvc/training_data/weights/Qwen3.5-4B 
+        --ckpt_dir /mnt/pvc/training_data/checkpoints/ --fsdp_sharding "shard_grad_op"  --disable_gradient_checkpointing 
+        --max_history_length 1024
       - echo "Hello"
