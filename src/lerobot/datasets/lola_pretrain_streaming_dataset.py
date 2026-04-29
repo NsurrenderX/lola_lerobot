@@ -1309,7 +1309,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         # Initialize video decoder cache
         if self.video_decoder_cache is None:
             n_cameras = max(1, len(self.meta.video_keys))
-            cache_size = max(4, n_cameras * 2)
+            cache_size = max(4, n_cameras * self.episode_chunk_size)
             self.video_decoder_cache = BoundedVideoDecoderCache(max_size=cache_size)
 
         # Distributed info
@@ -1853,14 +1853,22 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
 
 class AsyncDecodeDataLoader:
-    """Wraps a DataLoader with video decode + collate for PyTorch Lightning."""
+    """Wraps a DataLoader with video decode + collate for PyTorch Lightning.
+
+    Supports optional background-thread prefetch for smoother data delivery
+    during training. When prefetch_queue_size > 0, a producer thread reads
+    batches from the DataLoader ahead of the training loop and buffers them
+    in a queue.Queue, eliminating data-yield stalls caused by chunk boundary
+    I/O or worker stalls.
+    """
 
     VARIABLE_LENGTH_KEYS = {"hist_actions_full", "hist_actions_mask"}
 
-    def __init__(self, dataloader, dataset, collate_fn=None):
+    def __init__(self, dataloader, dataset, collate_fn=None, prefetch_queue_size=0):
         self._loader = dataloader
         self._dataset = dataset
         self._collate_fn = collate_fn
+        self._prefetch_queue_size = prefetch_queue_size
 
     @staticmethod
     def make_collate_fn():
@@ -1899,8 +1907,71 @@ class AsyncDecodeDataLoader:
 
         return collate_fn
 
+    def _prefetch_iter(self):
+        """Background-thread prefetch: producer reads from DataLoader,
+        applies collate_fn, and buffers batches in queue.Queue."""
+        import queue as queue_mod
+        import threading
+
+        data_queue = queue_mod.Queue(maxsize=self._prefetch_queue_size)
+        shutdown_event = threading.Event()
+        error_holder = [None]  # shared mutable container for error propagation
+
+        decode_on_yield = self._dataset.deferred_video_decode and not self._dataset.async_decode
+
+        def producer():
+            try:
+                if self._dataset.async_decode and self._dataset.deferred_video_decode:
+                    for decoded_items in self._dataset.decode_iter(self._loader):
+                        if shutdown_event.is_set():
+                            break
+                        batch = self._collate_fn(decoded_items) if self._collate_fn else decoded_items
+                        try:
+                            data_queue.put(batch, block=True, timeout=0.5)
+                        except queue_mod.Full:
+                            continue
+                else:
+                    for batch in self._loader:
+                        if shutdown_event.is_set():
+                            break
+                        if self._dataset.deferred_video_decode and not decode_on_yield:
+                            batch = self._dataset.decode_items_batch(batch)
+                        batch = self._collate_fn(batch) if self._collate_fn else batch
+                        try:
+                            data_queue.put(batch, block=True, timeout=0.5)
+                        except queue_mod.Full:
+                            continue
+            except Exception as e:
+                error_holder[0] = e
+            finally:
+                data_queue.put(None)  # sentinel
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                item = data_queue.get(block=True)
+                if item is None:
+                    # Sentinel reached — iterator exhausted or producer stopped
+                    if error_holder[0] is not None:
+                        raise error_holder[0]
+                    break
+                yield item
+        finally:
+            shutdown_event.set()
+            # Drain queue so producer thread can exit if blocked on put
+            while not data_queue.empty():
+                try:
+                    data_queue.get_nowait()
+                except queue_mod.Empty:
+                    break
+            thread.join(timeout=5)
+
     def __iter__(self):
-        if self._dataset.async_decode and self._dataset.deferred_video_decode:
+        if self._prefetch_queue_size > 0:
+            yield from self._prefetch_iter()
+        elif self._dataset.async_decode and self._dataset.deferred_video_decode:
             for decoded_items in self._dataset.decode_iter(self._loader):
                 if self._collate_fn is not None:
                     yield self._collate_fn(decoded_items)

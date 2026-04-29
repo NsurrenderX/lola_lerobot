@@ -976,7 +976,7 @@ def main():
     parser.add_argument("--history_padding_side", type=str, default="left", choices=["left", "right"])
 
     # 流式数据集参数
-    parser.add_argument("--buffer_size", type=int, default=1000, help="Streaming shuffle buffer size")
+    parser.add_argument("--buffer_size", type=int, default=5000, help="Streaming shuffle buffer size per worker")
     parser.add_argument("--streaming_seed", type=int, default=42, help="Streaming dataset seed")
     parser.add_argument("--no_shuffle", action="store_true", help="Disable streaming shuffle")
 
@@ -1000,6 +1000,10 @@ def main():
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="DataLoader prefetch_factor per worker (default 2 in PyTorch, we use 4)")
+    parser.add_argument("--prefetch_queue_size", type=int, default=4,
+                        help="AsyncDecodeDataLoader batch-level prefetch queue size (0=disabled)")
 
     # 预训练参数
     parser.add_argument("--pretrain", action="store_true",
@@ -1171,11 +1175,14 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         collate_fn=lambda x: x,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=True,
     )
     train_loader = AsyncLoaderClass(
         dataloader=raw_loader,
         dataset=train_dataset,
         collate_fn=AsyncLoaderClass.make_collate_fn(),
+        prefetch_queue_size=args.prefetch_queue_size,
     )
 
     trainer.train(train_loader, start_step=start_step)

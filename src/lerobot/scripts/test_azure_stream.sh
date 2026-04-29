@@ -121,6 +121,8 @@ DECODE_NUM_THREADS=2
 BUFFER_SIZE=5000
 STREAMING_SEED=42
 NUM_WORKERS=8
+PREFETCH_FACTOR=4
+PREFETCH_QUEUE_SIZE=4
 NO_SHUFFLE=false
 
 # Pretrain 参数
@@ -300,6 +302,18 @@ while [[ $# -gt 0 ]]; do
             NUM_WORKERS="$2"
             shift 2
             ;;
+        --prefetch_factor)
+            PREFETCH_FACTOR="$2"
+            shift 2
+            ;;
+        --prefetch_queue_size)
+            PREFETCH_QUEUE_SIZE="$2"
+            shift 2
+            ;;
+        --buffer_size)
+            BUFFER_SIZE="$2"
+            shift 2
+            ;;
         --no_shuffle)
             NO_SHUFFLE=true
             shift
@@ -374,6 +388,9 @@ echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - Pretrain: ${PRETRAIN}"
+echo "  - Buffer size: ${BUFFER_SIZE}"
+echo "  - Prefetch factor: ${PREFETCH_FACTOR}"
+echo "  - Prefetch queue: ${PREFETCH_QUEUE_SIZE}"
 echo "  - Disable gradient checkpointing: ${DISABLE_GRADIENT_CHECKPOINTING}"
 echo "========================================"
 
@@ -418,6 +435,8 @@ cmd="${cmd} \
     --decode_device ${DECODE_DEVICE} \
     --decode_num_threads ${DECODE_NUM_THREADS} \
     --num_workers ${NUM_WORKERS} \
+    --prefetch_factor ${PREFETCH_FACTOR} \
+    --prefetch_queue_size ${PREFETCH_QUEUE_SIZE} \
     --wandb_project ${WANDB_PROJECT}"
 
 # 数据集参数
