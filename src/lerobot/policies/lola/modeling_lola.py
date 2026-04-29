@@ -650,6 +650,7 @@ class LoLAPolicy(PreTrainedPolicy):
                 device_map=None,  # 不自动分配，让分布式策略管理
                 low_cpu_mem_usage=True,
                 local_files_only=True,
+                attn_implementation="sdpa",
             )
         else:
             self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
@@ -657,6 +658,7 @@ class LoLAPolicy(PreTrainedPolicy):
                 torch_dtype=self._dtype,
                 device_map=None,
                 low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
             )
         
         self.model.to(self._dtype)

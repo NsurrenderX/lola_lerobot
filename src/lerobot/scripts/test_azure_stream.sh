@@ -86,6 +86,7 @@ LEARNING_RATE=2.5e-5
 LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
 GRADIENT_CLIP_VAL=1.0
+DISABLE_GRADIENT_CHECKPOINTING=false  # Disable checkpointing to save bwd recomputation overhead (increases memory)
 
 # 数据集参数
 DATASET_REPO_ID=""
@@ -196,6 +197,10 @@ while [[ $# -gt 0 ]]; do
         --gradient_clip_val)
             GRADIENT_CLIP_VAL="$2"
             shift 2
+            ;;
+        --disable_gradient_checkpointing)
+            DISABLE_GRADIENT_CHECKPOINTING=true
+            shift
             ;;
 
         # 数据集参数
@@ -369,6 +374,7 @@ echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - Pretrain: ${PRETRAIN}"
+echo "  - Disable gradient checkpointing: ${DISABLE_GRADIENT_CHECKPOINTING}"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -444,6 +450,9 @@ if [ "$TRAIN_VLM" = true ]; then
 fi
 
 # 解码参数
+if [ "$DISABLE_GRADIENT_CHECKPOINTING" = true ]; then
+    cmd="${cmd} --disable_gradient_checkpointing"
+fi
 if [ "$NO_DEFERRED" = true ]; then
     cmd="${cmd} --no_deferred"
 fi

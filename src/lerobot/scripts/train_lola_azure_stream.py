@@ -440,6 +440,7 @@ class LoLATrainer:
         ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
         save_every_n_steps: int = 500,
         log_every_n_steps: int = 10,
+        disable_gradient_checkpointing: bool = False,
         wandb_project: str = "lola-azure-stream",
         wandb_name: str | None = None,
         wandb_entity: str | None = None,
@@ -459,6 +460,7 @@ class LoLATrainer:
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
         self.log_every_n_steps = log_every_n_steps
+        self.disable_gradient_checkpointing = disable_gradient_checkpointing
 
         self.wandb_project = wandb_project
         self.wandb_name = wandb_name
@@ -489,6 +491,11 @@ class LoLATrainer:
 
     def setup_model(self):
         """设置模型"""
+        # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        cudnn_sdp_available = torch.backends.cuda.cudnn_sdp_enabled()
+        _log(f"cuDNN SDPA backend: enabled={cudnn_sdp_available}")
+
         _log(f"Loading LoLA Policy on {self.device}...")
 
         self.policy = LoLAPolicy(self.config)
@@ -524,6 +531,15 @@ class LoLATrainer:
 
         self.interconnect_monitor = InterconnectMonitor(self.device)
 
+        # Disable gradient checkpointing if requested (saves bwd recomputation overhead)
+        if self.disable_gradient_checkpointing:
+            if hasattr(self.policy, 'vlm') and hasattr(self.policy.vlm, 'gradient_checkpointing_disable'):
+                self.policy.vlm.gradient_checkpointing_disable()
+                _log("VLM gradient checkpointing DISABLED")
+            if hasattr(self.policy, 'model') and hasattr(self.policy.model, 'gradient_checkpointing_disable'):
+                self.policy.model.gradient_checkpointing_disable()
+                _log("DiT gradient checkpointing DISABLED")
+
     def _setup_ddp(self):
         """设置 DDP"""
         _log("Setting up DDP...")
@@ -546,7 +562,7 @@ class LoLATrainer:
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
             buffer_dtype=torch.bfloat16,
         )
 
@@ -614,17 +630,27 @@ class LoLATrainer:
         batch.update(special_data)
         return batch
 
-    def training_step(self, batch):
+    def training_step(self, batch, timing_dict: dict | None = None):
         """单步训练"""
+        t0 = time.monotonic()
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        t_device = time.monotonic() - t0
 
+        t1 = time.monotonic()
         special_data = self._extract_special_fields(batch)
-
         batch = self.preprocessor(batch)
         batch = self._restore_special_fields(batch, special_data)
+        t_preprocess = time.monotonic() - t1
 
+        t2 = time.monotonic()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             loss, loss_dict = self.model(batch)
+        t_model_fwd = time.monotonic() - t2
+
+        if timing_dict is not None:
+            timing_dict["device_s"] = t_device
+            timing_dict["preprocess_s"] = t_preprocess
+            timing_dict["model_fwd_s"] = t_model_fwd
 
         return loss, loss_dict
 
@@ -665,18 +691,24 @@ class LoLATrainer:
         # 数据跳过由 dataset.start_index 在 __iter__ 内部处理，
         # 这里无需 skip_epochs/skip_batches 逻辑
 
+        data_yield_start = time.monotonic()
         for batch_idx, batch in enumerate(train_loader):
             if self.global_step >= self.max_steps:
                 break
 
+            data_yield_s = time.monotonic() - data_yield_start
             step_start = time.monotonic()
 
             self.optimizer.zero_grad()
 
-            # ── Forward pass (with timing) ───────────────────────
+            # ── Forward pass (with split timing) ────────────────
+            fwd_timing = {}
             fwd_start = time.monotonic()
-            loss, loss_dict = self.training_step(batch)
+            loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
             fwd_s = time.monotonic() - fwd_start
+            device_s = fwd_timing.get("device_s", 0)
+            preprocess_s = fwd_timing.get("preprocess_s", 0)
+            model_fwd_s = fwd_timing.get("model_fwd_s", 0)
 
             # ── Backward pass (with timing) ──────────────────────
             bwd_start = time.monotonic()
@@ -744,13 +776,15 @@ class LoLATrainer:
                     _log(
                         f"[Step {self.global_step}/{self.max_steps}] "
                         f"Loss={loss.item():.4f} LR={lr:.2e} "
-                        f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
+                        f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s "
+                        f"DataWait={data_yield_s:.2f}s"
                     )
                     if grad_norm_val is not None:
                         _log(f"  grad_norm={grad_norm_val:.4f}")
                     _log(
-                        f"  Timing: fwd={fwd_s:.3f}s bwd={bwd_s:.3f}s "
-                        f"clip={clip_s:.3f}s opt={opt_s:.3f}s"
+                        f"  Timing: fwd={fwd_s:.3f}s (device={device_s:.3f}s "
+                        f"preprocess={preprocess_s:.3f}s model_fwd={model_fwd_s:.3f}s) "
+                        f"bwd={bwd_s:.3f}s clip={clip_s:.3f}s opt={opt_s:.3f}s"
                     )
                     _log(
                         f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
@@ -792,7 +826,11 @@ class LoLATrainer:
                             "train/step": self.global_step,
                             "train/update_s": update_s,
                             "train/batch_per_s": batch_per_s,
+                            "train/data_yield_s": data_yield_s,
                             "train/fwd_s": fwd_s,
+                            "train/fwd_device_s": device_s,
+                            "train/fwd_preprocess_s": preprocess_s,
+                            "train/fwd_model_fwd_s": model_fwd_s,
                             "train/bwd_s": bwd_s,
                             "train/clip_s": clip_s,
                             "train/opt_s": opt_s,
@@ -813,6 +851,9 @@ class LoLATrainer:
 
             if self.global_step % self.save_every_n_steps == 0:
                 self.save_checkpoint(ckpt_dir, self.global_step)
+
+            # Reset data yield timer for next iteration
+            data_yield_start = time.monotonic()
 
         self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
         _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
@@ -909,6 +950,8 @@ def main():
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--save_every_n_steps", type=int, default=500)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
+    parser.add_argument("--disable_gradient_checkpointing", action="store_true",
+                        help="Disable gradient checkpointing on VLM and DiT (saves recomputation overhead, increases memory)")
 
     # 模型参数
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/")
@@ -1099,6 +1142,7 @@ def main():
         ckpt_dir=args.ckpt_dir,
         save_every_n_steps=args.save_every_n_steps,
         log_every_n_steps=args.log_every_n_steps,
+        disable_gradient_checkpointing=args.disable_gradient_checkpointing,
         wandb_project=args.wandb_project,
         wandb_name=args.wandb_name,
         wandb_entity=args.wandb_entity,
