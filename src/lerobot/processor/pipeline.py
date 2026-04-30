@@ -281,29 +281,36 @@ class DataProcessorPipeline(HubMixin, Generic[TInput, TOutput]):
     before_step_hooks: list[Callable[[int, EnvTransition], None]] = field(default_factory=list, repr=False)
     after_step_hooks: list[Callable[[int, EnvTransition], None]] = field(default_factory=list, repr=False)
 
-    def __call__(self, data: TInput) -> TOutput:
+    def __call__(self, data: TInput, skip_device_step: bool = False) -> TOutput:
         """Processes input data through the full pipeline.
 
         Args:
             data: The input data to process.
+            skip_device_step: If True, skip DeviceProcessorStep (useful when
+                running CPU-only preprocessing in a background thread, then
+                doing GPU transfer on the main thread).
 
         Returns:
             The processed data in the specified output format.
         """
         transition = self.to_transition(data)
-        transformed_transition = self._forward(transition)
+        transformed_transition = self._forward(transition, skip_device_step=skip_device_step)
         return self.to_output(transformed_transition)
 
-    def _forward(self, transition: EnvTransition) -> EnvTransition:
+    def _forward(self, transition: EnvTransition, skip_device_step: bool = False) -> EnvTransition:
         """Executes all processing steps and hooks in sequence.
 
         Args:
             transition: The initial `EnvTransition` object.
+            skip_device_step: If True, skip steps whose class name is
+                "DeviceProcessorStep" to avoid GPU transfer in background threads.
 
         Returns:
             The final `EnvTransition` after all steps have been applied.
         """
         for idx, processor_step in enumerate(self.steps):
+            if skip_device_step and processor_step.__class__.__name__ == "DeviceProcessorStep":
+                continue
             # Execute pre-hooks
             for hook in self.before_step_hooks:
                 hook(idx, transition)

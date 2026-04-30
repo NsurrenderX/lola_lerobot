@@ -413,6 +413,7 @@ def create_lola_pretrain_streaming_dataset(
         temp_process=temp_process,
         episode_chunk_size=episode_chunk_size,
         start_index=start_index,
+        tolerance_frames=2,
     )
 
     return dataset
@@ -445,6 +446,7 @@ class LoLATrainer:
         wandb_name: str | None = None,
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
+        preprocess_in_loader: bool = False,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -488,6 +490,7 @@ class LoLATrainer:
         self.global_step = 0
         self.best_loss = float("inf")
         self.interconnect_monitor = None
+        self._preprocess_in_loader = preprocess_in_loader
 
     def setup_model(self):
         """设置模型"""
@@ -633,14 +636,22 @@ class LoLATrainer:
     def training_step(self, batch, timing_dict: dict | None = None):
         """单步训练"""
         t0 = time.monotonic()
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        t_device = time.monotonic() - t0
 
-        t1 = time.monotonic()
-        special_data = self._extract_special_fields(batch)
-        batch = self.preprocessor(batch)
-        batch = self._restore_special_fields(batch, special_data)
-        t_preprocess = time.monotonic() - t1
+        if self._preprocess_in_loader:
+            # Batch already preprocessed by prefetch thread (CPU steps done, no PIL Images).
+            # Only need to move all tensors to GPU.
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            t_preprocess = time.monotonic() - t0  # GPU transfer time only
+        else:
+            # Old behavior: GPU transfer + extract special + preprocess + restore
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            t_device = time.monotonic() - t0
+
+            t1 = time.monotonic()
+            special_data = self._extract_special_fields(batch)
+            batch = self.preprocessor(batch)
+            batch = self._restore_special_fields(batch, special_data)
+            t_preprocess = time.monotonic() - t1
 
         t2 = time.monotonic()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -648,8 +659,12 @@ class LoLATrainer:
         t_model_fwd = time.monotonic() - t2
 
         if timing_dict is not None:
-            timing_dict["device_s"] = t_device
-            timing_dict["preprocess_s"] = t_preprocess
+            if self._preprocess_in_loader:
+                timing_dict["device_s"] = 0.0  # No separate device transfer before preprocess
+                timing_dict["preprocess_s"] = t_preprocess  # GPU transfer time only
+            else:
+                timing_dict["device_s"] = t_device
+                timing_dict["preprocess_s"] = t_preprocess
             timing_dict["model_fwd_s"] = t_model_fwd
 
         return loss, loss_dict
@@ -1151,6 +1166,7 @@ def main():
         wandb_name=args.wandb_name,
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
+        preprocess_in_loader=args.prefetch_queue_size > 0,
     )
 
     if args.disable_wandb:
@@ -1178,12 +1194,28 @@ def main():
         prefetch_factor=args.prefetch_factor,
         persistent_workers=True,
     )
-    train_loader = AsyncLoaderClass(
-        dataloader=raw_loader,
-        dataset=train_dataset,
-        collate_fn=AsyncLoaderClass.make_collate_fn(),
-        prefetch_queue_size=args.prefetch_queue_size,
-    )
+
+    # When prefetch is enabled, create a preprocess_fn that runs CPU-only preprocessing
+    # in the background thread, so the main training thread only needs GPU transfer.
+    # Only PretrainAsyncDecodeDataLoader supports prefetch_queue_size and preprocess_fn.
+    loader_kwargs = {
+        "dataloader": raw_loader,
+        "dataset": train_dataset,
+        "collate_fn": AsyncLoaderClass.make_collate_fn(),
+    }
+    if args.pretrain:
+        preprocess_fn_for_loader = None
+        if args.prefetch_queue_size > 0:
+            def preprocess_fn_for_loader(batch):
+                """Preprocess batch in prefetch thread (CPU steps, skip GPU transfer)."""
+                special_data = trainer._extract_special_fields(batch)
+                batch = trainer.preprocessor(batch, skip_device_step=True)
+                batch = trainer._restore_special_fields(batch, special_data)
+                return batch
+        loader_kwargs["prefetch_queue_size"] = args.prefetch_queue_size
+        loader_kwargs["preprocess_fn"] = preprocess_fn_for_loader
+
+    train_loader = AsyncLoaderClass(**loader_kwargs)
 
     trainer.train(train_loader, start_step=start_step)
 

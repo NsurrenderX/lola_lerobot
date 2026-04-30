@@ -1860,15 +1860,21 @@ class AsyncDecodeDataLoader:
     batches from the DataLoader ahead of the training loop and buffers them
     in a queue.Queue, eliminating data-yield stalls caused by chunk boundary
     I/O or worker stalls.
+
+    When preprocess_fn is provided alongside prefetch_queue_size > 0, the
+    producer thread also runs CPU-only preprocessing (skipping GPU transfer)
+    before enqueuing, so the main training thread only needs to move tensors
+    to GPU — eliminating the ~1.0-1.5s CPU preprocess bottleneck.
     """
 
     VARIABLE_LENGTH_KEYS = {"hist_actions_full", "hist_actions_mask"}
 
-    def __init__(self, dataloader, dataset, collate_fn=None, prefetch_queue_size=0):
+    def __init__(self, dataloader, dataset, collate_fn=None, prefetch_queue_size=0, preprocess_fn=None):
         self._loader = dataloader
         self._dataset = dataset
         self._collate_fn = collate_fn
         self._prefetch_queue_size = prefetch_queue_size
+        self._preprocess_fn = preprocess_fn
 
     @staticmethod
     def make_collate_fn():
@@ -1909,7 +1915,8 @@ class AsyncDecodeDataLoader:
 
     def _prefetch_iter(self):
         """Background-thread prefetch: producer reads from DataLoader,
-        applies collate_fn, and buffers batches in queue.Queue."""
+        applies collate_fn and optionally preprocess_fn, then buffers
+        batches in queue.Queue."""
         import queue as queue_mod
         import threading
 
@@ -1926,10 +1933,15 @@ class AsyncDecodeDataLoader:
                         if shutdown_event.is_set():
                             break
                         batch = self._collate_fn(decoded_items) if self._collate_fn else decoded_items
-                        try:
-                            data_queue.put(batch, block=True, timeout=0.5)
-                        except queue_mod.Full:
-                            continue
+                        if self._preprocess_fn:
+                            batch = self._preprocess_fn(batch)
+                        # Retry put until success or shutdown (don't discard preprocessed batches)
+                        while not shutdown_event.is_set():
+                            try:
+                                data_queue.put(batch, block=True, timeout=0.5)
+                                break
+                            except queue_mod.Full:
+                                continue
                 else:
                     for batch in self._loader:
                         if shutdown_event.is_set():
@@ -1937,10 +1949,15 @@ class AsyncDecodeDataLoader:
                         if self._dataset.deferred_video_decode and not decode_on_yield:
                             batch = self._dataset.decode_items_batch(batch)
                         batch = self._collate_fn(batch) if self._collate_fn else batch
-                        try:
-                            data_queue.put(batch, block=True, timeout=0.5)
-                        except queue_mod.Full:
-                            continue
+                        if self._preprocess_fn:
+                            batch = self._preprocess_fn(batch)
+                        # Retry put until success or shutdown
+                        while not shutdown_event.is_set():
+                            try:
+                                data_queue.put(batch, block=True, timeout=0.5)
+                                break
+                            except queue_mod.Full:
+                                continue
             except Exception as e:
                 error_holder[0] = e
             finally:
