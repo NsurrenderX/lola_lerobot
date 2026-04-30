@@ -28,6 +28,7 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 
 import torch
@@ -1151,6 +1152,7 @@ class LoLATrainer:
                     "train_vlm": self.train_vlm,
                     "gradient_clip_val": self.gradient_clip_val,
                     "gradient_accumulation_steps": total_accum_steps,
+                    "gradient_sync_interval": sync_interval,
                     "target_effective_batch": target_effective_batch,
                     "tier_batch_sizes": tier_batch_sizes,
                     "tier_accum_steps": tier_accum_steps,
@@ -1163,6 +1165,16 @@ class LoLATrainer:
              f"(accum={total_accum_steps} micro-steps, "
              f"effective_batch={target_effective_batch})")
 
+        # Compute gradient sync interval for distributed training.
+        # Without no_sync(), every backward() triggers all_reduce/reduce_scatter,
+        # causing inter-GPU stalls. We sync every N micro-steps to balance
+        # throughput (fewer syncs) vs memory (sync releases gradient buffers).
+        # Default: sync every 5 steps, dynamically adjusted after step 1.
+        sync_interval = total_accum_steps if not self.is_distributed else min(5, total_accum_steps)
+        self._sync_interval = sync_interval
+        _log(f"Gradient sync interval: every {sync_interval} micro-steps "
+             f"(total_accum={total_accum_steps}, distributed={self.is_distributed})")
+
         data_yield_start = time.monotonic()
         while self.global_step < self.max_steps:
             # ── Gradient accumulation cycle ────────────────────────
@@ -1174,20 +1186,35 @@ class LoLATrainer:
             tier_loss_counts = {t: 0 for t in range(num_tiers)}
             tier_sample_counts = {t: 0 for t in range(num_tiers)}
             tier_memory_costs = {}
+            accum_data_yield_s = 0.0
+            accum_fwd_s = 0.0
+            accum_bwd_s = 0.0
 
             for micro_idx, (tier_idx, micro_batch) in enumerate(accum_order):
                 # Get next batch from tier DataLoader (auto-restart on StopIteration)
                 batch = self._get_next_tier_batch(tier_idx)
 
                 data_yield_s = time.monotonic() - data_yield_start
-                step_start = time.monotonic()
+                accum_data_yield_s += data_yield_s
 
                 # Forward + backward (scaled by 1/total_accum for proper gradient averaging)
-                fwd_timing = {}
-                loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
+                # Periodic gradient sync: sync every sync_interval steps to release
+                # gradient buffers and prevent memory buildup, while reducing sync stalls.
+                should_sync = (micro_idx + 1) % self._sync_interval == 0 or micro_idx == total_accum_steps - 1
+                sync_ctx = nullcontext() if should_sync or not self.is_distributed else self.model.no_sync()
 
-                scaled_loss = loss / total_accum_steps
-                scaled_loss.backward()
+                with sync_ctx:
+                    fwd_timing = {}
+                    fwd_start = time.monotonic()
+                    loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
+                    fwd_s = time.monotonic() - fwd_start
+                    accum_fwd_s += fwd_s
+
+                    bwd_start = time.monotonic()
+                    scaled_loss = loss / total_accum_steps
+                    scaled_loss.backward()
+                    bwd_s = time.monotonic() - bwd_start
+                    accum_bwd_s += bwd_s
 
                 accum_loss += loss.item()
                 accum_samples += micro_batch
@@ -1269,6 +1296,46 @@ class LoLATrainer:
 
                 torch.cuda.reset_peak_memory_stats(self.device)
 
+                # Dynamically adjust sync_interval based on available memory
+                if self.is_distributed and total_accum_steps > 1:
+                    # Estimate per-micro-step gradient memory overhead
+                    # = peak_mem - post_backward_mem (the gradient buffer size for one step)
+                    # Under FSDP, no_sync() accumulates full unsharded gradients instead of
+                    # keeping only the local shard. Extra cost per no_sync step ≈
+                    # (world_size - 1) / world_size * grad_shard_size.
+                    # We measure it empirically by comparing current allocated vs peak.
+                    current_mem = torch.cuda.memory_allocated(self.device)
+                    total_mem = torch.cuda.get_device_properties(self.device).total_memory
+                    budget_mem = total_mem * self._gpu_utilization_target
+
+                    # Estimate gradient buffer overhead per no_sync step
+                    # After one step with sync, current_mem = model + optimizer + activations
+                    # After one step without sync, peak would be current_mem + grad_buffer
+                    # We use the difference between peak and current as grad_buffer estimate
+                    # (this is conservative since peak also includes activation peaks)
+                    # A better estimate: grad_buffer ≈ param_memory * (world_size-1)/world_size for FSDP
+                    param_mem = sum(p.numel() * p.element_size() for p in self.model.parameters())
+                    if self.strategy == "fsdp":
+                        # FSDP: no_sync accumulates (world_size-1)/world_size of full gradient
+                        grad_buffer_per_step = param_mem * (self.world_size - 1) / self.world_size
+                    else:
+                        # DDP: no_sync keeps full gradient buffer per step
+                        grad_buffer_per_step = param_mem
+
+                    # Available room for no_sync gradient accumulation
+                    available_for_grads = budget_mem - current_mem
+                    max_no_sync_steps = max(1, int(available_for_grads / grad_buffer_per_step)) if grad_buffer_per_step > 0 else 1
+                    # Use at most max_no_sync_steps between syncs, but cap at 20 for stability
+                    new_sync_interval = min(max_no_sync_steps, 20, total_accum_steps)
+                    new_sync_interval = max(1, new_sync_interval)
+
+                    if new_sync_interval != self._sync_interval:
+                        _log(f"Sync interval adjusted: {self._sync_interval} -> {new_sync_interval} "
+                             f"(grad_buffer/step={grad_buffer_per_step / 1e9:.2f}GB, "
+                             f"available={available_for_grads / 1e9:.1f}GB, "
+                             f"max_no_sync={max_no_sync_steps})")
+                        self._sync_interval = new_sync_interval
+
             # ── Logging ─────────────────────────────────────────────
             if self.global_step % self.log_every_n_steps == 0:
                 lr = self.scheduler.get_last_lr()[0]
@@ -1330,9 +1397,14 @@ class LoLATrainer:
                             "train/effective_batch_size": accum_samples,
                             "train/target_effective_batch": target_effective_batch,
                             "train/total_accum_steps": total_accum_steps,
+                            "train/sync_interval": self._sync_interval,
                             "train/gpu_mem_alloc_gb": gpu_mem_alloc,
                             "train/gpu_mem_reserved_gb": gpu_mem_reserved,
                             "train/balance_max_deviation": max_deviation,
+                            "train/data_yield_s": accum_data_yield_s / total_accum_steps,
+                            "train/fwd_s": accum_fwd_s / total_accum_steps,
+                            "train/bwd_s": accum_bwd_s / total_accum_steps,
+                            "train/update_s": clip_s + opt_s,
                         }
                         for k, v in loss_dict.items():
                             if k != "loss" and isinstance(v, (int, float)):
