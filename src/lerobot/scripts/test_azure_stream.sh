@@ -132,7 +132,11 @@ EPISODE_CHUNK_SIZE=16
 
 # Tier-based batching 参数
 TIER_CONFIG_PATH=""
-GRADIENT_ACCUMULATION_STEPS=1
+EFFECTIVE_BATCH_SIZE=2048
+BALANCE_MODE="frame_weighted"
+GPU_UTILIZATION_TARGET=0.92
+GPU_MEMORY_BUDGET_GB=""
+TIER_MICRO_BATCHES_OVERRIDE=""
 
 # Wandb 参数
 WANDB_PROJECT="lola-azure-pretrain"
@@ -340,8 +344,24 @@ while [[ $# -gt 0 ]]; do
             TIER_CONFIG_PATH="$2"
             shift 2
             ;;
-        --gradient_accumulation_steps)
-            GRADIENT_ACCUMULATION_STEPS="$2"
+        --effective_batch_size)
+            EFFECTIVE_BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --balance_mode)
+            BALANCE_MODE="$2"
+            shift 2
+            ;;
+        --gpu_utilization_target)
+            GPU_UTILIZATION_TARGET="$2"
+            shift 2
+            ;;
+        --gpu_memory_budget_gb)
+            GPU_MEMORY_BUDGET_GB="$2"
+            shift 2
+            ;;
+        --tier_micro_batches_override)
+            TIER_MICRO_BATCHES_OVERRIDE="$2"
             shift 2
             ;;
 
@@ -406,7 +426,11 @@ echo "  - Prefetch queue: ${PREFETCH_QUEUE_SIZE}"
 echo "  - Disable gradient checkpointing: ${DISABLE_GRADIENT_CHECKPOINTING}"
 if [ -n "$TIER_CONFIG_PATH" ]; then
     echo "  - Tier config: ${TIER_CONFIG_PATH}"
-    echo "  - Gradient accumulation steps: ${GRADIENT_ACCUMULATION_STEPS}"
+    echo "  - Effective batch size: ${EFFECTIVE_BATCH_SIZE}"
+    echo "  - Balance mode: ${BALANCE_MODE}"
+    echo "  - GPU utilization target: ${GPU_UTILIZATION_TARGET}"
+    [ -n "$GPU_MEMORY_BUDGET_GB" ] && echo "  - GPU memory budget (GB): ${GPU_MEMORY_BUDGET_GB}"
+    [ -n "$TIER_MICRO_BATCHES_OVERRIDE" ] && echo "  - Tier micro-batches override: ${TIER_MICRO_BATCHES_OVERRIDE}"
 fi
 echo "========================================"
 
@@ -482,7 +506,15 @@ fi
 # Tier-based batching 参数
 if [ -n "$TIER_CONFIG_PATH" ]; then
     cmd="${cmd} --tier_config_path ${TIER_CONFIG_PATH}"
-    cmd="${cmd} --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS}"
+    cmd="${cmd} --effective_batch_size ${EFFECTIVE_BATCH_SIZE}"
+    cmd="${cmd} --balance_mode ${BALANCE_MODE}"
+    cmd="${cmd} --gpu_utilization_target ${GPU_UTILIZATION_TARGET}"
+    if [ -n "$GPU_MEMORY_BUDGET_GB" ]; then
+        cmd="${cmd} --gpu_memory_budget_gb ${GPU_MEMORY_BUDGET_GB}"
+    fi
+    if [ -n "$TIER_MICRO_BATCHES_OVERRIDE" ]; then
+        cmd="${cmd} --tier_micro_batches_override ${TIER_MICRO_BATCHES_OVERRIDE}"
+    fi
 fi
 
 # 训练 VLM 参数
