@@ -610,6 +610,7 @@ def compute_tier_schedule(
     )
     schedule["tier_micro_batches"] = tier_micro_batches
     schedule["gpu_utilization_target"] = gpu_utilization_target
+    schedule["bytes_per_token"] = bytes_per_token
 
     return schedule
 
@@ -1076,7 +1077,13 @@ class LoLATrainer:
 
     def train_with_tiers(self, tier_loaders, tier_batch_sizes, tier_accum_steps,
                          accum_order, balance_weights, target_effective_batch,
-                         start_step: int = 0):
+                         start_step: int = 0,
+                         gpu_utilization_target: float = 0.92,
+                         tier_stats: dict | None = None,
+                         tier_datasets: list | None = None,
+                         async_loader_class=None,
+                         dataloader_kwargs: dict | None = None,
+                         balance_mode: str = "frame_weighted"):
         """Balanced tier-cycling training loop with gradient accumulation.
 
         Each optimizer step = len(accum_order) micro-steps.
@@ -1091,9 +1098,21 @@ class LoLATrainer:
             balance_weights: target ratio per tier (e.g. frame-weighted)
             target_effective_batch: target total samples per optimizer step
             start_step: resume offset
+            gpu_utilization_target: target GPU memory utilization (default 0.92)
+            tier_stats: tier_config["tier_stats"] for recalibration
+            tier_datasets: list of tier datasets (for DataLoader recreation)
+            async_loader_class: AsyncDecodeDataLoader class to use
+            dataloader_kwargs: kwargs for DataLoader creation (num_workers, etc.)
+            balance_mode: balance mode used for recalibration (default: frame_weighted)
         """
         self.global_step = start_step
         self.model.train()
+        self._gpu_utilization_target = gpu_utilization_target
+        self._tier_stats = tier_stats
+        self._tier_datasets = tier_datasets
+        self._async_loader_class = async_loader_class
+        self._dataloader_kwargs = dataloader_kwargs or {}
+        self._balance_mode = balance_mode
 
         num_tiers = len(tier_loaders)
         total_accum_steps = len(accum_order)
@@ -1199,6 +1218,57 @@ class LoLATrainer:
             self.scheduler.step()
             self.global_step += 1
 
+            # ── Dynamic micro_batch recalibration after first step ──
+            if self.global_step == 1 and torch.cuda.is_available() and self._tier_stats is not None:
+                actual_peak = torch.cuda.max_memory_allocated(self.device)
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+                actual_ratio = actual_peak / total_mem
+                _log(f"Step 1 GPU utilization: {actual_ratio:.2%} (target: {self._gpu_utilization_target:.2%})")
+
+                if actual_ratio < self._gpu_utilization_target * 0.8:
+                    scale = min(self._gpu_utilization_target / actual_ratio, 3.0)
+                    new_batch_sizes = [max(1, int(bs * scale * 0.95)) for bs in tier_batch_sizes]
+
+                    _log(f"Recalibrating micro_batches: {tier_batch_sizes} -> {new_batch_sizes} "
+                         f"(scale={scale:.2f}, safety_margin=0.95)")
+
+                    new_schedule = compute_balanced_schedule(
+                        tier_stats=self._tier_stats,
+                        tier_micro_batches=new_batch_sizes,
+                        target_effective_batch=target_effective_batch,
+                        balance_mode=self._balance_mode,
+                    )
+
+                    tier_batch_sizes = new_batch_sizes
+                    tier_accum_steps = new_schedule["tier_accum_steps"]
+                    accum_order = new_schedule["accum_order"]
+                    total_accum_steps = len(accum_order)
+
+                    # Recreate DataLoaders with new batch sizes
+                    if self._tier_datasets is not None and self._async_loader_class is not None:
+                        for t in range(num_tiers):
+                            old_loader = self._tier_loaders[t]
+                            try:
+                                old_loader.close()
+                            except Exception:
+                                pass
+                            self._tier_loaders[t] = self._create_tier_dataloader(
+                                tier_ds=self._tier_datasets[t],
+                                micro_batch=tier_batch_sizes[t],
+                                async_loader_class=self._async_loader_class,
+                                **self._dataloader_kwargs,
+                            )
+                            self._tier_iters[t] = iter(self._tier_loaders[t])
+
+                    _log(f"Updated schedule: {total_accum_steps} micro-steps per optimizer step")
+                    for t in range(num_tiers):
+                        _log(f"  Tier {t}: micro_batch={tier_batch_sizes[t]}, "
+                             f"accum_steps={tier_accum_steps[str(t)]}, "
+                             f"samples/step={tier_batch_sizes[t] * tier_accum_steps[str(t)]}")
+                    _log(f"  Total effective batch: {sum(tier_batch_sizes[t] * tier_accum_steps[str(t)] for t in range(num_tiers))}")
+
+                torch.cuda.reset_peak_memory_stats(self.device)
+
             # ── Logging ─────────────────────────────────────────────
             if self.global_step % self.log_every_n_steps == 0:
                 lr = self.scheduler.get_last_lr()[0]
@@ -1298,6 +1368,42 @@ class LoLATrainer:
 
         if self.use_wandb:
             wandb.finish()
+
+    def _create_tier_dataloader(self, tier_ds, micro_batch, num_workers=8,
+                                prefetch_factor=4, prefetch_queue_size=0,
+                                async_loader_class=None):
+        """Create a single tier DataLoader with async decode wrapping."""
+        from torch.utils.data import DataLoader
+
+        if async_loader_class is None:
+            async_loader_class = self._async_loader_class
+
+        raw_loader = DataLoader(
+            tier_ds,
+            batch_size=micro_batch,
+            num_workers=num_workers,
+            collate_fn=lambda x: x,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True,
+        )
+
+        loader_kwargs = {
+            "dataloader": raw_loader,
+            "dataset": tier_ds,
+            "collate_fn": async_loader_class.make_collate_fn(),
+        }
+        if prefetch_queue_size > 0:
+            def make_preprocess_fn(trainer_ref):
+                def preprocess_fn(batch):
+                    special_data = trainer_ref._extract_special_fields(batch)
+                    batch = trainer_ref.preprocessor(batch, skip_device_step=True)
+                    batch = trainer_ref._restore_special_fields(batch, special_data)
+                    return batch
+                return preprocess_fn
+            loader_kwargs["prefetch_queue_size"] = prefetch_queue_size
+            loader_kwargs["preprocess_fn"] = make_preprocess_fn(self)
+
+        return async_loader_class(**loader_kwargs)
 
     def _get_next_tier_batch(self, tier_idx: int):
         """Get next batch from tier DataLoader, with auto-restart and epoch tracking."""
@@ -1661,42 +1767,30 @@ def main():
                 _log(f"Tier {tier_idx} start_index = {tier_ds.start_index}")
 
         # Create per-tier DataLoaders (after start_index is set)
+        dataloader_kwargs = {
+            "num_workers": args.num_workers,
+            "prefetch_factor": args.prefetch_factor,
+            "prefetch_queue_size": args.prefetch_queue_size,
+        }
         for tier_idx in range(num_tiers):
-            tier_ds = tier_datasets[tier_idx]
-            micro_batch = tier_micro_batches[tier_idx]
-
-            raw_loader = DataLoader(
-                tier_ds,
-                batch_size=micro_batch,
-                num_workers=args.num_workers,
-                collate_fn=lambda x: x,
-                prefetch_factor=args.prefetch_factor,
-                persistent_workers=True,
+            tier_loader = trainer._create_tier_dataloader(
+                tier_ds=tier_datasets[tier_idx],
+                micro_batch=tier_micro_batches[tier_idx],
+                async_loader_class=AsyncLoaderClass,
+                **dataloader_kwargs,
             )
-
-            loader_kwargs = {
-                "dataloader": raw_loader,
-                "dataset": tier_ds,
-                "collate_fn": AsyncLoaderClass.make_collate_fn(),
-            }
-            if args.prefetch_queue_size > 0:
-                def make_preprocess_fn(trainer_ref):
-                    def preprocess_fn(batch):
-                        special_data = trainer_ref._extract_special_fields(batch)
-                        batch = trainer_ref.preprocessor(batch, skip_device_step=True)
-                        batch = trainer_ref._restore_special_fields(batch, special_data)
-                        return batch
-                    return preprocess_fn
-                loader_kwargs["prefetch_queue_size"] = args.prefetch_queue_size
-                loader_kwargs["preprocess_fn"] = make_preprocess_fn(trainer)
-
-            tier_loader = AsyncLoaderClass(**loader_kwargs)
             tier_loaders.append(tier_loader)
 
         trainer.train_with_tiers(
             tier_loaders, tier_micro_batches, tier_accum_steps,
             accum_order, balance_weights, actual_effective_batch,
             start_step=start_step,
+            gpu_utilization_target=args.gpu_utilization_target,
+            tier_stats=tier_stats,
+            tier_datasets=tier_datasets,
+            async_loader_class=AsyncLoaderClass,
+            dataloader_kwargs=dataloader_kwargs,
+            balance_mode=args.balance_mode,
         )
 
     # ── Original single-DataLoader path ───────────────────────────
