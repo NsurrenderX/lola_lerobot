@@ -130,6 +130,10 @@ PRETRAIN=false
 TEMP_PROCESS=false
 EPISODE_CHUNK_SIZE=16
 
+# Tier-based batching 参数
+TIER_CONFIG_PATH=""
+GRADIENT_ACCUMULATION_STEPS=1
+
 # Wandb 参数
 WANDB_PROJECT="lola-azure-pretrain"
 WANDB_NAME=""
@@ -332,6 +336,14 @@ while [[ $# -gt 0 ]]; do
             EPISODE_CHUNK_SIZE="$2"
             shift 2
             ;;
+        --tier_config_path)
+            TIER_CONFIG_PATH="$2"
+            shift 2
+            ;;
+        --gradient_accumulation_steps)
+            GRADIENT_ACCUMULATION_STEPS="$2"
+            shift 2
+            ;;
 
         # Wandb 参数
         --wandb_project)
@@ -392,6 +404,10 @@ echo "  - Buffer size: ${BUFFER_SIZE}"
 echo "  - Prefetch factor: ${PREFETCH_FACTOR}"
 echo "  - Prefetch queue: ${PREFETCH_QUEUE_SIZE}"
 echo "  - Disable gradient checkpointing: ${DISABLE_GRADIENT_CHECKPOINTING}"
+if [ -n "$TIER_CONFIG_PATH" ]; then
+    echo "  - Tier config: ${TIER_CONFIG_PATH}"
+    echo "  - Gradient accumulation steps: ${GRADIENT_ACCUMULATION_STEPS}"
+fi
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -461,6 +477,12 @@ if [ "$TEMP_PROCESS" = true ]; then
 fi
 if [ "$EPISODE_CHUNK_SIZE" != 8 ]; then
     cmd="${cmd} --episode_chunk_size ${EPISODE_CHUNK_SIZE}"
+fi
+
+# Tier-based batching 参数
+if [ -n "$TIER_CONFIG_PATH" ]; then
+    cmd="${cmd} --tier_config_path ${TIER_CONFIG_PATH}"
+    cmd="${cmd} --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS}"
 fi
 
 # 训练 VLM 参数

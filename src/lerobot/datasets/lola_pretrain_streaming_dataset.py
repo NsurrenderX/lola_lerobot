@@ -755,6 +755,13 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         temp_process: bool = False,
         episode_chunk_size: int = 8,
         start_index: int = 0,
+        tier_config_path: str | None = None,
+        yield_tier: int | None = None,
+        pred_chunk_size: int = 50,
+        max_image_pixels: int = 230400,
+        min_image_pixels: int = 65536,
+        vision_tower_multiplier: float = 4.0,
+        action_token_weight: float = 1.0,
     ):
         super().__init__()
 
@@ -786,6 +793,13 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self.temp_process = temp_process
         self.episode_chunk_size = episode_chunk_size
         self.start_index = start_index
+        self.pred_chunk_size = pred_chunk_size
+        self._max_image_pixels = max_image_pixels
+        self._min_image_pixels = min_image_pixels
+        self._vision_tower_multiplier = vision_tower_multiplier
+        self._action_token_weight = action_token_weight
+        self.tier_config_path = tier_config_path
+        self.yield_tier = yield_tier
 
         # Build metadata
         self.meta = self._build_metadata_polars(
@@ -834,31 +848,15 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             last_file = bisect.bisect_right(self._file_cumsum, self._episode_ends[ep_idx] - 1) - 1
             self._episode_file_ranges.append((first_file, last_file))
 
-        # ── Chunk-to-file mapping + visual cost estimation ──────────
-        # Each chunk's primary file = most frequent file across its episodes.
-        # Visual cost = estimated number of visual tokens per chunk
-        # (valid cameras count × target visual tokens per image).
+        # ── Chunk-to-file mapping (primary file only, computed early) ────
+        # Full chunk cost + tier classification is deferred until after tier
+        # config is loaded (see below).
         chunk_size = self.episode_chunk_size
         num_chunks = (num_episodes + chunk_size - 1) // chunk_size
         self._chunk_primary_file = []
-        self._chunk_visual_cost = []
         for c in range(num_chunks):
             ep_start = c * chunk_size
-            ep_end = min(ep_start + chunk_size, num_episodes)
-            # Primary file = first file of the first episode (most representative)
-            primary_file = self._episode_file_ranges[ep_start][0]
-            self._chunk_primary_file.append(primary_file)
-            # Visual cost = sum of valid cameras across episodes in this chunk
-            cost = 0
-            for ep_i in range(ep_start, ep_end):
-                ep_meta = self.meta.episodes[ep_i]
-                valid_cameras = 0
-                for cam_key in self.meta.camera_keys:
-                    is_valid = ep_meta.get(f"videos/{cam_key}/is_valid", 1)
-                    if is_valid == 1:
-                        valid_cameras += 1
-                cost += valid_cameras
-            self._chunk_visual_cost.append(cost)
+            self._chunk_primary_file.append(self._episode_file_ranges[ep_start][0])
 
         # ── EpisodeChunkReader ─────────────────────────────────────────
         self._chunk_reader = EpisodeChunkReader(
@@ -875,9 +873,42 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         # ── Task name lookup ───────────────────────────────────────────
         self._task_names = [self.meta.tasks.iloc[i].name for i in range(len(self.meta.tasks))]
 
-        # ── Seek-mode mapping (scan videos at init) ────────────────────
+        # ── Seek-mode mapping + tier config loading ────────────────────
         self._video_seek_modes: dict[str, str] = {}
-        if self.streaming_from_local and os.path.isdir(os.path.join(str(self.root), "videos")):
+        self._video_resolution_map: dict[str, tuple[int, int]] = {}
+        self._episode_visual_cost: list[float] | None = None
+        self._episode_tier: list[int] | None = None
+        self._tier_boundaries: tuple[float, ...] | None = None
+        self._tier_stats: dict | None = None
+
+        if self.tier_config_path is not None:
+            # Load pre-computed tier config from Phase 1b JSON (no scanning needed)
+            import json as _json
+            with open(self.tier_config_path) as f:
+                tier_config = _json.load(f)
+
+            # Video resolution + seek mode from JSON
+            for rel_path, vmeta in tier_config["video_resolution_map"].items():
+                self._video_resolution_map[rel_path] = (vmeta["height"], vmeta["width"])
+                self._video_seek_modes[rel_path] = vmeta.get("seek_mode", "approximate")
+
+            # Episode costs and tiers from JSON
+            self._episode_visual_cost = tier_config["episode_costs"]
+            self._episode_tier = tier_config["episode_tiers"]
+            self._tier_boundaries = tuple(tier_config["tier_boundaries"][:-1]) + (float("inf"),)
+            self._tier_stats = tier_config["tier_stats"]
+
+            # Use calibrated coefficients from JSON
+            self._vision_tower_multiplier = tier_config["params"]["vision_tower_multiplier"]
+            self._action_token_weight = tier_config["params"]["action_token_weight"]
+
+            num_tiers = len(self._tier_stats)
+            print(f"[LoLAPretrainStreamingDataset] Loaded tier config from {self.tier_config_path}: "
+                  f"{len(self._video_resolution_map)} videos, "
+                  f"{len(self._episode_visual_cost)} episode costs, "
+                  f"{num_tiers} tiers, boundaries={self._tier_boundaries}")
+        elif self.streaming_from_local and os.path.isdir(os.path.join(str(self.root), "videos")):
+            # Original behavior: scan videos at init (for non-tier-aware mode)
             self._video_seek_modes = scan_video_seek_modes(str(self.root), num_workers=8)
             exact_count = sum(1 for v in self._video_seek_modes.values() if v == "exact")
             print(f"[LoLAPretrainStreamingDataset] seek-mode scan: {len(self._video_seek_modes)} videos, "
@@ -902,6 +933,72 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         print(f"[LoLAPretrainStreamingDataset] total_episodes: {num_episodes}")
         print(f"[LoLAPretrainStreamingDataset] episode_chunk_size: {episode_chunk_size}")
         print(f"[LoLAPretrainStreamingDataset] sub_datasets: {len(self._sub_dataset_names)}")
+
+        # ── Chunk memory cost + tier classification (deferred after tier config) ──
+        # This must run after _episode_visual_cost and _episode_tier are populated
+        # from tier_config_path (if provided), otherwise the fallback is used.
+        self._chunk_memory_cost: list[float] = []
+        self._chunk_tier: list[int] = []
+        # Per-tier frame count per chunk (for yield_tier worker balancing)
+        self._chunk_tier_frame_counts: dict[int, list[int]] = {}
+
+        num_tiers = len(self._tier_boundaries) - 1 if self._tier_boundaries else 0
+        chunk_size = self.episode_chunk_size
+        num_chunks = (num_episodes + chunk_size - 1) // chunk_size
+
+        # Initialize per-tier frame count lists
+        for t in range(num_tiers):
+            self._chunk_tier_frame_counts[t] = [0] * num_chunks
+
+        for c in range(num_chunks):
+            ep_start = c * chunk_size
+            ep_end = min(ep_start + chunk_size, num_episodes)
+
+            cost = 0.0
+            tier_counts = [0] * max(num_tiers, 1)
+            tier_frame_counts = [0] * max(num_tiers, 1)
+
+            for ep_i in range(ep_start, ep_end):
+                # Use pre-computed episode cost if available (from tier config JSON)
+                if self._episode_visual_cost is not None:
+                    ep_cost = self._episode_visual_cost[ep_i]
+                else:
+                    # Fallback: count valid cameras (original behavior)
+                    ep_meta = self.meta.episodes[ep_i]
+                    valid_cameras = 0
+                    for cam_key in self.meta.camera_keys:
+                        is_valid = ep_meta.get(f"videos/{cam_key}/is_valid", 1)
+                        if is_valid == 1:
+                            valid_cameras += 1
+                    ep_cost = valid_cameras * self._vision_tower_multiplier
+
+                    # Add action cost
+                    ds_idx = int(self._episode_to_ds_idx[ep_i])
+                    action_dim, _ = self._sub_dataset_dims[ds_idx] if ds_idx >= 0 and ds_idx < len(self._sub_dataset_dims) else (self.action_dim, 0)
+                    pred_tokens = self.pred_chunk_size // self.action_chunk_size
+                    hist_tokens = self.max_history_length // self.action_chunk_size
+                    action_cost = (pred_tokens + hist_tokens) * self._action_token_weight * action_dim
+                    ep_cost += action_cost
+
+                cost += ep_cost
+
+                # Track tier counts and frame counts for this chunk
+                if self._episode_tier is not None and num_tiers > 0:
+                    ep_tier = self._episode_tier[ep_i]
+                    tier_counts[ep_tier] += 1
+                    ep_frame_count = self._episode_ends[ep_i] - self._episode_starts[ep_i]
+                    tier_frame_counts[ep_tier] += ep_frame_count
+
+            self._chunk_memory_cost.append(cost)
+            # Dominant tier = most frequent tier in chunk
+            if num_tiers > 0 and sum(tier_counts) > 0:
+                self._chunk_tier.append(tier_counts.index(max(tier_counts)))
+            else:
+                self._chunk_tier.append(0)
+
+            # Store per-tier frame counts for this chunk
+            for t in range(num_tiers):
+                self._chunk_tier_frame_counts[t][c] = tier_frame_counts[t]
 
     @staticmethod
     def _build_metadata_polars(repo_id, root, revision, force_cache_sync=False):
@@ -1298,6 +1395,16 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             item["action_dim"] = action_dim
             item["state_dim"] = state_dim
 
+            # ── Tier metadata (for per-tier DataLoader filtering) ────
+            if self._episode_visual_cost is not None:
+                item["_memory_cost"] = float(self._episode_visual_cost[ep_idx])
+            else:
+                item["_memory_cost"] = 0.0
+            if self._episode_tier is not None:
+                item["_tier"] = int(self._episode_tier[ep_idx])
+            else:
+                item["_tier"] = 0
+
             items.append(item)
 
         return items
@@ -1338,23 +1445,35 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             pf = self._chunk_primary_file[c]
             file_to_chunks.setdefault(pf, []).append(c)
 
-        # Sort file groups by their maximum chunk visual cost (descending)
+        # Sort file groups by their maximum chunk memory cost (descending)
         file_groups = sorted(
             file_to_chunks.values(),
-            key=lambda group: max(self._chunk_visual_cost[c] for c in group),
+            key=lambda group: max(self._chunk_memory_cost[c] for c in group),
             reverse=True,
         )
 
         # Greedy round-robin: assign each file group to the worker with lowest current cost
+        # When yield_tier is set, balance by target-tier frame count instead of memory cost
         worker_indices: list[list[int]] = [[] for _ in range(total_parallel)]
         worker_costs: list[float] = [0.0] * total_parallel
+        use_tier_frame_balance = (
+            self.yield_tier is not None
+            and self.yield_tier in self._chunk_tier_frame_counts
+        )
         for group in file_groups:
             min_worker = worker_costs.index(min(worker_costs))
             worker_indices[min_worker].extend(group)
             for c in group:
-                worker_costs[min_worker] += self._chunk_visual_cost[c]
+                if use_tier_frame_balance:
+                    worker_costs[min_worker] += self._chunk_tier_frame_counts[self.yield_tier][c]
+                else:
+                    worker_costs[min_worker] += self._chunk_memory_cost[c]
 
         worker_chunk_indices = worker_indices[parallel_id]
+
+        # Note: tier filtering is done at per-episode level inside the episode loop
+        # (see below), not at chunk level. This is more precise than chunk-level
+        # filtering because episodes in a mixed-tier chunk can be correctly routed.
 
         if not worker_chunk_indices:
             print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no chunks assigned "
@@ -1412,6 +1531,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             for local_ep_idx in ep_order:
                 ep_idx = ep_start_idx + local_ep_idx
                 ep_data = ep_data_list[local_ep_idx]
+
+                # Per-episode tier filter (more precise than chunk-level filtering)
+                if self.yield_tier is not None and self._episode_tier is not None:
+                    if self._episode_tier[ep_idx] != self.yield_tier:
+                        continue
 
                 # Process all frames in this episode
                 try:
@@ -1903,8 +2027,10 @@ class AsyncDecodeDataLoader:
                             v = torch.cat([padding, v], dim=0)
                         padded_values.append(v)
                     result[key] = torch.stack(padded_values)
-                elif key == "action_dim" or key == "state_dim":
+                elif key == "action_dim" or key == "state_dim" or key == "_tier":
                     result[key] = torch.tensor(values)
+                elif key == "_memory_cost":
+                    result[key] = torch.tensor(values, dtype=torch.float32)
                 elif isinstance(values[0], torch.Tensor):
                     result[key] = torch.stack(values)
                 else:

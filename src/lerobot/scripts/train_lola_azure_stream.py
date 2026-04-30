@@ -377,6 +377,8 @@ def create_lola_pretrain_streaming_dataset(
     temp_process: bool = False,
     episode_chunk_size: int = 8,
     start_index: int = 0,
+    tier_config_path: str | None = None,
+    yield_tier: int | None = None,
 ):
     """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
     dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id, root=root, revision=None)
@@ -414,9 +416,202 @@ def create_lola_pretrain_streaming_dataset(
         episode_chunk_size=episode_chunk_size,
         start_index=start_index,
         tolerance_frames=2,
+        tier_config_path=tier_config_path,
+        yield_tier=yield_tier,
     )
 
     return dataset
+
+
+# ----------------------------------------------------------------------
+# Tier 调度自动计算
+# ----------------------------------------------------------------------
+def compute_balanced_schedule(
+    tier_stats: dict,
+    tier_micro_batches: list[int],
+    target_effective_batch: int,
+    balance_mode: str = "frame_weighted",
+    seed: int = 42,
+):
+    """自动计算 per-tier 累积步数，使各 tier 按指定权重平衡参与每个 optimizer step。
+
+    Args:
+        tier_stats: tier_config["tier_stats"] dict, keyed by tier index string
+        tier_micro_batches: per-tier micro-batch size list
+        target_effective_batch: 目标有效 batch size (总样本数)
+        balance_mode: "frame_weighted" | "equal" | "episode_weighted"
+        seed: 用于 shuffle accum_order 的随机种子
+
+    Returns:
+        dict with tier_accum_steps, accum_order, actual_effective_batch,
+        balance_weights, balance_mode
+    """
+    import numpy as np
+
+    num_tiers = len(tier_stats)
+
+    # 1. Compute balance weights
+    if balance_mode == "frame_weighted":
+        total_frames = sum(tier_stats[str(t)]["frame_count"] for t in range(num_tiers))
+        weights = [tier_stats[str(t)]["frame_count"] / total_frames for t in range(num_tiers)]
+    elif balance_mode == "episode_weighted":
+        total_eps = sum(tier_stats[str(t)]["episode_count"] for t in range(num_tiers))
+        weights = [tier_stats[str(t)]["episode_count"] / total_eps for t in range(num_tiers)]
+    else:  # equal
+        weights = [1.0 / num_tiers] * num_tiers
+
+    # 2. Compute ideal (float) accum steps per tier
+    ideal_accum = [target_effective_batch * weights[t] / tier_micro_batches[t] for t in range(num_tiers)]
+
+    # 3. Adaptive rounding: floor first, then distribute remainder
+    #    respecting ratio bounds — skip tiers already over-represented
+    accum = [max(1, int(a)) for a in ideal_accum]
+
+    def _actual_ratio(accum_list):
+        total_s = sum(m * a for m, a in zip(tier_micro_batches, accum_list))
+        if total_s == 0:
+            return [0.0] * num_tiers
+        return [tier_micro_batches[t] * accum_list[t] / total_s for t in range(num_tiers)]
+
+    current_total = sum(m * a for m, a in zip(tier_micro_batches, accum))
+
+    # Greedily add or skip based on ratio deficit
+    max_iterations = target_effective_batch  # safety bound
+    for _ in range(max_iterations):
+        if current_total >= target_effective_batch:
+            break
+
+        ratios = _actual_ratio(accum)
+        # Find tier with largest deficit (actual < target)
+        best_tier = -1
+        best_deficit = -float("inf")
+        for t in range(num_tiers):
+            deficit = weights[t] - ratios[t]
+            if deficit > best_deficit:
+                best_deficit = deficit
+                best_tier = t
+
+        # Only add if adding doesn't push this tier over its target ratio
+        # (i.e., the tier is still under-represented)
+        if best_tier >= 0 and best_deficit > -1e-6:
+            accum[best_tier] += 1
+            current_total += tier_micro_batches[best_tier]
+        else:
+            # All tiers are at or above target ratio; add to the one closest to target
+            # This handles the case where total is slightly under target but all ratios match
+            smallest_excess = float("inf")
+            for t in range(num_tiers):
+                excess = ratios[t] - weights[t]
+                if excess < smallest_excess:
+                    smallest_excess = excess
+                    best_tier = t
+            if best_tier >= 0:
+                accum[best_tier] += 1
+                current_total += tier_micro_batches[best_tier]
+
+    # 4. Build interleaved accum_order (round-robin proportional to accum steps)
+    accum_order = []
+    max_accum = max(accum)
+    for step in range(max_accum):
+        for t in range(num_tiers):
+            if step < accum[t]:
+                accum_order.append((t, tier_micro_batches[t]))
+
+    # Shuffle for gradient mixing (deterministic with seed)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(accum_order)
+
+    return {
+        "tier_accum_steps": {str(t): accum[t] for t in range(num_tiers)},
+        "accum_order": accum_order,
+        "actual_effective_batch": current_total,
+        "balance_weights": weights,
+        "balance_mode": balance_mode,
+    }
+
+
+def compute_tier_schedule(
+    tier_stats: dict,
+    effective_batch_size: int,
+    balance_mode: str = "frame_weighted",
+    gpu_memory_budget_gb: float | None = None,
+    tier_micro_batches_override: str | None = None,
+    gpu_utilization_target: float = 0.92,
+    calibration_path: str | None = None,
+    seed: int = 42,
+):
+    """自动计算 per-tier micro-batch size 和累积调度。
+
+    Args:
+        tier_stats: tier_config["tier_stats"] dict
+        effective_batch_size: 目标有效 batch size
+        balance_mode: "frame_weighted" | "equal" | "episode_weighted"
+        gpu_memory_budget_gb: 手动指定 GPU 显存预算 (GB)；None 则自动探测
+        tier_micro_batches_override: 手动覆盖 micro-batch sizes, 逗号分隔 (e.g. "8,4,2")
+        gpu_utilization_target: GPU 显存利用率目标 (default 0.92 = 92%)
+        calibration_path: calibration_coefficients.json 路径
+        seed: 用于 shuffle accum_order 的随机种子
+
+    Returns:
+        dict with tier_micro_batches, tier_accum_steps, accum_order,
+        actual_effective_batch, balance_weights, balance_mode
+    """
+    num_tiers = len(tier_stats)
+
+    # Step 1: Compute per-tier micro-batch sizes
+    if tier_micro_batches_override:
+        tier_micro_batches = [int(x) for x in tier_micro_batches_override.split(",")]
+        if len(tier_micro_batches) != num_tiers:
+            raise ValueError(
+                f"tier_micro_batches_override has {len(tier_micro_batches)} values "
+                f"but there are {num_tiers} tiers"
+            )
+    else:
+        # Auto-detect GPU memory budget
+        if gpu_memory_budget_gb is None:
+            if torch.cuda.is_available():
+                gpu_total_bytes = torch.cuda.get_device_properties(0).total_memory
+                gpu_memory_budget_gb = gpu_total_bytes / 1e9 * gpu_utilization_target
+            else:
+                gpu_memory_budget_gb = 60.0 * gpu_utilization_target  # conservative default
+                _log(f"CUDA not available, using default {gpu_memory_budget_gb:.1f}GB budget")
+
+        # Load calibration to get bytes per equivalent token
+        bytes_per_token = 4.0e6  # conservative default
+        if calibration_path and os.path.isfile(calibration_path):
+            try:
+                import json as _json
+                with open(calibration_path) as _f:
+                    calib = _json.load(_f)
+                vlm_calib_bs = calib.get("vlm_calib_batch_size", 4)
+                text_slope = calib["measurements"]["text_token_slope_bytes"]
+                bytes_per_token = text_slope / vlm_calib_bs
+                _log(f"Calibration: bytes_per_equivalent_token={bytes_per_token:.0f} "
+                     f"(text_slope={text_slope:.0f}, calib_bs={vlm_calib_bs})")
+            except Exception as e:
+                _log(f"Failed to load calibration from {calibration_path}: {e}, using default")
+
+        budget_bytes = gpu_memory_budget_gb * 1e9
+        tier_micro_batches = []
+        for t in range(num_tiers):
+            cost = tier_stats[str(t)]["avg_cost"]
+            mb = max(1, int(budget_bytes / (cost * bytes_per_token)))
+            tier_micro_batches.append(mb)
+            _log(f"Tier {t}: avg_cost={cost:.0f}, micro_batch={mb} "
+                 f"(budget={gpu_memory_budget_gb:.1f}GB, bytes/token={bytes_per_token:.0f})")
+
+    # Step 2: Compute accumulation schedule
+    schedule = compute_balanced_schedule(
+        tier_stats=tier_stats,
+        tier_micro_batches=tier_micro_batches,
+        target_effective_batch=effective_batch_size,
+        balance_mode=balance_mode,
+        seed=seed,
+    )
+    schedule["tier_micro_batches"] = tier_micro_batches
+    schedule["gpu_utilization_target"] = gpu_utilization_target
+
+    return schedule
 
 
 # ----------------------------------------------------------------------
@@ -879,6 +1074,241 @@ class LoLATrainer:
         if self.use_wandb:
             wandb.finish()
 
+    def train_with_tiers(self, tier_loaders, tier_batch_sizes, tier_accum_steps,
+                         accum_order, balance_weights, target_effective_batch,
+                         start_step: int = 0):
+        """Balanced tier-cycling training loop with gradient accumulation.
+
+        Each optimizer step = len(accum_order) micro-steps.
+        The accumulation order is auto-computed to balance tier representation
+        proportional to balance_weights (default: frame_weighted).
+
+        Args:
+            tier_loaders: list of AsyncDecodeDataLoader per tier
+            tier_batch_sizes: list of micro_batch_size per tier
+            tier_accum_steps: dict {tier_idx_str: accum_steps}
+            accum_order: list of (tier_idx, micro_batch) interleaved + shuffled
+            balance_weights: target ratio per tier (e.g. frame-weighted)
+            target_effective_batch: target total samples per optimizer step
+            start_step: resume offset
+        """
+        self.global_step = start_step
+        self.model.train()
+
+        num_tiers = len(tier_loaders)
+        total_accum_steps = len(accum_order)
+        self._tier_loaders = tier_loaders
+        self._tier_iters = [iter(loader) for loader in tier_loaders]
+        self._tier_epochs = [0] * num_tiers
+
+        _log(f"Accumulation order ({total_accum_steps} micro-steps per optimizer step):")
+        for t in range(num_tiers):
+            _log(f"  Tier {t}: micro_batch={tier_batch_sizes[t]}, "
+                 f"accum_steps={tier_accum_steps[str(t)]}, "
+                 f"weight={balance_weights[t]:.3f}, "
+                 f"samples/step={tier_batch_sizes[t] * tier_accum_steps[str(t)]}")
+        _log(f"  Total effective batch: {target_effective_batch}")
+
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-stream-{time_str}")
+        if self.is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            _log(f"Checkpoint directory: {ckpt_dir}")
+
+        if self.use_wandb:
+            wandb_run_name = self.wandb_name or f"lola-tier-stream-{self.strategy}-{time_str}"
+            wandb.init(
+                project=self.wandb_project,
+                name=wandb_run_name,
+                entity=self.wandb_entity,
+                id=self.wandb_id,
+                resume="allow" if self.wandb_id else None,
+                config={
+                    "learning_rate": self.learning_rate,
+                    "weight_decay": self.weight_decay,
+                    "max_steps": self.max_steps,
+                    "strategy": self.strategy,
+                    "world_size": self.world_size,
+                    "train_vlm": self.train_vlm,
+                    "gradient_clip_val": self.gradient_clip_val,
+                    "gradient_accumulation_steps": total_accum_steps,
+                    "target_effective_batch": target_effective_batch,
+                    "tier_batch_sizes": tier_batch_sizes,
+                    "tier_accum_steps": tier_accum_steps,
+                    "balance_weights": balance_weights,
+                },
+            )
+            _log(f"Wandb initialized: {wandb_run_name}")
+
+        _log(f"Starting tier-cycling training from step {start_step} to {self.max_steps} "
+             f"(accum={total_accum_steps} micro-steps, "
+             f"effective_batch={target_effective_batch})")
+
+        data_yield_start = time.monotonic()
+        while self.global_step < self.max_steps:
+            # ── Gradient accumulation cycle ────────────────────────
+            self.optimizer.zero_grad()
+
+            accum_loss = 0.0
+            accum_samples = 0
+            tier_loss_sums = {t: 0.0 for t in range(num_tiers)}
+            tier_loss_counts = {t: 0 for t in range(num_tiers)}
+            tier_sample_counts = {t: 0 for t in range(num_tiers)}
+            tier_memory_costs = {}
+
+            for micro_idx, (tier_idx, micro_batch) in enumerate(accum_order):
+                # Get next batch from tier DataLoader (auto-restart on StopIteration)
+                batch = self._get_next_tier_batch(tier_idx)
+
+                data_yield_s = time.monotonic() - data_yield_start
+                step_start = time.monotonic()
+
+                # Forward + backward (scaled by 1/total_accum for proper gradient averaging)
+                fwd_timing = {}
+                loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
+
+                scaled_loss = loss / total_accum_steps
+                scaled_loss.backward()
+
+                accum_loss += loss.item()
+                accum_samples += micro_batch
+                tier_loss_sums[tier_idx] += loss.item()
+                tier_loss_counts[tier_idx] += 1
+                tier_sample_counts[tier_idx] += micro_batch
+
+                if "_memory_cost" in batch and isinstance(batch["_memory_cost"], torch.Tensor):
+                    tier_memory_costs[tier_idx] = batch["_memory_cost"].mean().item()
+
+                data_yield_start = time.monotonic()
+
+            # ── Gradient clipping + optimizer step ──────────────────
+            clip_start = time.monotonic()
+            if self.gradient_clip_val > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.gradient_clip_val,
+                )
+            else:
+                grad_norm = None
+            clip_s = time.monotonic() - clip_start
+
+            opt_start = time.monotonic()
+            self.optimizer.step()
+            opt_s = time.monotonic() - opt_start
+
+            self.scheduler.step()
+            self.global_step += 1
+
+            # ── Logging ─────────────────────────────────────────────
+            if self.global_step % self.log_every_n_steps == 0:
+                lr = self.scheduler.get_last_lr()[0]
+                gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                interconnect_metrics = self.interconnect_monitor.snapshot() if self.interconnect_monitor else {}
+
+                # Per-rank memory distribution
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+                local_reserved_pct = torch.cuda.memory_reserved(self.device) / total_mem * 100
+                local_alloc_pct = torch.cuda.memory_allocated(self.device) / total_mem * 100
+                if self.is_distributed:
+                    reserved_tensor = torch.tensor([local_reserved_pct], device=self.device)
+                    alloc_tensor = torch.tensor([local_alloc_pct], device=self.device)
+                    reserved_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                    alloc_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                    dist.all_gather(reserved_gathered, reserved_tensor)
+                    dist.all_gather(alloc_gathered, alloc_tensor)
+                else:
+                    reserved_gathered = [torch.tensor([local_reserved_pct])]
+                    alloc_gathered = [torch.tensor([local_alloc_pct])]
+
+                if self.is_main_process:
+                    grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
+                    avg_loss = accum_loss / total_accum_steps
+
+                    _log(
+                        f"[Step {self.global_step}/{self.max_steps}] "
+                        f"Loss={avg_loss:.4f} EffectiveBatch={accum_samples} "
+                        f"LR={lr:.2e}"
+                    )
+                    max_deviation = 0.0
+                    for t in range(num_tiers):
+                        actual_ratio = tier_sample_counts[t] / accum_samples if accum_samples > 0 else 0
+                        deviation = actual_ratio - balance_weights[t]
+                        max_deviation = max(max_deviation, abs(deviation))
+                        avg_t_loss = tier_loss_sums[t] / tier_loss_counts[t] if tier_loss_counts[t] > 0 else 0
+                        t_mem = tier_memory_costs.get(t, 0.0)
+                        _log(f"  Tier {t}: loss={avg_t_loss:.4f} samples={tier_sample_counts[t]} "
+                             f"ratio={actual_ratio:.3f} (target={balance_weights[t]:.3f}) "
+                             f"mem_cost={t_mem:.0f} epoch={self._tier_epochs[t]}")
+                    _log(f"  Balance max deviation: {max_deviation:.4f}")
+                    if grad_norm_val is not None:
+                        _log(f"  grad_norm={grad_norm_val:.4f}")
+
+                    # Per-rank memory distribution
+                    mem_str = " | ".join(
+                        f"GPU{i}: r={r.item():.1f}% a={a.item():.1f}%"
+                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered))
+                    )
+                    _log(f"  Memory Distribution: {mem_str}")
+
+                    if self.use_wandb:
+                        log_dict = {
+                            "train/loss": avg_loss,
+                            "train/learning_rate": lr,
+                            "train/step": self.global_step,
+                            "train/grad_norm": grad_norm_val if grad_norm_val is not None else 0,
+                            "train/effective_batch_size": accum_samples,
+                            "train/target_effective_batch": target_effective_batch,
+                            "train/total_accum_steps": total_accum_steps,
+                            "train/gpu_mem_alloc_gb": gpu_mem_alloc,
+                            "train/gpu_mem_reserved_gb": gpu_mem_reserved,
+                            "train/balance_max_deviation": max_deviation,
+                        }
+                        for k, v in loss_dict.items():
+                            if k != "loss" and isinstance(v, (int, float)):
+                                log_dict[f"train/{k}"] = v
+                        for t in range(num_tiers):
+                            actual_ratio = tier_sample_counts[t] / accum_samples if accum_samples > 0 else 0
+                            avg_t_loss = tier_loss_sums[t] / tier_loss_counts[t] if tier_loss_counts[t] > 0 else 0
+                            log_dict[f"tier/{t}/loss"] = avg_t_loss
+                            log_dict[f"tier/{t}/samples"] = tier_sample_counts[t]
+                            log_dict[f"tier/{t}/actual_ratio"] = actual_ratio
+                            log_dict[f"tier/{t}/target_ratio"] = balance_weights[t]
+                            log_dict[f"tier/{t}/ratio_deviation"] = actual_ratio - balance_weights[t]
+                            log_dict[f"tier/{t}/epoch"] = self._tier_epochs[t]
+                            log_dict[f"tier/{t}/batch_size"] = tier_batch_sizes[t]
+                            log_dict[f"tier/{t}/accum_steps"] = tier_accum_steps[str(t)]
+                            if t in tier_memory_costs:
+                                log_dict[f"tier/{t}/avg_memory_cost"] = tier_memory_costs[t]
+                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
+                            log_dict[f"train/gpu{i}_reserved_pct"] = r.item()
+                            log_dict[f"train/gpu{i}_alloc_pct"] = a.item()
+                        for k, v in interconnect_metrics.items():
+                            log_dict[f"interconnect/{k}"] = v
+                        wandb.log(log_dict)
+
+            if self.global_step % self.save_every_n_steps == 0:
+                self.save_checkpoint(ckpt_dir, self.global_step)
+
+        self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
+        _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
+
+        if self.interconnect_monitor:
+            self.interconnect_monitor.close()
+
+        if self.use_wandb:
+            wandb.finish()
+
+    def _get_next_tier_batch(self, tier_idx: int):
+        """Get next batch from tier DataLoader, with auto-restart and epoch tracking."""
+        try:
+            return next(self._tier_iters[tier_idx])
+        except StopIteration:
+            self._tier_epochs[tier_idx] += 1
+            self._tier_iters[tier_idx] = iter(self._tier_loaders[tier_idx])
+            _log(f"Tier {tier_idx} DataLoader restarted (epoch {self._tier_epochs[tier_idx]})")
+            return next(self._tier_iters[tier_idx])
+
     def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
         """保存 checkpoint"""
         if self.strategy == "fsdp":
@@ -1032,6 +1462,21 @@ def main():
     parser.add_argument("--episode_chunk_size", type=int, default=8,
                         help="预训练模式：每次加载的连续 episode 数（影响 I/O 效率）")
 
+    # Tier-based batching parameters
+    parser.add_argument("--tier_config_path", type=str, default=None,
+                        help="Path to tier config JSON from Phase 1 scan (enables per-tier DataLoader + gradient accumulation)")
+    parser.add_argument("--effective_batch_size", type=int, default=2048,
+                        help="Target effective batch size per optimizer step (sum of tier samples)")
+    parser.add_argument("--balance_mode", type=str, default="frame_weighted",
+                        choices=["frame_weighted", "equal", "episode_weighted"],
+                        help="How to weight tier representation in each optimizer step")
+    parser.add_argument("--gpu_utilization_target", type=float, default=0.92,
+                        help="Target GPU memory utilization per micro-batch (e.g., 0.92 = 92%%)")
+    parser.add_argument("--gpu_memory_budget_gb", type=float, default=None,
+                        help="Override GPU memory budget per micro-batch in GB (auto-detect if None)")
+    parser.add_argument("--tier_micro_batches_override", type=str, default=None,
+                        help="Override auto-computed per-tier micro-batches, comma-separated (e.g., '8,4,2')")
+
     args = parser.parse_args()
 
     if args.dataset_repo_id is None and args.dataset_root is None:
@@ -1054,6 +1499,11 @@ def main():
             _log(f"Sub Root: {args.sub_root}")
             _log(f"Temp Process: {args.temp_process}")
             _log(f"Episode Chunk Size: {args.episode_chunk_size}")
+        if args.tier_config_path:
+            _log(f"Tier Config: {args.tier_config_path}")
+            _log(f"Effective Batch Size: {args.effective_batch_size}")
+            _log(f"Balance Mode: {args.balance_mode}")
+            _log(f"GPU Utilization Target: {args.gpu_utilization_target}")
         _log("=" * 60)
 
     # 获取数据集元数据
@@ -1101,7 +1551,156 @@ def main():
     # 创建流式数据集
     AsyncLoaderClass = PretrainAsyncDecodeDataLoader if args.pretrain else StreamingAsyncDecodeDataLoader
 
-    if args.pretrain:
+    # ── Tier-based batching path ──────────────────────────────────
+    if args.pretrain and args.tier_config_path:
+        import json
+        _log(f"Loading tier config from {args.tier_config_path}...")
+        with open(args.tier_config_path) as f:
+            tier_config = json.load(f)
+
+        tier_stats = tier_config["tier_stats"]
+        num_tiers = len(tier_stats)
+
+        # Auto-compute tier schedule from tier_stats
+        calibration_path = tier_config.get("params", {}).get("calibration_path")
+        schedule = compute_tier_schedule(
+            tier_stats=tier_stats,
+            effective_batch_size=args.effective_batch_size,
+            balance_mode=args.balance_mode,
+            gpu_memory_budget_gb=args.gpu_memory_budget_gb,
+            tier_micro_batches_override=args.tier_micro_batches_override,
+            gpu_utilization_target=args.gpu_utilization_target,
+            calibration_path=calibration_path,
+        )
+
+        tier_micro_batches = schedule["tier_micro_batches"]
+        tier_accum_steps = schedule["tier_accum_steps"]
+        accum_order = schedule["accum_order"]
+        balance_weights = schedule["balance_weights"]
+        actual_effective_batch = schedule["actual_effective_batch"]
+
+        _log(f"Auto-computed tier schedule:")
+        for t in range(num_tiers):
+            _log(f"  Tier {t}: micro_batch={tier_micro_batches[t]}, "
+                 f"accum_steps={tier_accum_steps[str(t)]}, "
+                 f"weight={balance_weights[t]:.3f}, "
+                 f"samples/step={tier_micro_batches[t] * tier_accum_steps[str(t)]}")
+        _log(f"  Total effective batch: {actual_effective_batch}")
+        _log(f"  Balance mode: {args.balance_mode}")
+
+        # Create per-tier datasets + DataLoaders
+        tier_datasets = []
+        tier_loaders = []
+
+        for tier_idx in range(num_tiers):
+            _log(f"Creating dataset + loader for tier {tier_idx} "
+                 f"(micro_batch={tier_micro_batches[tier_idx]})...")
+            tier_ds = create_lola_pretrain_streaming_dataset(
+                repo_id=args.dataset_repo_id,
+                config=config,
+                root=args.dataset_root,
+                sub_root=args.sub_root,
+                episodes=args.episodes,
+                max_history_length=args.max_history_length,
+                history_padding_side=args.history_padding_side,
+                buffer_size=args.buffer_size,
+                seed=args.streaming_seed,
+                shuffle=not args.no_shuffle,
+                deferred_video_decode=not args.no_deferred,
+                async_decode=args.async_decode,
+                decode_device=args.decode_device,
+                decode_num_threads=args.decode_num_threads,
+                num_dataloader_workers=args.num_workers,
+                dataset_to_episodes_path=args.dataset_to_episodes_path,
+                temp_process=args.temp_process,
+                episode_chunk_size=args.episode_chunk_size,
+                tier_config_path=args.tier_config_path,
+                yield_tier=tier_idx,
+            )
+            tier_datasets.append(tier_ds)
+
+        # Create trainer first (before DataLoaders, so we can use preprocessor for prefetch)
+        dataset_stats = {}
+        trainer = LoLATrainer(
+            config=config,
+            dataset_stats=dataset_stats,
+            dist_info=dist_info,
+            learning_rate=args.learning_rate,
+            max_steps=args.max_steps,
+            train_vlm=args.train_vlm,
+            strategy=args.strategy,
+            fsdp_sharding=args.fsdp_sharding,
+            gradient_clip_val=args.gradient_clip_val,
+            ckpt_dir=args.ckpt_dir,
+            save_every_n_steps=args.save_every_n_steps,
+            log_every_n_steps=args.log_every_n_steps,
+            disable_gradient_checkpointing=args.disable_gradient_checkpointing,
+            wandb_project=args.wandb_project,
+            wandb_name=args.wandb_name,
+            wandb_entity=args.wandb_entity,
+            wandb_id=args.wandb_id,
+            preprocess_in_loader=args.prefetch_queue_size > 0,
+        )
+
+        if args.disable_wandb:
+            trainer.use_wandb = False
+
+        trainer.setup_model()
+        trainer.setup_optimizer()
+
+        start_step = 0
+        if args.resume:
+            trainer.load_checkpoint(args.resume)
+            start_step = trainer.global_step
+
+        # Resume: set start_index for each tier dataset
+        if start_step > 0:
+            total_accum = len(accum_order)
+            for tier_idx, tier_ds in enumerate(tier_datasets):
+                tier_ds.start_index = start_step * tier_micro_batches[tier_idx] * dist_info.world_size * total_accum
+                _log(f"Tier {tier_idx} start_index = {tier_ds.start_index}")
+
+        # Create per-tier DataLoaders (after start_index is set)
+        for tier_idx in range(num_tiers):
+            tier_ds = tier_datasets[tier_idx]
+            micro_batch = tier_micro_batches[tier_idx]
+
+            raw_loader = DataLoader(
+                tier_ds,
+                batch_size=micro_batch,
+                num_workers=args.num_workers,
+                collate_fn=lambda x: x,
+                prefetch_factor=args.prefetch_factor,
+                persistent_workers=True,
+            )
+
+            loader_kwargs = {
+                "dataloader": raw_loader,
+                "dataset": tier_ds,
+                "collate_fn": AsyncLoaderClass.make_collate_fn(),
+            }
+            if args.prefetch_queue_size > 0:
+                def make_preprocess_fn(trainer_ref):
+                    def preprocess_fn(batch):
+                        special_data = trainer_ref._extract_special_fields(batch)
+                        batch = trainer_ref.preprocessor(batch, skip_device_step=True)
+                        batch = trainer_ref._restore_special_fields(batch, special_data)
+                        return batch
+                    return preprocess_fn
+                loader_kwargs["prefetch_queue_size"] = args.prefetch_queue_size
+                loader_kwargs["preprocess_fn"] = make_preprocess_fn(trainer)
+
+            tier_loader = AsyncLoaderClass(**loader_kwargs)
+            tier_loaders.append(tier_loader)
+
+        trainer.train_with_tiers(
+            tier_loaders, tier_micro_batches, tier_accum_steps,
+            accum_order, balance_weights, actual_effective_batch,
+            start_step=start_step,
+        )
+
+    # ── Original single-DataLoader path ───────────────────────────
+    elif args.pretrain:
         # dataset_to_episodes_path is optional for local testing without per-sub-dataset normalization
         _log("Creating pretrain streaming dataset...")
         train_dataset = create_lola_pretrain_streaming_dataset(

@@ -176,6 +176,112 @@ def scan_video_seek_modes(dataset_root: str, num_workers: int = 8) -> dict[str, 
     return seek_modes
 
 
+def _probe_single_video_metadata(video_path: str) -> dict:
+    """Probe a single video for seek_mode and resolution (height, width).
+
+    Opens the video once with torchcodec, extracts metadata, and probes
+    last decodable frame for seek classification. Returns dict with
+    "seek_mode", "height", "width" keys. Zero extra opens compared to
+    _classify_single_video_seek_mode — resolution is already in metadata.
+    """
+    from torchcodec.decoders import VideoDecoder
+
+    try:
+        fh = fsspec.open(video_path).__enter__()
+        dec = VideoDecoder(fh, seek_mode="approximate")
+        meta = dec.metadata
+        num_frames = meta.num_frames
+        height = meta.height
+        width = meta.width
+
+        approx_last = _probe_last_decodable(dec, num_frames)
+        delta_approx = (num_frames - 1) - approx_last if approx_last >= 0 else -1
+        fh.close()
+
+        seek_mode = "approximate"
+        if delta_approx > 0:
+            fh = fsspec.open(video_path).__enter__()
+            dec = VideoDecoder(fh, seek_mode="exact")
+            exact_last = _probe_last_decodable(dec, num_frames)
+            delta_exact = (num_frames - 1) - exact_last if exact_last >= 0 else -1
+            fh.close()
+
+            if delta_exact == 0:
+                seek_mode = "exact"
+
+        return {"seek_mode": seek_mode, "height": height, "width": width}
+
+    except Exception as e:
+        logging.warning(f"Failed to probe metadata for {video_path}: {e}")
+        return {"seek_mode": "exact", "height": 0, "width": 0}
+
+
+def scan_video_metadata(dataset_root: str, num_workers: int = 8) -> dict[str, dict]:
+    """Scan all videos and return {rel_path: {"seek_mode", "height", "width"}}.
+
+    Extends scan_video_seek_modes by also extracting resolution from each
+    video's metadata. Opens each video only once (same as seek-mode scan),
+    adding zero extra I/O cost.
+
+    Args:
+        dataset_root: Dataset root directory (contains videos/ subdir).
+        num_workers: Number of parallel workers for probing.
+
+    Returns:
+        Dict mapping relative video path (relative to videos/) to
+        {"seek_mode": str, "height": int, "width": int}.
+    """
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    videos_dir = os.path.join(dataset_root, "videos")
+    if not os.path.isdir(videos_dir):
+        logging.warning(f"No videos/ directory found at {dataset_root}, skipping video metadata scan")
+        return {}
+
+    video_files = []
+    for root, dirs, files in os.walk(videos_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for f in files:
+            if f.endswith(".mp4") and not f.startswith("."):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, videos_dir)
+                video_files.append((full_path, rel_path))
+
+    video_files.sort(key=lambda x: x[1])
+
+    if not video_files:
+        return {}
+
+    total = len(video_files)
+    video_meta = {}
+    exact_count = 0
+    start_time = time.time()
+
+    logging.info(f"Scanning {total} videos for metadata (seek-mode + resolution) with {num_workers} workers...")
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(_probe_single_video_metadata, full_path): rel_path
+            for full_path, rel_path in video_files
+        }
+        for future in as_completed(futures):
+            rel_path = futures[future]
+            result = future.result()
+            video_meta[rel_path] = result
+            if result["seek_mode"] == "exact":
+                exact_count += 1
+
+    elapsed = time.time() - start_time
+    logging.info(
+        f"Video metadata scan complete: {total} videos, {exact_count} need exact mode, "
+        f"{total - exact_count} use approximate. Time: {elapsed:.1f}s"
+    )
+
+    return video_meta
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
