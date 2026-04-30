@@ -1134,7 +1134,15 @@ class LoLATrainer:
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             _log(f"Checkpoint directory: {ckpt_dir}")
-
+        
+        # Compute gradient sync interval for distributed training.
+        # Without no_sync(), every backward() triggers all_reduce/reduce_scatter,
+        # causing inter-GPU stalls. We sync every N micro-steps to balance
+        # throughput (fewer syncs) vs memory (sync releases gradient buffers).
+        # Default: sync every 5 steps, dynamically adjusted after step 1.
+        sync_interval = total_accum_steps if not self.is_distributed else min(5, total_accum_steps)
+        self._sync_interval = sync_interval
+        
         if self.use_wandb:
             wandb_run_name = self.wandb_name or f"lola-tier-stream-{self.strategy}-{time_str}"
             wandb.init(
@@ -1165,13 +1173,6 @@ class LoLATrainer:
              f"(accum={total_accum_steps} micro-steps, "
              f"effective_batch={target_effective_batch})")
 
-        # Compute gradient sync interval for distributed training.
-        # Without no_sync(), every backward() triggers all_reduce/reduce_scatter,
-        # causing inter-GPU stalls. We sync every N micro-steps to balance
-        # throughput (fewer syncs) vs memory (sync releases gradient buffers).
-        # Default: sync every 5 steps, dynamically adjusted after step 1.
-        sync_interval = total_accum_steps if not self.is_distributed else min(5, total_accum_steps)
-        self._sync_interval = sync_interval
         _log(f"Gradient sync interval: every {sync_interval} micro-steps "
              f"(total_accum={total_accum_steps}, distributed={self.is_distributed})")
 
