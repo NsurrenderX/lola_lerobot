@@ -2042,7 +2042,16 @@ class AsyncDecodeDataLoader:
     def _prefetch_iter(self):
         """Background-thread prefetch: producer reads from DataLoader,
         applies collate_fn and optionally preprocess_fn, then buffers
-        batches in queue.Queue."""
+        batches in queue.Queue.
+
+        IMPORTANT: The DataLoader iterator is created on the *main* thread
+        before the producer thread starts.  This is critical because
+        ``iter(loader)`` with ``persistent_workers=True`` forks worker
+        processes, and forking inside a background thread of a
+        multi-threaded process is unsafe — only the calling thread
+        survives the fork, leaving locks held by other threads permanently
+        locked in the child, which causes deadlocks.
+        """
         import queue as queue_mod
         import threading
 
@@ -2052,38 +2061,32 @@ class AsyncDecodeDataLoader:
 
         decode_on_yield = self._dataset.deferred_video_decode and not self._dataset.async_decode
 
+        # Create the DataLoader iterator on the main thread *before* starting
+        # the producer thread.  This ensures that fork() happens while only
+        # the main thread is alive, avoiding the multi-threaded fork deadlock.
+        if self._dataset.async_decode and self._dataset.deferred_video_decode:
+            loader_iter = self._dataset.decode_iter(self._loader)
+        else:
+            loader_iter = iter(self._loader)
+
         def producer():
             try:
-                if self._dataset.async_decode and self._dataset.deferred_video_decode:
-                    for decoded_items in self._dataset.decode_iter(self._loader):
-                        if shutdown_event.is_set():
-                            break
-                        batch = self._collate_fn(decoded_items) if self._collate_fn else decoded_items
-                        if self._preprocess_fn:
-                            batch = self._preprocess_fn(batch)
-                        # Retry put until success or shutdown (don't discard preprocessed batches)
-                        while not shutdown_event.is_set():
-                            try:
-                                data_queue.put(batch, block=True, timeout=0.5)
-                                break
-                            except queue_mod.Full:
-                                continue
-                else:
-                    for batch in self._loader:
-                        if shutdown_event.is_set():
-                            break
+                for batch in loader_iter:
+                    if shutdown_event.is_set():
+                        break
+                    if not (self._dataset.async_decode and self._dataset.deferred_video_decode):
                         if self._dataset.deferred_video_decode and not decode_on_yield:
                             batch = self._dataset.decode_items_batch(batch)
-                        batch = self._collate_fn(batch) if self._collate_fn else batch
-                        if self._preprocess_fn:
-                            batch = self._preprocess_fn(batch)
-                        # Retry put until success or shutdown
-                        while not shutdown_event.is_set():
-                            try:
-                                data_queue.put(batch, block=True, timeout=0.5)
-                                break
-                            except queue_mod.Full:
-                                continue
+                    batch = self._collate_fn(batch) if self._collate_fn else batch
+                    if self._preprocess_fn:
+                        batch = self._preprocess_fn(batch)
+                    # Retry put until success or shutdown (don't discard preprocessed batches)
+                    while not shutdown_event.is_set():
+                        try:
+                            data_queue.put(batch, block=True, timeout=0.5)
+                            break
+                        except queue_mod.Full:
+                            continue
             except Exception as e:
                 error_holder[0] = e
             finally:
