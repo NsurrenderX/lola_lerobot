@@ -91,6 +91,8 @@ LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
 GRADIENT_CLIP_VAL=1.0
 DISABLE_GRADIENT_CHECKPOINTING=false  # Disable checkpointing to save bwd recomputation overhead (increases memory)
+COMPILE_MODEL=false  # Enable torch.compile for DiT (kernel fusion, reduces kernel launch overhead)
+COMPILE_MODE="reduce-overhead"  # torch.compile mode: "reduce-overhead" (CUDA graphs), "default", "max-autotune"
 
 # 数据集参数
 DATASET_REPO_ID=""
@@ -216,6 +218,14 @@ while [[ $# -gt 0 ]]; do
         --disable_gradient_checkpointing)
             DISABLE_GRADIENT_CHECKPOINTING=true
             shift
+            ;;
+        --compile_model)
+            COMPILE_MODEL=true
+            shift
+            ;;
+        --compile_mode)
+            COMPILE_MODE="$2"
+            shift 2
             ;;
 
         # 数据集参数
@@ -433,6 +443,7 @@ echo "  - Buffer size: ${BUFFER_SIZE}"
 echo "  - Prefetch factor: ${PREFETCH_FACTOR}"
 echo "  - Prefetch queue: ${PREFETCH_QUEUE_SIZE}"
 echo "  - Disable gradient checkpointing: ${DISABLE_GRADIENT_CHECKPOINTING}"
+echo "  - Compile model (torch.compile): ${COMPILE_MODEL} (mode: ${COMPILE_MODE})"
 if [ -n "$TIER_CONFIG_PATH" ]; then
     echo "  - Tier config: ${TIER_CONFIG_PATH}"
     echo "  - Effective batch size: ${EFFECTIVE_BATCH_SIZE}"
@@ -535,6 +546,10 @@ fi
 # 解码参数
 if [ "$DISABLE_GRADIENT_CHECKPOINTING" = true ]; then
     cmd="${cmd} --disable_gradient_checkpointing"
+fi
+if [ "$COMPILE_MODEL" = true ]; then
+    cmd="${cmd} --compile_model"
+    cmd="${cmd} --compile_mode ${COMPILE_MODE}"
 fi
 if [ "$NO_DEFERRED" = true ]; then
     cmd="${cmd} --no_deferred"

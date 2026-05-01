@@ -720,6 +720,18 @@ class LoLATrainer:
         total_params = sum(p.numel() for p in self.policy.parameters())
         _log(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
+        # Enable TF32 for matmul and cuDNN on Ampere+ GPUs (B200/H100/A100)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        _log("TF32 matmul/cudnn: enabled")
+
+        # torch.compile DiT before FSDP wrapping for kernel fusion
+        if self.config.compile_model:
+            compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
+            _log(f"Compiling DiT with torch.compile(mode={compile_mode})...")
+            self.policy.model.dit = torch.compile(self.policy.model.dit, mode=compile_mode)
+            _log("DiT compilation complete (first forward will trigger JIT compilation)")
+
         if self.is_distributed:
             cap = torch.cuda.get_device_capability(self.device)
             torch_cuda_ver = torch.version.cuda
@@ -764,7 +776,7 @@ class LoLATrainer:
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         )
 
@@ -1643,6 +1655,10 @@ def main():
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--disable_gradient_checkpointing", action="store_true",
                         help="Disable gradient checkpointing on VLM and DiT (saves recomputation overhead, increases memory)")
+    parser.add_argument("--compile_model", action="store_true",
+                        help="Enable torch.compile for DiT module (kernel fusion, reduces kernel launch overhead)")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        help="torch.compile mode: reduce-overhead (CUDA graphs), default, max-autotune")
 
     # 模型参数
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/")
@@ -1786,6 +1802,8 @@ def main():
         history_padding_side=args.history_padding_side,
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
     )
 
     # 预训练模式：归一化由 dataset 内部完成，processor 使用 IDENTITY
