@@ -672,25 +672,40 @@ class LoLAPolicy(PreTrainedPolicy):
         # 初始化动作队列
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
 
-        # VLM forward mode: always "hook" for FSDP compatibility.
-        # Split mode manually iterates decoder layers (lang_model.layers[idx]),
-        # bypassing FSDP's _pre_forward_unshard. This leaves parameters in
-        # sharded (size-0) form during Dynamo's fake tensor tracing, causing
-        # broadcast errors. Hook mode runs VLM through the normal forward path
-        # where FSDP unshard operates correctly. FSDP unit boundaries naturally
-        # produce graph breaks regardless, so split mode's "avoid graph breaks"
-        # advantage does not apply under FSDP.
-        self._vlm_forward_mode = "hook"
+        # VLM forward mode selection:
+        # - "hook": uses forward hooks to capture only 3 needed layers (memory-efficient,
+        #   ~30MB). Works with FSDP but NOT with torch.compile (hooks are Python-level
+        #   side effects that Dynamo cannot propagate across graph breaks).
+        # - "output_hidden_states": uses output_hidden_states=True to get all 33 layers
+        #   from VLM output, then selects 3 (~330MB peak). Compatible with both FSDP
+        #   and torch.compile because hidden_states are tensor-level model returns.
+        # - "split": manually iterates decoder layers, NOT compatible with FSDP
+        #   (bypasses _pre_forward_unshard, causing size-0 parameter errors).
+        if config.compile_model:
+            import warnings
+            warnings.warn(
+                "torch.compile + FSDP is incompatible with hook-based hidden state capture "
+                "(hooks are Python side effects that Dynamo cannot propagate). "
+                "Switching VLM forward mode from 'hook' to 'output_hidden_states'. "
+                "This materializes all 33 VLM layers (~330MB peak) instead of 3 (~30MB), "
+                "but the impact is negligible relative to B200's 171GB reserved memory.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._vlm_forward_mode = "output_hidden_states"
+        else:
+            self._vlm_forward_mode = "hook"
 
+        # Hook infrastructure: only actively used for hook mode
         if self._vlm_forward_mode == "hook":
             self._captured_hidden_states: Dict[int, torch.Tensor] = {}
             self._hook_handles: List = []
             self._in_vlm_forward: bool = False
             self._register_vlm_hooks()
         else:
-            self._captured_hidden_states = {}
-            self._hook_handles = []
-            self._in_vlm_forward = False
+            self._captured_hidden_states: Dict[int, torch.Tensor] = {}
+            self._hook_handles: List = []
+            self._in_vlm_forward: bool = False
 
     def _register_vlm_hooks(self):
         """在 VLM 的指定 decoder 层上注册 forward hook，仅捕获所需的 hidden states。
@@ -873,16 +888,41 @@ class LoLAPolicy(PreTrainedPolicy):
         else:
             # 端到端调用 Qwen3.5 模型
             if self._vlm_forward_mode == "split":
-                # Split forward: run VLM in segments at extract layers.
-                # This avoids hooks entirely, making the full graph visible to torch.compile.
+                # Split forward: not compatible with FSDP (bypasses _pre_forward_unshard)
                 hidden_states_all_layers = self._vlm_split_forward(
                     input_ids=input_ids,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                     attention_mask=attention_mask,
                 )
+            elif self._vlm_forward_mode == "output_hidden_states":
+                # output_hidden_states mode: compatible with torch.compile + FSDP.
+                # Uses VLM's native output_hidden_states=True to get all 33 layers as
+                # tensor-level model output, then selects only the 3 needed layers.
+                # Dynamo can properly track tensor returns (not Python side effects).
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "output_hidden_states": True,
+                    "return_dict": True,
+                }
+                if pixel_values is not None:
+                    forward_kwargs["pixel_values"] = pixel_values
+                if image_grid_thw is not None:
+                    forward_kwargs["image_grid_thw"] = image_grid_thw
+                if attention_mask is not None:
+                    forward_kwargs["attention_mask"] = attention_mask
+
+                if not self.config.train_vlm:
+                    with torch.no_grad():
+                        vlm_output = self.vlm(**forward_kwargs)
+                else:
+                    vlm_output = self.vlm(**forward_kwargs)
+                hidden_states_all_layers = {
+                    i: vlm_output.hidden_states[i] for i in self.config.vlm_extract_layers
+                }
             else:
-                # Hook mode: original approach, use forward hooks to capture intermediate layers
+                # Hook mode: memory-efficient (only 3 layers), but NOT compatible with
+                # torch.compile (Python side effects). Works with FSDP alone.
                 forward_kwargs = {
                     "input_ids": input_ids,
                     "output_hidden_states": False,  # 不物化所有 33 层，改用 hook 捕获

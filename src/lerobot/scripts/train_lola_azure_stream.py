@@ -743,12 +743,16 @@ class LoLATrainer:
         # torch.compile for kernel fusion — MUST be done after FSDP wrapping.
         # Compiling individual layers before FSDP wrap changes their type to
         # OptimizedModule, which breaks FSDP's transformer_auto_wrap_policy
-        # (it uses isinstance checks). FSDP then can't recognize compiled
-        # layers as wrap units, and parameters appear sharded (size 0) during
-        # Dynamo's fake tensor tracing.
-        # Compiling the full model after FSDP wrap lets Dynamo see FSDP's
-        # all-gather/reduce-scatter ops and automatically insert graph breaks
-        # at FSDP unit boundaries (which is desired for correct comm ordering).
+        # (it uses isinstance checks). Compiling the full model after FSDP wrap
+        # lets Dynamo see FSDP's all-gather/reduce-scatter ops and automatically
+        # insert graph breaks at FSDP unit boundaries (which is desired for
+        # correct comm ordering).
+        # NOTE: When compile_model=True, LoLAPolicy automatically switches VLM forward
+        # mode from 'hook' to 'output_hidden_states' (with a warning). Hook mode's
+        # forward hooks are Python-level side effects that Dynamo cannot propagate
+        # across graph breaks. output_hidden_states=True returns tensor-level values
+        # that Dynamo handles correctly. Memory cost: ~330MB peak (33 layers) vs
+        # ~30MB (3 layers with hooks), negligible relative to B200's 171GB reserved.
         if self.config.compile_model:
             compile_mode = getattr(self.config, 'compile_mode', 'max-autotune-no-cudagraphs')
             _log(f"Compiling model with torch.compile(mode={compile_mode})...")
