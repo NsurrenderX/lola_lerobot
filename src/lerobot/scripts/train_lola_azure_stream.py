@@ -725,12 +725,31 @@ class LoLATrainer:
         torch.backends.cudnn.allow_tf32 = True
         _log("TF32 matmul/cudnn: enabled")
 
-        # torch.compile DiT before FSDP wrapping for kernel fusion
+        # Silence CUDA Graphs dynamic shape warning for tier-based batching
+        # (9 distinct sizes from 3 tiers is expected and harmless)
+        # torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+
+        # torch.compile for kernel fusion (must be done before FSDP wrapping)
         if self.config.compile_model:
             compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
             _log(f"Compiling DiT with torch.compile(mode={compile_mode})...")
             self.policy.model.dit = torch.compile(self.policy.model.dit, mode=compile_mode)
-            _log("DiT compilation complete (first forward will trigger JIT compilation)")
+            _log("DiT compilation scheduled (first forward will trigger JIT compilation)")
+
+            # Compile VLM language model layers (split mode avoids hooks, making
+            # the full VLM graph compile-friendly)
+            _log(f"Compiling VLM decoder layers with torch.compile(mode={compile_mode})...")
+            lang_layers = self.policy.vlm.model.language_model.layers
+            for i in range(len(lang_layers)):
+                lang_layers[i] = torch.compile(lang_layers[i], mode=compile_mode)
+            _log("VLM decoder layers compilation scheduled")
+
+            # Compile VLM vision encoder blocks (~287M params, 27 layers)
+            _log(f"Compiling VLM vision blocks with torch.compile(mode={compile_mode})...")
+            vision_blocks = self.policy.vlm.model.vision_model.blocks
+            for i in range(len(vision_blocks)):
+                vision_blocks[i] = torch.compile(vision_blocks[i], mode=compile_mode)
+            _log("VLM vision blocks compilation scheduled")
 
         if self.is_distributed:
             cap = torch.cuda.get_device_capability(self.device)

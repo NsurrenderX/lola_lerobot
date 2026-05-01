@@ -672,11 +672,21 @@ class LoLAPolicy(PreTrainedPolicy):
         # 初始化动作队列
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
 
-        # VLM forward hooks: 仅捕获需要的层 (8, 16, 24)，替代 output_hidden_states=True
-        self._captured_hidden_states: Dict[int, torch.Tensor] = {}
-        self._hook_handles: List = []
-        self._in_vlm_forward: bool = False
-        self._register_vlm_hooks()
+        # VLM forward mode:
+        # - "hook": use forward hooks to capture intermediate layers (original approach)
+        # - "split": split VLM forward into segments at extract layers (compile-friendly,
+        #   no hooks, torch.compile sees the full graph)
+        self._vlm_forward_mode = "split" if config.compile_model else "hook"
+
+        if self._vlm_forward_mode == "hook":
+            self._captured_hidden_states: Dict[int, torch.Tensor] = {}
+            self._hook_handles: List = []
+            self._in_vlm_forward: bool = False
+            self._register_vlm_hooks()
+        else:
+            self._captured_hidden_states = {}
+            self._hook_handles = []
+            self._in_vlm_forward = False
 
     def _register_vlm_hooks(self):
         """在 VLM 的指定 decoder 层上注册 forward hook，仅捕获所需的 hidden states。
@@ -857,36 +867,153 @@ class LoLAPolicy(PreTrainedPolicy):
                 # Legacy tuple format: 仅提取所需层，转为 dict
                 hidden_states_all_layers = {i: raw[i] for i in self.config.vlm_extract_layers}
         else:
-            # 端到端调用 Qwen3.5 模型，仅通过 hook 捕获所需层
-            forward_kwargs = {
-                "input_ids": input_ids,
-                "output_hidden_states": False,  # 不物化所有 33 层，改用 hook 捕获
-                "return_dict": True,
-            }
+            # 端到端调用 Qwen3.5 模型
+            if self._vlm_forward_mode == "split":
+                # Split forward: run VLM in segments at extract layers.
+                # This avoids hooks entirely, making the full graph visible to torch.compile.
+                hidden_states_all_layers = self._vlm_split_forward(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask,
+                )
+            else:
+                # Hook mode: original approach, use forward hooks to capture intermediate layers
+                forward_kwargs = {
+                    "input_ids": input_ids,
+                    "output_hidden_states": False,  # 不物化所有 33 层，改用 hook 捕获
+                    "return_dict": True,
+                }
 
-            # 添加视觉输入（如果有）
-            if pixel_values is not None:
-                forward_kwargs["pixel_values"] = pixel_values
-            if image_grid_thw is not None:
-                forward_kwargs["image_grid_thw"] = image_grid_thw
-            if attention_mask is not None:
-                forward_kwargs["attention_mask"] = attention_mask
+                # 添加视觉输入（如果有）
+                if pixel_values is not None:
+                    forward_kwargs["pixel_values"] = pixel_values
+                if image_grid_thw is not None:
+                    forward_kwargs["image_grid_thw"] = image_grid_thw
+                if attention_mask is not None:
+                    forward_kwargs["attention_mask"] = attention_mask
 
-            # 激活 hook 捕获
-            self._captured_hidden_states = {}
-            self._in_vlm_forward = True
-            try:
-                if not self.config.train_vlm:
-                    with torch.no_grad():
+                # 激活 hook 捕获
+                self._captured_hidden_states = {}
+                self._in_vlm_forward = True
+                try:
+                    if not self.config.train_vlm:
+                        with torch.no_grad():
+                            self.vlm(**forward_kwargs)
+                    else:
                         self.vlm(**forward_kwargs)
-                else:
-                    self.vlm(**forward_kwargs)
-            finally:
-                self._in_vlm_forward = False
+                finally:
+                    self._in_vlm_forward = False
 
-            hidden_states_all_layers = self._captured_hidden_states
+                hidden_states_all_layers = self._captured_hidden_states
 
         return hidden_states_all_layers, input_ids
+
+    def _vlm_split_forward(self, input_ids, pixel_values=None, image_grid_thw=None, attention_mask=None):
+        """Split VLM forward into segments at extract layers, avoiding hooks.
+
+        Instead of registering forward hooks on decoder layers (which causes graph breaks
+        in torch.compile), we manually run the VLM in segments:
+        1. Vision encoder + embedding → inputs_embeds (same as Qwen3_5Model.forward)
+        2. Layers [0, extract[0]) → capture hidden at extract[0]
+        3. Layers [extract[0], extract[1]) → capture hidden at extract[1]
+        ...
+        N. Layers [extract[-1], num_layers) + final norm
+
+        This makes the entire VLM forward visible to torch.compile as a single graph.
+        """
+        vlm_model = self.vlm.model  # Qwen3_5Model
+        lang_model = vlm_model.language_model  # Qwen3_5TextModel
+
+        # Step 1: Embed inputs (same as Qwen3_5Model.forward)
+        inputs_embeds = vlm_model.get_input_embeddings()(input_ids)
+
+        # Inject visual embeddings
+        if pixel_values is not None:
+            image_outputs = vlm_model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = vlm_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        # Step 2: Compute position_ids using Qwen3_5Model's method (handles 3D mrope for vision)
+        position_ids = vlm_model.compute_3d_position_ids(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+        )
+
+        # Step 3: Compute position embeddings and causal mask (same as Qwen3_5TextModel.forward)
+        batch_size, seq_len = inputs_embeds.shape[:2]
+        cache_position = torch.arange(0, seq_len, device=inputs_embeds.device)
+
+        # Handle position_ids dimensions
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+        position_embeddings = lang_model.rotary_emb(inputs_embeds, position_ids)
+
+        # text_position_ids for causal mask
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+        else:
+            text_position_ids = position_ids[0]
+
+        from transformers.masking_utils import create_causal_mask
+        causal_mask = create_causal_mask(
+            config=lang_model.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=None,
+            position_ids=text_position_ids,
+        )
+
+        # Qwen3.5 uses alternating linear_attention / full_attention layers.
+        # Linear attention (DeltaNet) layers need a separate mask.
+        linear_attn_mask = attention_mask
+        if cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1)):
+            linear_attn_mask = None
+
+        # Step 4: Run decoder layers in segments, capturing at extract points
+        hidden_states = inputs_embeds
+        extract_layers = sorted(self.config.vlm_extract_layers)
+        num_layers = len(lang_model.layers)
+        # Segment boundaries: [0, extract[0], extract[1], ..., extract[-1], num_layers]
+        boundaries = [0] + [e for e in extract_layers] + [num_layers]
+
+        captured = {}
+        for seg_idx in range(len(boundaries) - 1):
+            start = boundaries[seg_idx]
+            end = boundaries[seg_idx + 1]
+
+            for layer_idx in range(start, end):
+                layer = lang_model.layers[layer_idx]
+                layer_mask = linear_attn_mask if layer.layer_type == "linear_attention" else causal_mask
+                hidden_states = layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=layer_mask,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    use_cache=False,
+                    cache_position=cache_position,
+                )
+
+            # After running layers [start, end), the output is from layer end-1
+            # which corresponds to hidden_states[end] (0-indexed: embedding=0, layer0=1, ...)
+            if end in extract_layers:
+                captured[end] = hidden_states
+
+        # Step 5: Final norm (needed for completeness, though we don't use the output)
+        hidden_states = lang_model.norm(hidden_states)
+
+        return captured
 
     # =========================================================
     # 训练和推理接口
