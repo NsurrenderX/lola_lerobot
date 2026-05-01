@@ -1054,18 +1054,18 @@ class LoLATrainer:
                             "train/loss": loss.item(),
                             "train/learning_rate": lr,
                             "train/step": self.global_step,
-                            "train/update_s": update_s,
                             "train/batch_per_s": batch_per_s,
-                            "train/data_yield_s": data_yield_s,
-                            "train/fwd_s": fwd_s,
-                            "train/fwd_device_s": device_s,
-                            "train/fwd_preprocess_s": preprocess_s,
-                            "train/fwd_model_fwd_s": model_fwd_s,
-                            "train/bwd_s": bwd_s,
-                            "train/clip_s": clip_s,
-                            "train/opt_s": opt_s,
-                            "train/gpu_mem_alloc_gb": gpu_mem_alloc,
-                            "train/gpu_mem_reserved_gb": gpu_mem_reserved,
+                            "timing/step_s": update_s,
+                            "timing/data_yield_s": data_yield_s,
+                            "timing/fwd_s": fwd_s,
+                            "timing/fwd_device_s": device_s,
+                            "timing/fwd_preprocess_s": preprocess_s,
+                            "timing/fwd_model_fwd_s": model_fwd_s,
+                            "timing/bwd_s": bwd_s,
+                            "timing/clip_s": clip_s,
+                            "timing/opt_s": opt_s,
+                            "memory/gpu_alloc_gb": gpu_mem_alloc,
+                            "memory/gpu_reserved_gb": gpu_mem_reserved,
                         }
                         if grad_norm_val is not None:
                             log_dict["train/grad_norm"] = grad_norm_val
@@ -1075,8 +1075,8 @@ class LoLATrainer:
                         for k, v in interconnect_metrics.items():
                             log_dict[f"interconnect/{k}"] = v
                         for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
-                            log_dict[f"train/gpu{i}_reserved_pct"] = r.item()
-                            log_dict[f"train/gpu{i}_alloc_pct"] = a.item()
+                            log_dict[f"memory/gpu{i}_reserved_pct"] = r.item()
+                            log_dict[f"memory/gpu{i}_alloc_pct"] = a.item()
                         wandb.log(log_dict)
 
             if self.global_step % self.save_every_n_steps == 0:
@@ -1195,6 +1195,7 @@ class LoLATrainer:
              f"(total_accum={total_accum_steps}, distributed={self.is_distributed})")
 
         data_yield_start = time.monotonic()
+        step_start = time.monotonic()
         while self.global_step < self.max_steps:
             # ── Gradient accumulation cycle ────────────────────────
             self.optimizer.zero_grad()
@@ -1208,6 +1209,10 @@ class LoLATrainer:
             accum_data_yield_s = 0.0
             accum_fwd_s = 0.0
             accum_bwd_s = 0.0
+            # Per-tier timing accumulators
+            tier_data_yield_s = {t: 0.0 for t in range(num_tiers)}
+            tier_fwd_s = {t: 0.0 for t in range(num_tiers)}
+            tier_bwd_s = {t: 0.0 for t in range(num_tiers)}
 
             for micro_idx, (tier_idx, micro_batch) in enumerate(accum_order):
                 # Get next batch from tier DataLoader (auto-restart on StopIteration)
@@ -1215,6 +1220,7 @@ class LoLATrainer:
 
                 data_yield_s = time.monotonic() - data_yield_start
                 accum_data_yield_s += data_yield_s
+                tier_data_yield_s[tier_idx] += data_yield_s
 
                 # Forward + backward (scaled by 1/total_accum for proper gradient averaging)
                 # Periodic gradient sync: sync every sync_interval steps to release
@@ -1228,12 +1234,14 @@ class LoLATrainer:
                     loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
                     fwd_s = time.monotonic() - fwd_start
                     accum_fwd_s += fwd_s
+                    tier_fwd_s[tier_idx] += fwd_s
 
                     bwd_start = time.monotonic()
                     scaled_loss = loss / total_accum_steps
                     scaled_loss.backward()
                     bwd_s = time.monotonic() - bwd_start
                     accum_bwd_s += bwd_s
+                    tier_bwd_s[tier_idx] += bwd_s
 
                 accum_loss += loss.item()
                 accum_samples += micro_batch
@@ -1356,6 +1364,7 @@ class LoLATrainer:
                         self._sync_interval = new_sync_interval
 
             # ── Logging ─────────────────────────────────────────────
+            total_step_s = time.monotonic() - step_start
             if self.global_step % self.log_every_n_steps == 0:
                 lr = self.scheduler.get_last_lr()[0]
                 gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
@@ -1380,11 +1389,19 @@ class LoLATrainer:
                 if self.is_main_process:
                     grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
                     avg_loss = accum_loss / total_accum_steps
+                    samples_per_s = accum_samples / total_step_s if total_step_s > 0 else 0
 
+                    # ── Console output ──────────────────────────────
                     _log(
                         f"[Step {self.global_step}/{self.max_steps}] "
-                        f"Loss={avg_loss:.4f} EffectiveBatch={accum_samples} "
-                        f"LR={lr:.2e}"
+                        f"Loss={avg_loss:.4f} LR={lr:.2e} "
+                        f"grad_norm={grad_norm_val:.4f if grad_norm_val is not None else 'N/A'} "
+                        f"samples/s={samples_per_s:.1f}"
+                    )
+                    _log(
+                        f"  Timing: total={total_step_s:.1f}s "
+                        f"data={accum_data_yield_s:.1f}s fwd={accum_fwd_s:.1f}s "
+                        f"bwd={accum_bwd_s:.1f}s clip={clip_s:.2f}s opt={opt_s:.2f}s"
                     )
                     max_deviation = 0.0
                     for t in range(num_tiers):
@@ -1393,38 +1410,56 @@ class LoLATrainer:
                         max_deviation = max(max_deviation, abs(deviation))
                         avg_t_loss = tier_loss_sums[t] / tier_loss_counts[t] if tier_loss_counts[t] > 0 else 0
                         t_mem = tier_memory_costs.get(t, 0.0)
-                        _log(f"  Tier {t}: loss={avg_t_loss:.4f} samples={tier_sample_counts[t]} "
-                             f"ratio={actual_ratio:.3f} (target={balance_weights[t]:.3f}) "
-                             f"mem_cost={t_mem:.0f} epoch={self._tier_epochs[t]}")
+                        t_count = tier_loss_counts[t]
+                        _log(
+                            f"  Tier {t}: loss={avg_t_loss:.4f} samples={tier_sample_counts[t]} "
+                            f"ratio={actual_ratio:.3f} (target={balance_weights[t]:.3f}) "
+                            f"data={tier_data_yield_s[t]:.1f}s fwd={tier_fwd_s[t]:.1f}s "
+                            f"bwd={tier_bwd_s[t]:.1f}s ({t_count} micro-steps) "
+                            f"epoch={self._tier_epochs[t]}"
+                        )
                     _log(f"  Balance max deviation: {max_deviation:.4f}")
-                    if grad_norm_val is not None:
-                        _log(f"  grad_norm={grad_norm_val:.4f}")
 
                     # Per-rank memory distribution
                     mem_str = " | ".join(
                         f"GPU{i}: r={r.item():.1f}% a={a.item():.1f}%"
                         for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered))
                     )
-                    _log(f"  Memory Distribution: {mem_str}")
+                    _log(f"  Memory: alloc={gpu_mem_alloc:.1f}GB reserved={gpu_mem_reserved:.1f}GB | {mem_str}")
 
                     if self.use_wandb:
                         log_dict = {
+                            # Core training metrics
                             "train/loss": avg_loss,
                             "train/learning_rate": lr,
                             "train/step": self.global_step,
                             "train/grad_norm": grad_norm_val if grad_norm_val is not None else 0,
                             "train/effective_batch_size": accum_samples,
-                            "train/target_effective_batch": target_effective_batch,
-                            "train/total_accum_steps": total_accum_steps,
-                            "train/sync_interval": self._sync_interval,
-                            "train/gpu_mem_alloc_gb": gpu_mem_alloc,
-                            "train/gpu_mem_reserved_gb": gpu_mem_reserved,
-                            "train/balance_max_deviation": max_deviation,
-                            "train/data_yield_s": accum_data_yield_s / total_accum_steps,
-                            "train/fwd_s": accum_fwd_s / total_accum_steps,
-                            "train/bwd_s": accum_bwd_s / total_accum_steps,
-                            "train/update_s": clip_s + opt_s,
+                            "train/samples_per_s": samples_per_s,
+
+                            # Step-level timing (total optimizer step)
+                            "timing/step_s": total_step_s,
+                            "timing/data_yield_s": accum_data_yield_s,
+                            "timing/fwd_s": accum_fwd_s,
+                            "timing/bwd_s": accum_bwd_s,
+                            "timing/clip_s": clip_s,
+                            "timing/opt_s": opt_s,
+
+                            # Schedule info
+                            "schedule/target_effective_batch": target_effective_batch,
+                            "schedule/total_accum_steps": total_accum_steps,
+                            "schedule/sync_interval": self._sync_interval,
+                            "schedule/balance_max_deviation": max_deviation,
+
+                            # GPU memory
+                            "memory/gpu_alloc_gb": gpu_mem_alloc,
+                            "memory/gpu_reserved_gb": gpu_mem_reserved,
                         }
+                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
+                            log_dict[f"memory/gpu{i}_reserved_pct"] = r.item()
+                            log_dict[f"memory/gpu{i}_alloc_pct"] = a.item()
+                        for k, v in interconnect_metrics.items():
+                            log_dict[f"interconnect/{k}"] = v
                         for k, v in loss_dict.items():
                             if k != "loss" and isinstance(v, (int, float)):
                                 log_dict[f"train/{k}"] = v
@@ -1437,16 +1472,14 @@ class LoLATrainer:
                             log_dict[f"tier/{t}/target_ratio"] = balance_weights[t]
                             log_dict[f"tier/{t}/ratio_deviation"] = actual_ratio - balance_weights[t]
                             log_dict[f"tier/{t}/epoch"] = self._tier_epochs[t]
-                            log_dict[f"tier/{t}/batch_size"] = tier_batch_sizes[t]
-                            log_dict[f"tier/{t}/accum_steps"] = tier_accum_steps[str(t)]
+                            log_dict[f"tier/{t}/data_yield_s"] = tier_data_yield_s[t]
+                            log_dict[f"tier/{t}/fwd_s"] = tier_fwd_s[t]
+                            log_dict[f"tier/{t}/bwd_s"] = tier_bwd_s[t]
                             if t in tier_memory_costs:
                                 log_dict[f"tier/{t}/avg_memory_cost"] = tier_memory_costs[t]
-                        for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
-                            log_dict[f"train/gpu{i}_reserved_pct"] = r.item()
-                            log_dict[f"train/gpu{i}_alloc_pct"] = a.item()
-                        for k, v in interconnect_metrics.items():
-                            log_dict[f"interconnect/{k}"] = v
                         wandb.log(log_dict)
+
+            step_start = time.monotonic()
 
             if self.global_step % self.save_every_n_steps == 0:
                 self.save_checkpoint(ckpt_dir, self.global_step)
