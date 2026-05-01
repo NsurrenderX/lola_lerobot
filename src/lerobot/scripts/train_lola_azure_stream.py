@@ -729,27 +729,6 @@ class LoLATrainer:
         # (9 distinct sizes from 3 tiers is expected and harmless)
         # torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
 
-        # torch.compile for kernel fusion (must be done before FSDP wrapping)
-        if self.config.compile_model:
-            compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
-            _log(f"Compiling DiT with torch.compile(mode={compile_mode})...")
-            self.policy.model.dit = torch.compile(self.policy.model.dit, mode=compile_mode)
-            _log("DiT compilation scheduled (first forward will trigger JIT compilation)")
-
-            # Compile VLM language model layers (split mode avoids hooks, making
-            # the full VLM graph compile-friendly)
-            _log(f"Compiling VLM decoder layers with torch.compile(mode={compile_mode})...")
-            lang_layers = self.policy.vlm.model.language_model.layers
-            for i in range(len(lang_layers)):
-                lang_layers[i] = torch.compile(lang_layers[i], mode=compile_mode)
-            _log("VLM decoder layers compilation scheduled")
-
-            # Note: Vision encoder blocks are NOT compiled here because they are
-            # called via get_image_features() which is outside FSDP's wrap scope.
-            # Compiled modules inside FSDP-unwrapped submodules see sharded 1D
-            # parameters instead of 2D weights, causing "b must be 2D" errors.
-            # The vision encoder (~287M/4.5B params) is small enough to skip.
-
         if self.is_distributed:
             cap = torch.cuda.get_device_capability(self.device)
             torch_cuda_ver = torch.version.cuda
@@ -760,6 +739,21 @@ class LoLATrainer:
                 self._setup_ddp()
         else:
             self.model = self.policy
+
+        # torch.compile for kernel fusion — MUST be done after FSDP wrapping.
+        # Compiling individual layers before FSDP wrap changes their type to
+        # OptimizedModule, which breaks FSDP's transformer_auto_wrap_policy
+        # (it uses isinstance checks). FSDP then can't recognize compiled
+        # layers as wrap units, and parameters appear sharded (size 0) during
+        # Dynamo's fake tensor tracing.
+        # Compiling the full model after FSDP wrap lets Dynamo see FSDP's
+        # all-gather/reduce-scatter ops and automatically insert graph breaks
+        # at FSDP unit boundaries (which is desired for correct comm ordering).
+        if self.config.compile_model:
+            compile_mode = getattr(self.config, 'compile_mode', 'max-autotune-no-cudagraphs')
+            _log(f"Compiling model with torch.compile(mode={compile_mode})...")
+            self.model = torch.compile(self.model, mode=compile_mode)
+            _log("Model compilation scheduled (first forward will trigger JIT compilation)")
 
         self.interconnect_monitor = InterconnectMonitor(self.device)
 
@@ -1674,9 +1668,9 @@ def main():
     parser.add_argument("--disable_gradient_checkpointing", action="store_true",
                         help="Disable gradient checkpointing on VLM and DiT (saves recomputation overhead, increases memory)")
     parser.add_argument("--compile_model", action="store_true",
-                        help="Enable torch.compile for DiT module (kernel fusion, reduces kernel launch overhead)")
-    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
-                        help="torch.compile mode: reduce-overhead (CUDA graphs), default, max-autotune")
+                        help="Enable torch.compile for kernel fusion (applied after FSDP wrapping)")
+    parser.add_argument("--compile_mode", type=str, default="max-autotune-no-cudagraphs",
+                        help="torch.compile mode: default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs")
 
     # 模型参数
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/")

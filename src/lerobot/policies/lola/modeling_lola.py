@@ -672,11 +672,15 @@ class LoLAPolicy(PreTrainedPolicy):
         # 初始化动作队列
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
 
-        # VLM forward mode:
-        # - "hook": use forward hooks to capture intermediate layers (original approach)
-        # - "split": split VLM forward into segments at extract layers (compile-friendly,
-        #   no hooks, torch.compile sees the full graph)
-        self._vlm_forward_mode = "split" if config.compile_model else "hook"
+        # VLM forward mode: always "hook" for FSDP compatibility.
+        # Split mode manually iterates decoder layers (lang_model.layers[idx]),
+        # bypassing FSDP's _pre_forward_unshard. This leaves parameters in
+        # sharded (size-0) form during Dynamo's fake tensor tracing, causing
+        # broadcast errors. Hook mode runs VLM through the normal forward path
+        # where FSDP unshard operates correctly. FSDP unit boundaries naturally
+        # produce graph breaks regardless, so split mode's "avoid graph breaks"
+        # advantage does not apply under FSDP.
+        self._vlm_forward_mode = "hook"
 
         if self._vlm_forward_mode == "hook":
             self._captured_hidden_states: Dict[int, torch.Tensor] = {}
@@ -928,15 +932,55 @@ class LoLAPolicy(PreTrainedPolicy):
         # Step 1: Embed inputs (same as Qwen3_5Model.forward)
         inputs_embeds = vlm_model.get_input_embeddings()(input_ids)
 
-        # Inject visual embeddings
+        # Inject visual embeddings — inlined from Qwen3_5Model.forward to avoid
+        # get_image_features() which uses .tolist() / torch.split and causes
+        # graph breaks in torch.compile. Also enables compiling vision blocks.
         if pixel_values is not None:
-            image_outputs = vlm_model.get_image_features(pixel_values, image_grid_thw, return_dict=True)
-            image_embeds = image_outputs.pooler_output
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask, _ = vlm_model.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            visual = vlm_model.visual
+            pixel_values = pixel_values.to(dtype=visual.dtype)
+
+            # Run vision encoder forward (Qwen3_5VisionModel.forward inlined)
+            hidden_states = visual.patch_embed(pixel_values)
+            pos_embeds = visual.fast_pos_embed_interpolate(image_grid_thw)
+            hidden_states = hidden_states + pos_embeds
+            rotary_pos_emb = visual.rot_pos_emb(image_grid_thw)
+
+            seq_len_v, _ = hidden_states.size()
+            hidden_states = hidden_states.reshape(seq_len_v, -1)
+            rotary_pos_emb = rotary_pos_emb.reshape(seq_len_v, -1)
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings_v = (emb.cos(), emb.sin())
+
+            cu_seqlens = torch.repeat_interleave(
+                image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+            ).cumsum(dim=0, dtype=torch.int32)
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+            for blk in visual.blocks:
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings_v,
+                )
+
+            # Merge and scatter image embeddings into text
+            # visual.merger output: (total_visual_tokens, out_hidden_size)
+            image_embeds = visual.merger(hidden_states)
+
+            # Per-image split + cat (equivalent to get_image_features logic,
+            # but using torch.split with a tensor instead of .tolist())
+            merge_size = visual.spatial_merge_size ** 2
+            split_sizes = image_grid_thw.prod(-1) // merge_size
+            image_embeds_list = torch.split(image_embeds, split_sizes.tolist())
+            image_embeds_cat = torch.cat(image_embeds_list, dim=0).to(
+                inputs_embeds.device, inputs_embeds.dtype
             )
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+            # Scatter into text embeddings (same as Qwen3_5Model.forward)
+            image_mask, _ = vlm_model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds_list
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds_cat)
 
         # Step 2: Compute position_ids using Qwen3_5Model's method (handles 3D mrope for vision)
         position_ids = vlm_model.compute_3d_position_ids(
