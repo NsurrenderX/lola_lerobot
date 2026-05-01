@@ -58,6 +58,7 @@ Qwen3.5 Input Format:
     ```
 """
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -355,7 +356,10 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 "Please install it with `pip install transformers`."
             )
 
-        self.qwen_processor = AutoProcessor.from_pretrained(processor_name)
+        if os.path.isdir(processor_name):
+            self.qwen_processor = AutoProcessor.from_pretrained(processor_name, local_files_only=True)
+        else:
+            self.qwen_processor = AutoProcessor.from_pretrained(processor_name)
         self.qwen_processor.image_processor.max_pixels = max_image_pixels
         self.qwen_processor.image_processor.min_pixels = min_image_pixels
     
@@ -519,7 +523,8 @@ def make_lola_pre_post_processors(
     """
     
     # Determine processor settings from config
-    vlm_model_name = config.vlm_model_name
+    # Use local vlm_path for processor when available, fall back to vlm_model_name
+    processor_name = config.vlm_path if config.vlm_path is not None else config.vlm_model_name
     max_length = getattr(config, 'tokenizer_max_length', 512)
     
     # Pre-processor steps
@@ -535,7 +540,7 @@ def make_lola_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),  # To maintain compatibility with pretrained format
         LolaImageProcessor(camera_keys=camera_keys),  # Extract and prepare images for Qwen3.5
         LolaQwenProcessor(  # Process text + images with Qwen3.5's apply_chat_template
-            processor_name=vlm_model_name,
+            processor_name=processor_name,
             max_length=max_length,
             max_image_pixels=config.max_image_pixels,
             min_image_pixels=config.min_image_pixels,
