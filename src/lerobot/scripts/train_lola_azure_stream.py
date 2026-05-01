@@ -644,6 +644,7 @@ class LoLATrainer:
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
         preprocess_in_loader: bool = False,
+        dataloader_timeout: int = 600,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -660,6 +661,7 @@ class LoLATrainer:
         self.save_every_n_steps = save_every_n_steps
         self.log_every_n_steps = log_every_n_steps
         self.disable_gradient_checkpointing = disable_gradient_checkpointing
+        self.dataloader_timeout = dataloader_timeout
 
         self.wandb_project = wandb_project
         self.wandb_name = wandb_name
@@ -754,7 +756,7 @@ class LoLATrainer:
         """设置 FSDP"""
         _log("Setting up FSDP...")
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+        from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, BackwardPrefetch
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
         from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
@@ -790,6 +792,7 @@ class LoLATrainer:
             auto_wrap_policy=auto_wrap_policy,
             use_orig_params=True,
             device_id=self.local_rank,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         )
 
     def setup_optimizer(self):
@@ -947,10 +950,13 @@ class LoLATrainer:
             if self.gradient_clip_val > 0:
                 if not self.use_bf16:
                     self.scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.gradient_clip_val,
-                )
+                if self.strategy == "fsdp":
+                    grad_norm = self.model.clip_grad_norm_(self.gradient_clip_val)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.gradient_clip_val,
+                    )
             else:
                 grad_norm = None
             clip_s = time.monotonic() - clip_start
@@ -1243,10 +1249,13 @@ class LoLATrainer:
             # ── Gradient clipping + optimizer step ──────────────────
             clip_start = time.monotonic()
             if self.gradient_clip_val > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.gradient_clip_val,
-                )
+                if self.strategy == "fsdp":
+                    grad_norm = self.model.clip_grad_norm_(self.gradient_clip_val)
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.gradient_clip_val,
+                    )
             else:
                 grad_norm = None
             clip_s = time.monotonic() - clip_start
@@ -1453,7 +1462,7 @@ class LoLATrainer:
 
     def _create_tier_dataloader(self, tier_ds, micro_batch, num_workers=8,
                                 prefetch_factor=4, prefetch_queue_size=0,
-                                async_loader_class=None):
+                                async_loader_class=None, timeout=600):
         """Create a single tier DataLoader with async decode wrapping."""
         from torch.utils.data import DataLoader
 
@@ -1467,7 +1476,7 @@ class LoLATrainer:
             collate_fn=lambda x: x,
             prefetch_factor=prefetch_factor,
             persistent_workers=True,
-            timeout=300,
+            timeout=timeout,
         )
 
         loader_kwargs = {
@@ -1488,22 +1497,30 @@ class LoLATrainer:
 
         return async_loader_class(**loader_kwargs)
 
-    def _get_next_tier_batch(self, tier_idx: int):
-        """Get next batch from tier DataLoader, with auto-restart and epoch tracking."""
-        try:
-            return next(self._tier_iters[tier_idx])
-        except StopIteration:
-            self._tier_epochs[tier_idx] += 1
-            # Give the old _prefetch_iter producer thread a moment to fully
-            # exit before creating a new iterator that accesses the same
-            # underlying DataLoader with persistent_workers.  Without this
-            # pause, two threads can race on the non-thread-safe
-            # _MultiProcessingDataLoaderIter internals.
-            import time as _time
-            _time.sleep(0.1)
-            self._tier_iters[tier_idx] = iter(self._tier_loaders[tier_idx])
-            _log(f"Tier {tier_idx} DataLoader restarted (epoch {self._tier_epochs[tier_idx]})")
-            return next(self._tier_iters[tier_idx])
+    def _get_next_tier_batch(self, tier_idx: int, max_retries: int = 3):
+        """Get next batch from tier DataLoader, with auto-restart and timeout retry."""
+        for attempt in range(max_retries + 1):
+            try:
+                return next(self._tier_iters[tier_idx])
+            except StopIteration:
+                self._tier_epochs[tier_idx] += 1
+                # Wait for any background producer thread to exit cleanly
+                # before creating a new iterator on the same DataLoader
+                # with persistent_workers.
+                import time as _time
+                _time.sleep(0.5)
+                self._tier_iters[tier_idx] = iter(self._tier_loaders[tier_idx])
+                _log(f"Tier {tier_idx} DataLoader restarted (epoch {self._tier_epochs[tier_idx]})")
+                continue
+            except TimeoutError:
+                if attempt < max_retries:
+                    _log(f"Tier {tier_idx} DataLoader timed out, retrying "
+                         f"(attempt {attempt + 1}/{max_retries})...")
+                    import time as _time
+                    _time.sleep(1.0)
+                    self._tier_iters[tier_idx] = iter(self._tier_loaders[tier_idx])
+                    continue
+                raise
 
     def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
         """保存 checkpoint"""
@@ -1645,6 +1662,8 @@ def main():
                         help="DataLoader prefetch_factor per worker (default 2 in PyTorch, we use 4)")
     parser.add_argument("--prefetch_queue_size", type=int, default=4,
                         help="AsyncDecodeDataLoader batch-level prefetch queue size (0=disabled)")
+    parser.add_argument("--dataloader_timeout", type=int, default=600,
+                        help="DataLoader worker timeout in seconds (default 600)")
 
     # 预训练参数
     parser.add_argument("--pretrain", action="store_true",
@@ -1836,6 +1855,7 @@ def main():
             wandb_entity=args.wandb_entity,
             wandb_id=args.wandb_id,
             preprocess_in_loader=args.prefetch_queue_size > 0,
+            dataloader_timeout=args.dataloader_timeout,
         )
 
         if args.disable_wandb:
@@ -1861,6 +1881,7 @@ def main():
             "num_workers": args.num_workers,
             "prefetch_factor": args.prefetch_factor,
             "prefetch_queue_size": args.prefetch_queue_size,
+            "timeout": args.dataloader_timeout,
         }
         for tier_idx in range(num_tiers):
             tier_loader = trainer._create_tier_dataloader(
@@ -1950,6 +1971,7 @@ def main():
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
         preprocess_in_loader=args.prefetch_queue_size > 0,
+        dataloader_timeout=args.dataloader_timeout,
     )
 
     if args.disable_wandb:
@@ -1976,7 +1998,7 @@ def main():
         collate_fn=lambda x: x,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=True,
-        timeout=300,
+        timeout=args.dataloader_timeout,
     )
 
     # When prefetch is enabled, create a preprocess_fn that runs CPU-only preprocessing

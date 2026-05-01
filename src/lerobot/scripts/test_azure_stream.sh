@@ -127,6 +127,7 @@ STREAMING_SEED=42
 NUM_WORKERS=8
 PREFETCH_FACTOR=4
 PREFETCH_QUEUE_SIZE=4
+DATALOADER_TIMEOUT=600
 NO_SHUFFLE=false
 
 # Pretrain 参数
@@ -322,6 +323,10 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_QUEUE_SIZE="$2"
             shift 2
             ;;
+        --dataloader_timeout)
+            DATALOADER_TIMEOUT="$2"
+            shift 2
+            ;;
         --buffer_size)
             BUFFER_SIZE="$2"
             shift 2
@@ -481,6 +486,7 @@ cmd="${cmd} \
     --num_workers ${NUM_WORKERS} \
     --prefetch_factor ${PREFETCH_FACTOR} \
     --prefetch_queue_size ${PREFETCH_QUEUE_SIZE} \
+    --dataloader_timeout ${DATALOADER_TIMEOUT} \
     --wandb_project ${WANDB_PROJECT}"
 
 # 数据集参数

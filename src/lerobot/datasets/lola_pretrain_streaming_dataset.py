@@ -601,6 +601,31 @@ class _EpisodeAccessor:
         return len(self._episodes)
 
 
+def _contiguous_ranges(indices: list[int]) -> list[tuple[int, int]]:
+    """Split a sorted list of global episode indices into contiguous [start, end) ranges.
+
+    Preserves I/O locality: episodes within the same sub-dataset are contiguous
+    in global index, so most ranges will span multiple episodes hitting 1-2 parquet files.
+
+    Example: [2, 3, 4, 7, 8, 10] -> [(2, 5), (7, 9), (10, 11)]
+    """
+    if not indices:
+        return []
+    sorted_idx = sorted(indices)
+    ranges = []
+    start = sorted_idx[0]
+    end = start + 1
+    for i in sorted_idx[1:]:
+        if i == end:
+            end = i + 1
+        else:
+            ranges.append((start, end))
+            start = i
+            end = i + 1
+    ranges.append((start, end))
+    return ranges
+
+
 class EpisodeChunkReader:
     """Load contiguous ranges of episodes from parquet into dict-of-numpy-arrays.
 
@@ -999,6 +1024,55 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             # Store per-tier frame counts for this chunk
             for t in range(num_tiers):
                 self._chunk_tier_frame_counts[t][c] = tier_frame_counts[t]
+
+        # ── Tier-scoped episode/chunk metadata (for yield_tier) ──────
+        # When yield_tier is set, build a list of only the target tier's
+        # episode indices and derive chunk metadata from it. This ensures
+        # __iter__ only iterates over relevant episodes, eliminating
+        # zero-cost chunks and wasted I/O on filtered-out episodes.
+        self._tier_episode_indices: list[int] | None = None
+        self._tier_chunk_ranges: list[tuple[int, int]] | None = None
+        self._tier_chunk_primary_files: list[int] | None = None
+        self._tier_chunk_costs: list[float] | None = None
+
+        if self.yield_tier is not None and self._episode_tier is not None:
+            self._tier_episode_indices = [
+                ep_idx for ep_idx, t in enumerate(self._episode_tier)
+                if t == self.yield_tier
+            ]
+            print(f"[LoLAPretrainStreamingDataset] yield_tier={self.yield_tier}: "
+                  f"{len(self._tier_episode_indices)} of {num_episodes} episodes")
+
+            tier_eps = self._tier_episode_indices
+            num_tier_chunks = (len(tier_eps) + chunk_size - 1) // chunk_size
+
+            self._tier_chunk_ranges = []
+            self._tier_chunk_primary_files = []
+            self._tier_chunk_costs = []
+
+            for tc in range(num_tier_chunks):
+                ep_start = tc * chunk_size
+                ep_end = min(ep_start + chunk_size, len(tier_eps))
+                self._tier_chunk_ranges.append((ep_start, ep_end))
+
+                # Primary file based on first episode in this tier-chunk
+                first_global_ep = tier_eps[ep_start]
+                self._tier_chunk_primary_files.append(
+                    self._episode_file_ranges[first_global_ep][0]
+                )
+
+                # Cost = sum of visual costs for episodes in this tier-chunk
+                if self._episode_visual_cost is not None:
+                    chunk_cost = sum(
+                        self._episode_visual_cost[tier_eps[i]]
+                        for i in range(ep_start, ep_end)
+                    )
+                else:
+                    chunk_cost = float(ep_end - ep_start)
+                self._tier_chunk_costs.append(chunk_cost)
+
+            print(f"[LoLAPretrainStreamingDataset] yield_tier={self.yield_tier}: "
+                  f"{num_tier_chunks} tier-chunks (chunk_size={chunk_size})")
 
     @staticmethod
     def _build_metadata_polars(repo_id, root, revision, force_cache_sync=False):
@@ -1434,139 +1508,249 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         total_parallel = world_size * num_workers
         parallel_id = rank * num_workers + worker_id
 
-        # ── File-aligned + visual-cost-balanced chunk assignment ─────
-        num_episodes = len(self.meta.episodes)
-        chunk_size = self.episode_chunk_size
-        num_chunks = (num_episodes + chunk_size - 1) // chunk_size
-
-        # Group chunks by primary parquet file
-        file_to_chunks: dict[int, list[int]] = {}
-        for c in range(num_chunks):
-            pf = self._chunk_primary_file[c]
-            file_to_chunks.setdefault(pf, []).append(c)
-
-        # Sort file groups by their maximum chunk memory cost (descending)
-        file_groups = sorted(
-            file_to_chunks.values(),
-            key=lambda group: max(self._chunk_memory_cost[c] for c in group),
-            reverse=True,
-        )
-
-        # Greedy round-robin: assign each file group to the worker with lowest current cost
-        # When yield_tier is set, balance by target-tier frame count instead of memory cost
-        worker_indices: list[list[int]] = [[] for _ in range(total_parallel)]
-        worker_costs: list[float] = [0.0] * total_parallel
-        use_tier_frame_balance = (
-            self.yield_tier is not None
-            and self.yield_tier in self._chunk_tier_frame_counts
-        )
-        for group in file_groups:
-            min_worker = worker_costs.index(min(worker_costs))
-            worker_indices[min_worker].extend(group)
-            for c in group:
-                if use_tier_frame_balance:
-                    worker_costs[min_worker] += self._chunk_tier_frame_counts[self.yield_tier][c]
-                else:
-                    worker_costs[min_worker] += self._chunk_memory_cost[c]
-
-        worker_chunk_indices = worker_indices[parallel_id]
-
-        # Note: tier filtering is done at per-episode level inside the episode loop
-        # (see below), not at chunk level. This is more precise than chunk-level
-        # filtering because episodes in a mixed-tier chunk can be correctly routed.
-
-        if not worker_chunk_indices:
-            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no chunks assigned "
-                  f"(num_chunks={num_chunks}, total_parallel={total_parallel})", flush=True)
-            return
-
-        # Shuffle chunk order
+        # ── Chunk assignment (tier-scoped or global) ────────────────
         rng = np.random.default_rng(
             self.seed + rank if not self.shuffle else self.rng.integers(0, 2**31) + rank
         )
-        chunk_indices_shuffled = np.array(worker_chunk_indices)
-        if self.shuffle:
-            rng.shuffle(chunk_indices_shuffled)
 
-        print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} processing "
-              f"{len(worker_chunk_indices)} chunks (chunk_size={chunk_size}, "
-              f"total_episodes={num_episodes}, visual_cost={worker_costs[parallel_id]:.0f})", flush=True)
+        if self._tier_episode_indices is not None:
+            # ── Tier-scoped path ────────────────────────────────────
+            # Only iterate over episodes belonging to yield_tier.
+            # Chunks are built from the tier-scoped episode list, so
+            # every chunk contains only relevant episodes — no zero-cost
+            # chunks, no wasted I/O on filtered-out episodes.
+            num_tier_chunks = len(self._tier_chunk_ranges)
 
-        # ── Decode mode ─────────────────────────────────────────────
-        # Decode video inside DataLoader workers using BoundedVideoDecoderCache.
-        # Safe because this file no longer uses polars at all (replaced with
-        # pyarrow), so Rayon is never initialized in the parent process.
-        decode_on_yield = self.deferred_video_decode and not self.async_decode
+            # Group tier-chunks by primary parquet file
+            file_to_tier_chunks: dict[int, list[int]] = {}
+            for tc in range(num_tier_chunks):
+                pf = self._tier_chunk_primary_files[tc]
+                file_to_tier_chunks.setdefault(pf, []).append(tc)
 
-        # ── Shuffle buffer ──────────────────────────────────────────
-        buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
-        frames_buffer = []
-        yield_count = 0
-        buffer_full = False
+            # Sort by max cost descending (for greedy balance)
+            file_groups = sorted(
+                file_to_tier_chunks.values(),
+                key=lambda group: max(self._tier_chunk_costs[c] for c in group),
+                reverse=True,
+            )
 
-        # Resume: fast-forward through start_index items per worker
-        skip_remaining = self.start_index // total_parallel
-        if skip_remaining > 0:
-            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} skipping {skip_remaining} items for resume...", flush=True)
+            # Greedy round-robin with random tie-breaking
+            worker_indices: list[list[int]] = [[] for _ in range(total_parallel)]
+            worker_costs: list[float] = [0.0] * total_parallel
+            for group in file_groups:
+                min_cost = min(worker_costs)
+                candidates = [i for i, c in enumerate(worker_costs) if c == min_cost]
+                min_worker = int(rng.choice(candidates))
+                worker_indices[min_worker].extend(group)
+                for tc in group:
+                    worker_costs[min_worker] += self._tier_chunk_costs[tc]
 
-        print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} filling buffer "
-              f"(target={self.buffer_size}, decode_on_yield={decode_on_yield})", flush=True)
+            worker_tier_chunk_indices = worker_indices[parallel_id]
 
-        for chunk_idx in chunk_indices_shuffled:
-            ep_start_idx = int(chunk_idx) * chunk_size
-            ep_end_idx = min(ep_start_idx + chunk_size, num_episodes)
+            if not worker_tier_chunk_indices:
+                print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no tier-chunks "
+                      f"(num_tier_chunks={num_tier_chunks}, total_parallel={total_parallel})", flush=True)
+                return
 
-            # Load contiguous episode range
-            try:
-                ep_data_list = self._chunk_reader.load_episode_range(ep_start_idx, ep_end_idx)
-            except Exception as e:
-                logger.warning(f"Failed to load episodes [{ep_start_idx}, {ep_end_idx}): {e}")
-                continue
+            # Diagnostic: check chunk count balance
+            chunk_counts = [len(w) for w in worker_indices]
+            max_cc, min_cc = max(chunk_counts), min(chunk_counts)
+            if max_cc > 2 * min_cc and min_cc > 0:
+                print(f"[LoLAPretrainStreamingDataset] WARNING: chunk count imbalance "
+                      f"max={max_cc}, min={min_cc}, ratio={max_cc/min_cc:.1f}x", flush=True)
 
-            # Optional: shuffle episodes within chunk
-            ep_order = list(range(len(ep_data_list)))
+            # Shuffle chunk order
+            chunk_indices_shuffled = np.array(worker_tier_chunk_indices)
             if self.shuffle:
-                rng.shuffle(ep_order)
+                rng.shuffle(chunk_indices_shuffled)
 
-            for local_ep_idx in ep_order:
-                ep_idx = ep_start_idx + local_ep_idx
-                ep_data = ep_data_list[local_ep_idx]
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} processing "
+                  f"{len(worker_tier_chunk_indices)} tier-chunks (tier={self.yield_tier}, "
+                  f"tier_episodes={len(self._tier_episode_indices)}, "
+                  f"cost={worker_costs[parallel_id]:.0f})", flush=True)
 
-                # Per-episode tier filter (more precise than chunk-level filtering)
-                if self.yield_tier is not None and self._episode_tier is not None:
-                    if self._episode_tier[ep_idx] != self.yield_tier:
+            # ── Decode mode ─────────────────────────────────────────
+            decode_on_yield = self.deferred_video_decode and not self.async_decode
+
+            # ── Shuffle buffer ──────────────────────────────────────
+            buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+            frames_buffer = []
+            yield_count = 0
+            buffer_full = False
+
+            skip_remaining = self.start_index // total_parallel
+            if skip_remaining > 0:
+                print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} skipping {skip_remaining} items for resume...", flush=True)
+
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} filling buffer "
+                  f"(target={self.buffer_size}, decode_on_yield={decode_on_yield})", flush=True)
+
+            # Build set for O(1) membership check within contiguous ranges
+            tier_ep_set = set(self._tier_episode_indices)
+
+            for tc_idx in chunk_indices_shuffled:
+                ep_start, ep_end = self._tier_chunk_ranges[int(tc_idx)]
+                global_indices = self._tier_episode_indices[ep_start:ep_end]
+
+                # Split into contiguous ranges for efficient batch I/O.
+                # Episodes within the same sub-dataset are contiguous in global
+                # index, so most ranges span many episodes in 1-2 parquet files.
+                for rng_start, rng_end in _contiguous_ranges(global_indices):
+                    try:
+                        ep_data_list = self._chunk_reader.load_episode_range(rng_start, rng_end)
+                    except Exception as e:
+                        logger.warning(f"Failed to load episodes [{rng_start}, {rng_end}): {e}")
                         continue
 
-                # Process all frames in this episode
+                    # Process only episodes belonging to yield_tier
+                    # Build list of (local_i, global_ep) for target episodes
+                    target_entries = [
+                        (local_i, global_ep)
+                        for local_i, global_ep in enumerate(range(rng_start, rng_end))
+                        if global_ep in tier_ep_set
+                    ]
+                    # Optional: shuffle episodes within the contiguous range
+                    if self.shuffle and len(target_entries) > 1:
+                        rng.shuffle(target_entries)
+
+                    for local_i, global_ep in target_entries:
+                        ep_data = ep_data_list[local_i]
+
+                        try:
+                            frame_items = self._process_episode_frames(ep_data, global_ep)
+                        except Exception as e:
+                            logger.warning(f"Failed to process episode {global_ep}: {e}")
+                            continue
+
+                        if self.shuffle and len(frame_items) > 1:
+                            rng.shuffle(frame_items)
+
+                        for frame in frame_items:
+                            if len(frames_buffer) == self.buffer_size:
+                                if not buffer_full:
+                                    buffer_full = True
+                                    print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} buffer full, starting yield", flush=True)
+                                i = next(buffer_indices_generator)
+                                to_yield = frames_buffer[i]
+                                if skip_remaining > 0:
+                                    skip_remaining -= 1
+                                    frames_buffer[i] = frame
+                                    continue
+                                yield_count += 1
+                                if decode_on_yield and "_video_lookup" in to_yield:
+                                    to_yield = self._decode_videos(to_yield)
+                                yield to_yield
+                                frames_buffer[i] = frame
+                            else:
+                                frames_buffer.append(frame)
+
+        else:
+            # ── Global path (no tier filtering) ─────────────────────
+            num_episodes = len(self.meta.episodes)
+            chunk_size = self.episode_chunk_size
+            num_chunks = (num_episodes + chunk_size - 1) // chunk_size
+
+            # Group chunks by primary parquet file
+            file_to_chunks: dict[int, list[int]] = {}
+            for c in range(num_chunks):
+                pf = self._chunk_primary_file[c]
+                file_to_chunks.setdefault(pf, []).append(c)
+
+            # Sort file groups by their maximum chunk memory cost (descending)
+            file_groups = sorted(
+                file_to_chunks.values(),
+                key=lambda group: max(self._chunk_memory_cost[c] for c in group),
+                reverse=True,
+            )
+
+            # Greedy round-robin with random tie-breaking
+            worker_indices: list[list[int]] = [[] for _ in range(total_parallel)]
+            worker_costs: list[float] = [0.0] * total_parallel
+            for group in file_groups:
+                min_cost = min(worker_costs)
+                candidates = [i for i, c in enumerate(worker_costs) if c == min_cost]
+                min_worker = int(rng.choice(candidates))
+                worker_indices[min_worker].extend(group)
+                for c in group:
+                    worker_costs[min_worker] += self._chunk_memory_cost[c]
+
+            worker_chunk_indices = worker_indices[parallel_id]
+
+            if not worker_chunk_indices:
+                print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} has no chunks assigned "
+                      f"(num_chunks={num_chunks}, total_parallel={total_parallel})", flush=True)
+                return
+
+            # Shuffle chunk order
+            chunk_indices_shuffled = np.array(worker_chunk_indices)
+            if self.shuffle:
+                rng.shuffle(chunk_indices_shuffled)
+
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} processing "
+                  f"{len(worker_chunk_indices)} chunks (chunk_size={chunk_size}, "
+                  f"total_episodes={num_episodes}, visual_cost={worker_costs[parallel_id]:.0f})", flush=True)
+
+            # ── Decode mode ─────────────────────────────────────────
+            decode_on_yield = self.deferred_video_decode and not self.async_decode
+
+            # ── Shuffle buffer ──────────────────────────────────────
+            buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
+            frames_buffer = []
+            yield_count = 0
+            buffer_full = False
+
+            skip_remaining = self.start_index // total_parallel
+            if skip_remaining > 0:
+                print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} skipping {skip_remaining} items for resume...", flush=True)
+
+            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} filling buffer "
+                  f"(target={self.buffer_size}, decode_on_yield={decode_on_yield})", flush=True)
+
+            for chunk_idx in chunk_indices_shuffled:
+                ep_start_idx = int(chunk_idx) * chunk_size
+                ep_end_idx = min(ep_start_idx + chunk_size, num_episodes)
+
                 try:
-                    frame_items = self._process_episode_frames(ep_data, ep_idx)
+                    ep_data_list = self._chunk_reader.load_episode_range(ep_start_idx, ep_end_idx)
                 except Exception as e:
-                    logger.warning(f"Failed to process episode {ep_idx}: {e}")
+                    logger.warning(f"Failed to load episodes [{ep_start_idx}, {ep_end_idx}): {e}")
                     continue
 
-                # Optional: shuffle frames within episode
-                if self.shuffle and len(frame_items) > 1:
-                    rng.shuffle(frame_items)
+                ep_order = list(range(len(ep_data_list)))
+                if self.shuffle:
+                    rng.shuffle(ep_order)
 
-                # Feed into shuffle buffer
-                for frame in frame_items:
-                    if len(frames_buffer) == self.buffer_size:
-                        if not buffer_full:
-                            buffer_full = True
-                            print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} buffer full, starting yield", flush=True)
-                        i = next(buffer_indices_generator)
-                        to_yield = frames_buffer[i]
-                        if skip_remaining > 0:
-                            skip_remaining -= 1
+                for local_ep_idx in ep_order:
+                    ep_idx = ep_start_idx + local_ep_idx
+                    ep_data = ep_data_list[local_ep_idx]
+
+                    try:
+                        frame_items = self._process_episode_frames(ep_data, ep_idx)
+                    except Exception as e:
+                        logger.warning(f"Failed to process episode {ep_idx}: {e}")
+                        continue
+
+                    if self.shuffle and len(frame_items) > 1:
+                        rng.shuffle(frame_items)
+
+                    for frame in frame_items:
+                        if len(frames_buffer) == self.buffer_size:
+                            if not buffer_full:
+                                buffer_full = True
+                                print(f"[LoLAPretrainStreamingDataset] Worker {parallel_id} buffer full, starting yield", flush=True)
+                            i = next(buffer_indices_generator)
+                            to_yield = frames_buffer[i]
+                            if skip_remaining > 0:
+                                skip_remaining -= 1
+                                frames_buffer[i] = frame
+                                continue
+                            yield_count += 1
+                            if decode_on_yield and "_video_lookup" in to_yield:
+                                to_yield = self._decode_videos(to_yield)
+                            yield to_yield
                             frames_buffer[i] = frame
-                            continue  # fast-forward: advance rng/buffer state but don't yield
-                        yield_count += 1
-                        if decode_on_yield and "_video_lookup" in to_yield:
-                            to_yield = self._decode_videos(to_yield)
-                        yield to_yield
-                        frames_buffer[i] = frame
-                    else:
-                        frames_buffer.append(frame)
+                        else:
+                            frames_buffer.append(frame)
 
         # Flush remaining buffer
         rng.shuffle(frames_buffer)
