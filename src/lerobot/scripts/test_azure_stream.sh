@@ -26,6 +26,10 @@ if [ -d "/opt/conda/envs/lerobot/lib" ]; then
     export LD_LIBRARY_PATH="/opt/conda/envs/lerobot/lib:${LD_LIBRARY_PATH:-}"
 fi
 
+# Ensure kernel cache directory exists (avoids "Specified kernel cache directory
+# could not be created" warning from torch.cuda on first CUDA JIT compile)
+mkdir -p /root/.cache/torch/kernels
+
 # ----------------------------------------------------------------------
 # CUDA / GPU Compatibility Diagnostic
 # For Blackwell (B200, sm_100) GPUs, ensure CUDA 12.8 runtime libraries

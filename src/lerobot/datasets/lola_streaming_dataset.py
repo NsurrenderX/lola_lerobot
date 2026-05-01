@@ -1788,6 +1788,18 @@ class AsyncDecodeDataLoader:
                     batch = self._collate_fn(batch)
                 yield batch
 
+    def close(self):
+        """Shut down DataLoader workers and decode pipeline.
+
+        Must be called before discarding an AsyncDecodeDataLoader instance
+        to ensure clean shutdown of persistent workers and background threads.
+        """
+        if hasattr(self._dataset, 'shutdown_decode_pipeline'):
+            self._dataset.shutdown_decode_pipeline()
+        if hasattr(self._loader, '_iterator') and self._loader._iterator is not None:
+            self._loader._iterator._shutdown_workers()
+            self._loader._iterator = None
+
     def __len__(self):
         return len(self._loader)
 

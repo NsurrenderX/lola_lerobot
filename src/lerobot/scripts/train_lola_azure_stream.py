@@ -904,9 +904,21 @@ class LoLATrainer:
         # 这里无需 skip_epochs/skip_batches 逻辑
 
         data_yield_start = time.monotonic()
-        for batch_idx, batch in enumerate(train_loader):
-            if self.global_step >= self.max_steps:
-                break
+        data_iter = iter(train_loader)
+        while self.global_step < self.max_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # Reset start_index so next epoch starts from beginning
+                if hasattr(train_loader, '_dataset') and hasattr(train_loader._dataset, 'start_index'):
+                    train_loader._dataset.start_index = 0
+                data_iter = iter(train_loader)
+                _log("DataLoader exhausted, restarting (new epoch)")
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    _log("DataLoader produced no data after restart, stopping training")
+                    break
 
             data_yield_s = time.monotonic() - data_yield_start
             step_start = time.monotonic()
@@ -1276,10 +1288,7 @@ class LoLATrainer:
                     if self._tier_datasets is not None and self._async_loader_class is not None:
                         for t in range(num_tiers):
                             old_loader = self._tier_loaders[t]
-                            try:
-                                old_loader.close()
-                            except Exception:
-                                pass
+                            old_loader.close()
                             self._tier_loaders[t] = self._create_tier_dataloader(
                                 tier_ds=self._tier_datasets[t],
                                 micro_batch=tier_batch_sizes[t],
@@ -1458,6 +1467,7 @@ class LoLATrainer:
             collate_fn=lambda x: x,
             prefetch_factor=prefetch_factor,
             persistent_workers=True,
+            timeout=300,
         )
 
         loader_kwargs = {
@@ -1484,6 +1494,13 @@ class LoLATrainer:
             return next(self._tier_iters[tier_idx])
         except StopIteration:
             self._tier_epochs[tier_idx] += 1
+            # Give the old _prefetch_iter producer thread a moment to fully
+            # exit before creating a new iterator that accesses the same
+            # underlying DataLoader with persistent_workers.  Without this
+            # pause, two threads can race on the non-thread-safe
+            # _MultiProcessingDataLoaderIter internals.
+            import time as _time
+            _time.sleep(0.1)
             self._tier_iters[tier_idx] = iter(self._tier_loaders[tier_idx])
             _log(f"Tier {tier_idx} DataLoader restarted (epoch {self._tier_epochs[tier_idx]})")
             return next(self._tier_iters[tier_idx])
@@ -1959,6 +1976,7 @@ def main():
         collate_fn=lambda x: x,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=True,
+        timeout=300,
     )
 
     # When prefetch is enabled, create a preprocess_fn that runs CPU-only preprocessing

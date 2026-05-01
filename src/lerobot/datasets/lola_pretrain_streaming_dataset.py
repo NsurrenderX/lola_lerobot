@@ -2087,7 +2087,12 @@ class AsyncDecodeDataLoader:
             except Exception as e:
                 error_holder[0] = e
             finally:
-                data_queue.put(None)  # sentinel
+                # Non-blocking sentinel: if queue is full the consumer will
+                # see StopIteration from the generator exit anyway.
+                try:
+                    data_queue.put(None, block=False)
+                except queue_mod.Full:
+                    pass
 
         thread = threading.Thread(target=producer, daemon=True)
         thread.start()
@@ -2109,7 +2114,19 @@ class AsyncDecodeDataLoader:
                     data_queue.get_nowait()
                 except queue_mod.Empty:
                     break
-            thread.join(timeout=5)
+            # Wait for producer thread to fully exit before returning.
+            # A longer timeout is needed because the thread may be blocked
+            # inside the DataLoader's next() call with persistent_workers,
+            # which has no timeout.  If this returns with the thread still
+            # alive, a subsequent iter() on the same DataLoader could race.
+            thread.join(timeout=30)
+            if thread.is_alive():
+                import warnings
+                warnings.warn(
+                    "AsyncDecodeDataLoader: producer thread did not exit "
+                    "within 30s.  This may cause issues with "
+                    "persistent_workers restart."
+                )
 
     def __iter__(self):
         if self._prefetch_queue_size > 0:
@@ -2131,6 +2148,18 @@ class AsyncDecodeDataLoader:
                 if self._collate_fn is not None:
                     batch = self._collate_fn(batch)
                 yield batch
+
+    def close(self):
+        """Shut down prefetch thread, DataLoader workers, and decode pipeline.
+
+        Must be called before discarding an AsyncDecodeDataLoader instance
+        to ensure clean shutdown of persistent workers and background threads.
+        """
+        if hasattr(self._dataset, 'shutdown_decode_pipeline'):
+            self._dataset.shutdown_decode_pipeline()
+        if hasattr(self._loader, '_iterator') and self._loader._iterator is not None:
+            self._loader._iterator._shutdown_workers()
+            self._loader._iterator = None
 
     def __len__(self):
         return len(self._loader)
