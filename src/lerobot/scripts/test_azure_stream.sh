@@ -92,7 +92,7 @@ SAVE_INTERVAL=5000
 GRADIENT_CLIP_VAL=1.0
 DISABLE_GRADIENT_CHECKPOINTING=false  # Disable checkpointing to save bwd recomputation overhead (increases memory)
 COMPILE_MODEL=false  # Enable torch.compile for DiT (kernel fusion, reduces kernel launch overhead)
-COMPILE_MODE="reduce-overhead"  # torch.compile mode: "reduce-overhead" (CUDA graphs), "default", "max-autotune"
+COMPILE_MODE="max-autotune-no-cudagraphs"  # torch.compile mode: exhaustive kernel search + fusion, no CUDA graphs (best for variable-length tier batching)
 
 # 数据集参数
 DATASET_REPO_ID=""

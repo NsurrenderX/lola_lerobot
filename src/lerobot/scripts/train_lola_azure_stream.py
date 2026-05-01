@@ -746,7 +746,7 @@ class LoLATrainer:
 
             # Compile VLM vision encoder blocks (~287M params, 27 layers)
             _log(f"Compiling VLM vision blocks with torch.compile(mode={compile_mode})...")
-            vision_blocks = self.policy.vlm.model.vision_model.blocks
+            vision_blocks = self.policy.vlm.model.visual.blocks
             for i in range(len(vision_blocks)):
                 vision_blocks[i] = torch.compile(vision_blocks[i], mode=compile_mode)
             _log("VLM vision blocks compilation scheduled")
