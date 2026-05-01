@@ -1395,7 +1395,7 @@ class LoLATrainer:
                     _log(
                         f"[Step {self.global_step}/{self.max_steps}] "
                         f"Loss={avg_loss:.4f} LR={lr:.2e} "
-                        f"grad_norm={grad_norm_val:.4f if grad_norm_val is not None else 'N/A'} "
+                        f"grad_norm={f'{grad_norm_val:.4f}' if grad_norm_val is not None else 'N/A'} "
                         f"samples/s={samples_per_s:.1f}"
                     )
                     _log(
