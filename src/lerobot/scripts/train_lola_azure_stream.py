@@ -744,12 +744,11 @@ class LoLATrainer:
                 lang_layers[i] = torch.compile(lang_layers[i], mode=compile_mode)
             _log("VLM decoder layers compilation scheduled")
 
-            # Compile VLM vision encoder blocks (~287M params, 27 layers)
-            _log(f"Compiling VLM vision blocks with torch.compile(mode={compile_mode})...")
-            vision_blocks = self.policy.vlm.model.visual.blocks
-            for i in range(len(vision_blocks)):
-                vision_blocks[i] = torch.compile(vision_blocks[i], mode=compile_mode)
-            _log("VLM vision blocks compilation scheduled")
+            # Note: Vision encoder blocks are NOT compiled here because they are
+            # called via get_image_features() which is outside FSDP's wrap scope.
+            # Compiled modules inside FSDP-unwrapped submodules see sharded 1D
+            # parameters instead of 2D weights, causing "b must be 2D" errors.
+            # The vision encoder (~287M/4.5B params) is small enough to skip.
 
         if self.is_distributed:
             cap = torch.cuda.get_device_capability(self.device)
