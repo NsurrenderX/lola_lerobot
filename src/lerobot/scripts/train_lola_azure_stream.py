@@ -75,6 +75,63 @@ def _log(msg: str):
     print(f"[{ts}] [Rank {rank}] {msg}", flush=True)
 
 
+def _compile_submodules(model: torch.nn.Module, compile_mode: str = "max-autotune-no-cudagraphs"):
+    """Compile leaf compute submodules inside FSDP units for kernel fusion.
+
+    Compiling the whole FSDP-wrapped model causes Dynamo to encounter FSDP flat
+    params whose .grad has been unsharded (full size) while the param is sharded,
+    triggering "gradient size mismatch" errors. Instead, we compile only the leaf
+    compute submodules (attention, MLP, etc.) inside each FSDP unit. With
+    use_orig_params=True, these submodules' parameters remain in their original
+    form — Dynamo never touches FSDP flat params.
+
+    Compiled submodule types (by FSDP unit):
+      - Qwen3_5DecoderLayer: self_attn / linear_attn, mlp
+      - Qwen3_5VisionBlock: attn, mlp
+      - Flux2TransformerBlock: attn, ff, ff_context
+      - Flux2SingleTransformerBlock: attn (fused attn+MLP)
+      - LolaVLMFeatureExtractor: feature_proj, empty_token_proj (nn.Sequential)
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5Attention, Qwen3_5GatedDeltaNet, Qwen3_5MLP,
+        Qwen3_5VisionAttention, Qwen3_5VisionMLP,
+    )
+    from diffusers.models.transformers.transformer_flux2 import (
+        Flux2Attention, Flux2FeedForward, Flux2ParallelSelfAttention,
+    )
+
+    # Types of leaf compute submodules to compile
+    compile_types = {
+        Qwen3_5Attention, Qwen3_5GatedDeltaNet, Qwen3_5MLP,
+        Qwen3_5VisionAttention, Qwen3_5VisionMLP,
+        Flux2Attention, Flux2FeedForward, Flux2ParallelSelfAttention,
+    }
+
+    # Phase 1: collect submodule paths to compile
+    to_compile = []
+    for name, module in model.named_modules():
+        if type(module) in compile_types:
+            to_compile.append((name, module))
+
+    # Phase 2: compile and replace each submodule
+    count = 0
+    module_dict = dict(model.named_modules())
+    for name, module in to_compile:
+        compiled = torch.compile(module, mode=compile_mode)
+        parts = name.rsplit(".", 1)
+        if len(parts) == 2:
+            parent_name, attr_name = parts
+            parent = module_dict[parent_name]
+        else:
+            parent = model
+            attr_name = parts[0]
+        setattr(parent, attr_name, compiled)
+        count += 1
+
+    _log(f"Compiled {count} leaf submodules with torch.compile(mode={compile_mode})")
+    _log("Compilation scheduled (first forward of each submodule will trigger JIT)")
+
+
 def setup_distributed():
     """从环境变量初始化分布式训练"""
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -740,24 +797,35 @@ class LoLATrainer:
         else:
             self.model = self.policy
 
-        # torch.compile for kernel fusion — MUST be done after FSDP wrapping.
-        # Compiling individual layers before FSDP wrap changes their type to
-        # OptimizedModule, which breaks FSDP's transformer_auto_wrap_policy
-        # (it uses isinstance checks). Compiling the full model after FSDP wrap
-        # lets Dynamo see FSDP's all-gather/reduce-scatter ops and automatically
-        # insert graph breaks at FSDP unit boundaries (which is desired for
-        # correct comm ordering).
+        # torch.compile for kernel fusion — compile leaf compute submodules
+        # inside FSDP units, NOT the whole FSDP-wrapped model.
+        #
+        # Why NOT compile the whole model:
+        #   Compiling the full FSDP-wrapped model causes Dynamo's fake tensor
+        #   tracing to encounter FSDP flat params whose .grad has been unsharded
+        #   (full size) while the param itself is still sharded (1/world_size),
+        #   triggering "gradient size mismatch" errors. This is a known PyTorch
+        #   FSDP + compile incompatibility (pytorch/issues#107498).
+        #
+        # Why NOT compile before FSDP wrapping:
+        #   Compiling individual layers before FSDP wrap changes their type to
+        #   OptimizedModule, which breaks FSDP's transformer_auto_wrap_policy
+        #   (it uses isinstance checks).
+        #
+        # Submodule compile approach:
+        #   After FSDP wrapping, we iterate model.modules() and compile only the
+        #   leaf compute submodules (attention, MLP, etc.) inside each FSDP unit.
+        #   With use_orig_params=True, these submodules' parameters remain in
+        #   their original form — Dynamo never touches FSDP flat params.
+        #
         # NOTE: When compile_model=True, LoLAPolicy automatically switches VLM forward
         # mode from 'hook' to 'output_hidden_states' (with a warning). Hook mode's
         # forward hooks are Python-level side effects that Dynamo cannot propagate
         # across graph breaks. output_hidden_states=True returns tensor-level values
-        # that Dynamo handles correctly. Memory cost: ~330MB peak (33 layers) vs
-        # ~30MB (3 layers with hooks), negligible relative to B200's 171GB reserved.
+        # that Dynamo handles correctly.
         if self.config.compile_model:
             compile_mode = getattr(self.config, 'compile_mode', 'max-autotune-no-cudagraphs')
-            _log(f"Compiling model with torch.compile(mode={compile_mode})...")
-            self.model = torch.compile(self.model, mode=compile_mode)
-            _log("Model compilation scheduled (first forward will trigger JIT compilation)")
+            _compile_submodules(self.model, compile_mode)
 
         self.interconnect_monitor = InterconnectMonitor(self.device)
 
