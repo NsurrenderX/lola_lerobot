@@ -649,4 +649,6 @@ def main():
 
 
 if __name__ == "__main__":
+    os.environ['WANDB_API_KEY'] = "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"
+
     main()
