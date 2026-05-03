@@ -2,7 +2,7 @@
 """
 RoboVLM 分布式微调脚本
 
-使用 LeRobotDataset 加载 lerobot 3.0 格式数据集，适配 RoboVLM (Kosmos-2 + LSTMDecoder) 模型。
+使用 RoboVLMDataset 加载 lerobot 3.0 格式数据集，适配 RoboVLM (Kosmos-2 + LSTMDecoder) 模型。
 适用于小规模微调场景，无需流式数据集。
 
 使用方法:
@@ -44,10 +44,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.robovlm_dataset import RoboVLMDataset
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.robovlm import RoboVLMConfig, RoboVLMPolicy
-from lerobot.policies.factory import make_pre_post_processors
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,63 +102,37 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def create_robovlm_dataset(
-    repo_id: str,
-    config: RoboVLMConfig,
-    root: str | None = None,
-):
-    """Create a LeRobotDataset with delta_timestamps matching RoboVLM config."""
-    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
-    fps = dataset_metadata.fps
-
-    delta_timestamps = {}
-    delta_timestamps["observation.state"] = [i / fps for i in config.observation_delta_indices]
-    delta_timestamps["action"] = [i / fps for i in config.action_delta_indices]
-    for key in dataset_metadata.camera_keys:
-        delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
-
-    _log(f"delta_timestamps: {delta_timestamps}")
-    _log(f"Camera keys: {dataset_metadata.camera_keys}")
-
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=root,
-        delta_timestamps=delta_timestamps,
-    )
-
-    return dataset, dataset_metadata
-
-
 class RoboVLMTrainer:
     def __init__(
         self,
         config: RoboVLMConfig,
-        dataset_stats: dict,
         dist_info: dict,
         learning_rate: float = 2e-5,
         weight_decay: float = 0.0,
-        max_steps: int = 10000,
+        max_steps: int | None = None,
+        max_epochs: int | None = None,
         strategy: str = "ddp",
         fsdp_sharding: str = "full_shard",
         gradient_clip_val: float = 1.0,
         ckpt_dir: str = "runs/checkpoints",
         save_every_n_steps: int = 500,
+        save_every_n_epochs: int | None = None,
         log_every_n_steps: int = 10,
         wandb_project: str | None = None,
         wandb_name: str | None = None,
         wandb_entity: str | None = None,
     ):
         self.config = config
-        self.dataset_stats = dataset_stats
         self.dist_info = dist_info
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
-        self.max_steps = max_steps
+        self.max_epochs = max_epochs
         self.strategy = strategy
         self.fsdp_sharding = fsdp_sharding
         self.gradient_clip_val = gradient_clip_val
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
+        self.save_every_n_epochs = save_every_n_epochs
         self.log_every_n_steps = log_every_n_steps
 
         self.wandb_project = wandb_project
@@ -178,13 +151,13 @@ class RoboVLMTrainer:
         self.model = None
         self.optimizer = None
         self.scheduler = None
-        self.preprocessor = None
-        self.postprocessor = None
 
         self.global_step = 0
+        self.current_epoch = 0
+        self.max_steps = max_steps  # may be overridden by epoch mode
         self.best_loss = float("inf")
 
-    def setup_model(self):
+    def setup_model(self, pretrained_checkpoint=None):
         """Instantiate RoboVLM policy and apply DDP/FSDP wrapping."""
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -193,10 +166,26 @@ class RoboVLMTrainer:
         self.policy = RoboVLMPolicy(self.config)
         self.policy.model = self.policy.model.to(self.device)
 
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.config,
-            dataset_stats=self.dataset_stats,
-        )
+        # Load pretrained weights (partial load — missing keys stay randomly initialized)
+        if pretrained_checkpoint is not None:
+            _log(f"Loading pretrained checkpoint: {pretrained_checkpoint}")
+            ckpt = torch.load(pretrained_checkpoint, map_location=self.device)
+            model_sd = ckpt["model_state_dict"]
+            current_sd = self.policy.model.state_dict()
+
+            # Match keys that exist in both
+            loaded_keys = []
+            missing_in_pretrained = []
+            for key in current_sd:
+                if key in model_sd:
+                    current_sd[key] = model_sd[key]
+                    loaded_keys.append(key)
+                else:
+                    missing_in_pretrained.append(key)
+
+            self.policy.model.load_state_dict(current_sd)
+            _log(f"Pretrained weights loaded: {len(loaded_keys)} keys matched")
+            _log(f"Keys missing in pretrained (randomly initialized): {missing_in_pretrained}")
 
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.policy.parameters())
@@ -267,7 +256,7 @@ class RoboVLMTrainer:
         )
 
     def setup_optimizer(self):
-        """Create optimizer and scheduler."""
+        """Create optimizer and LR scheduler (matching original RoboVLM)."""
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
@@ -278,35 +267,25 @@ class RoboVLMTrainer:
             eps=self.config.optimizer_eps,
         )
 
-        from torch.optim.lr_scheduler import OneCycleLR
-        warmup_pct = self.config.scheduler_warmup_steps / self.max_steps
-        self.scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.learning_rate,
-            total_steps=self.max_steps,
-            pct_start=min(warmup_pct, 0.1),
-            anneal_strategy="cos",
-        )
+        from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+        warmup_steps = self.config.scheduler_warmup_steps
+        if self.config.scheduler_type == "cosine":
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=self.max_steps,
+            )
+        else:
+            # Default: "constant" — warmup then flat LR (matches original RoboVLM)
+            self.scheduler = get_constant_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+            )
 
     def training_step(self, batch):
-        """Single training step."""
+        """Single training step — data already preprocessed by RoboVLMDataset."""
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
-        # Extract action and task before preprocessing (preprocessor doesn't handle them)
-        action = batch.pop("action", None)
-        task = batch.pop("task", None)
-        action_is_pad = batch.pop("action_is_pad", None)
-
-        # Preprocess remaining observation data
-        batch = self.preprocessor(batch)
-
-        # Restore action and task
-        if action is not None:
-            batch["action"] = action
-        if task is not None:
-            batch["task"] = task
-        if action_is_pad is not None:
-            batch["action_is_pad"] = action_is_pad
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             loss, loss_dict = self.model(batch)
@@ -314,9 +293,18 @@ class RoboVLMTrainer:
         return loss, loss_dict
 
     def train(self, train_loader, start_step: int = 0):
-        """Training loop."""
+        """Training loop supporting both step-based and epoch-based modes."""
         self.global_step = start_step
         self.model.train()
+
+        steps_per_epoch = len(train_loader)
+
+        # Compute max_steps from epochs if using epoch mode
+        if self.max_epochs is not None:
+            self.max_steps = self.max_epochs * steps_per_epoch
+            _log(f"Epoch mode: {self.max_epochs} epochs x {steps_per_epoch} steps/epoch = {self.max_steps} total steps")
+        elif self.max_steps is None:
+            raise ValueError("Must specify either --max_steps or --max_epochs")
 
         time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         ckpt_dir = os.path.join(self.ckpt_dir, f"robovlm-{time_str}")
@@ -334,6 +322,7 @@ class RoboVLMTrainer:
                     "learning_rate": self.learning_rate,
                     "weight_decay": self.weight_decay,
                     "max_steps": self.max_steps,
+                    "max_epochs": self.max_epochs,
                     "batch_size": train_loader.batch_size,
                     "strategy": self.strategy,
                     "world_size": self.world_size,
@@ -344,15 +333,23 @@ class RoboVLMTrainer:
 
         data_yield_start = time.monotonic()
         data_iter = iter(train_loader)
+        self.current_epoch = start_step // steps_per_epoch
 
         while self.global_step < self.max_steps:
             try:
                 batch = next(data_iter)
             except StopIteration:
+                # Epoch boundary
+                self.current_epoch += 1
                 if self.is_distributed and hasattr(train_loader, "sampler"):
-                    train_loader.sampler.set_epoch(self.global_step // len(train_loader))
+                    train_loader.sampler.set_epoch(self.current_epoch)
                 data_iter = iter(train_loader)
-                _log("DataLoader exhausted, restarting (new epoch)")
+                _log(f"Epoch {self.current_epoch} completed, starting epoch {self.current_epoch + 1}")
+
+                # Epoch-based checkpointing
+                if self.save_every_n_epochs and self.current_epoch % self.save_every_n_epochs == 0:
+                    self.save_checkpoint(ckpt_dir, self.global_step, epoch=self.current_epoch)
+
                 try:
                     batch = next(data_iter)
                 except StopIteration:
@@ -396,9 +393,10 @@ class RoboVLMTrainer:
 
                 if self.is_main_process:
                     grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                    epoch_str = f" Epoch={self.current_epoch + 1}/{self.max_epochs}" if self.max_epochs else ""
 
                     _log(
-                        f"[Step {self.global_step}/{self.max_steps}] "
+                        f"[Step {self.global_step}/{self.max_steps}]{epoch_str} "
                         f"Loss={loss.item():.4f} LR={lr:.2e} "
                         f"Update={update_s:.2f}s DataWait={data_yield_s:.2f}s"
                     )
@@ -418,6 +416,7 @@ class RoboVLMTrainer:
                             "train/loss": loss.item(),
                             "train/learning_rate": lr,
                             "train/step": self.global_step,
+                            "train/epoch": self.current_epoch + 1,
                             "timing/fwd_s": fwd_s,
                             "timing/bwd_s": bwd_s,
                             "memory/gpu_alloc_gb": gpu_mem_alloc,
@@ -430,41 +429,51 @@ class RoboVLMTrainer:
                                 log_dict[f"train/{k}"] = v
                         wandb.log(log_dict)
 
-            # Checkpointing
+            # Step-based checkpointing
             if self.global_step % self.save_every_n_steps == 0:
                 self.save_checkpoint(ckpt_dir, self.global_step)
 
             data_yield_start = time.monotonic()
 
-        self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
+        self.save_checkpoint(ckpt_dir, self.global_step, is_final=True,
+                             epoch=self.current_epoch + 1 if self.max_epochs else None)
         _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
 
         if self.use_wandb:
             wandb.finish()
 
-    def save_checkpoint(self, ckpt_dir, step, is_final=False):
+    def save_checkpoint(self, ckpt_dir, step, is_final=False, epoch=None):
         """Save checkpoint."""
         if not self.is_main_process:
             return
 
+        # Build filename
+        if is_final:
+            fname = "final.pt"
+        elif epoch is not None:
+            fname = f"epoch-{epoch}.pt"
+        else:
+            fname = f"step-{step}.pt"
+
         if self.strategy == "fsdp":
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, FullStateDictConfig, StateDictType
             cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, cfg):
                 state_dict = self.model.state_dict()
-            path = os.path.join(ckpt_dir, f"step-{step}.pt")
-            torch.save({"model_state_dict": state_dict, "global_step": step}, path)
+            path = os.path.join(ckpt_dir, fname)
+            torch.save({"model_state_dict": state_dict, "global_step": step, "epoch": epoch}, path)
         else:
             model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-            path = os.path.join(ckpt_dir, f"step-{step}.pt")
+            path = os.path.join(ckpt_dir, fname)
             torch.save({
                 "model_state_dict": model_to_save.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "global_step": step,
+                "epoch": epoch,
             }, path)
 
-        tag = "final" if is_final else f"step-{step}"
+        tag = "final" if is_final else fname.replace(".pt", "")
         _log(f"Checkpoint saved: {path} ({tag})")
 
     def load_checkpoint(self, path):
@@ -480,30 +489,41 @@ class RoboVLMTrainer:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
         self.global_step = ckpt.get("global_step", 0)
-        _log(f"Checkpoint loaded from {path}, resuming from step {self.global_step}")
+        self.current_epoch = ckpt.get("epoch", 0) or 0
+        _log(f"Checkpoint loaded from {path}, resuming from step {self.global_step}, epoch {self.current_epoch}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RoboVLM Fine-tuning")
 
     # Dataset
-    parser.add_argument("--dataset_repo_id", type=str, required=True, help="LeRobot dataset repo ID")
+    parser.add_argument("--dataset_repo_id", type=str, default=None, help="LeRobot dataset repo ID")
     parser.add_argument("--dataset_root", type=str, default=None, help="Local dataset root path")
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=10000)
+    train_mode = parser.add_mutually_exclusive_group()
+    train_mode.add_argument("--max_steps", type=int, default=None, help="Max training steps (step-based mode)")
+    train_mode.add_argument("--max_epochs", type=int, default=None, help="Max training epochs (epoch-based mode)")
     parser.add_argument("--num_workers", type=int, default=8)
 
     # Model overrides
-    parser.add_argument("--vlm_pretrained_path", type=str, default=".vlms/kosmos-2-patch14-224")
+    parser.add_argument("--vlm_pretrained_path", type=str, default="/data_16T/deepseek/kosmos-2-patch14-224/")
     parser.add_argument("--freeze_backbone", action="store_true", default=False)
     parser.add_argument("--train_vision", action="store_true", default=True)
     parser.add_argument("--train_text_embedding", action="store_true", default=True)
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--fwd_pred_next_n", type=int, default=10)
+    parser.add_argument("--use_state", action="store_true", default=True,
+                        help="Use state (robot proprioception) as input. Default True. "
+                             "Pass --no_use_state to disable (e.g. matching OXE pretrain).")
+    parser.add_argument("--no_use_state", action="store_true", default=False,
+                        help="Disable state input (use_state=False)")
+    parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"],
+                        help="LR scheduler type: 'constant' (warmup then flat, matches original) or 'cosine' (warmup then cosine decay)")
+    parser.add_argument("--scheduler_warmup_steps", type=int, default=250)
 
     # Distributed
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
@@ -513,7 +533,12 @@ def parse_args():
     # Checkpoint / logging
     parser.add_argument("--ckpt_dir", type=str, default="runs/checkpoints")
     parser.add_argument("--save_every_n_steps", type=int, default=500)
+    parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs (epoch-based mode)")
     parser.add_argument("--log_every_n_steps", type=int, default=10)
+    parser.add_argument("--pretrained_checkpoint", type=str, default=None,
+                        help="Path to converted pretrained RoboVLM checkpoint (.pt). "
+                             "Missing keys (e.g. embed_state) stay randomly initialized. "
+                             "Use convert_robovlm_checkpoint.py first to convert original DeepSpeed checkpoints.")
     parser.add_argument("--resume", type=str, default=None)
 
     # Wandb
@@ -530,24 +555,56 @@ def main():
     dist_info = setup_distributed()
 
     # Build config
+    use_state = not args.no_use_state if args.no_use_state else args.use_state
     config = RoboVLMConfig(
         vlm_pretrained_path=args.vlm_pretrained_path,
         freeze_backbone=args.freeze_backbone,
         train_vision=args.train_vision,
         train_text_embedding=args.train_text_embedding,
+        use_state=use_state,
         window_size=args.window_size,
         fwd_pred_next_n=args.fwd_pred_next_n,
         optimizer_lr=args.learning_rate,
+        scheduler_type=args.scheduler,
+        scheduler_warmup_steps=args.scheduler_warmup_steps,
     )
 
-    # Create dataset
-    train_dataset, dataset_metadata = create_robovlm_dataset(
+    # Setup model first (need tokenizer for dataset)
+    trainer = RoboVLMTrainer(
+        config=config,
+        dist_info=dist_info,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        max_steps=args.max_steps,
+        max_epochs=args.max_epochs,
+        strategy=args.strategy,
+        fsdp_sharding=args.fsdp_sharding,
+        gradient_clip_val=args.gradient_clip_val,
+        ckpt_dir=args.ckpt_dir,
+        save_every_n_steps=args.save_every_n_steps,
+        save_every_n_epochs=args.save_every_n_epochs,
+        log_every_n_steps=args.log_every_n_steps,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+        wandb_entity=args.wandb_entity,
+    )
+
+    if args.disable_wandb:
+        trainer.use_wandb = False
+
+    trainer.setup_model(pretrained_checkpoint=args.pretrained_checkpoint)
+
+    # Create RoboVLMDataset with tokenizer from the model
+    tokenizer = trainer.policy.model.tokenizer
+    train_dataset = RoboVLMDataset(
         repo_id=args.dataset_repo_id,
         config=config,
         root=args.dataset_root,
+        tokenizer=tokenizer,
     )
 
-    # Setup dataset features in config
+    # Setup dataset features in config (needed by PreTrainedPolicy)
+    dataset_metadata = train_dataset.meta
     features = dataset_to_policy_features(dataset_metadata.features)
     if not config.output_features:
         config.output_features = {k: ft for k, ft in features.items() if ft.type is FeatureType.ACTION}
@@ -555,9 +612,7 @@ def main():
         config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
     config.validate_features()
 
-    dataset_stats = dataset_metadata.stats
-
-    # Create DataLoader
+    # Create DataLoader with custom collater
     sampler = None
     if dist_info["is_distributed"]:
         sampler = DistributedSampler(
@@ -574,34 +629,12 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=train_dataset.collater,
     )
 
     _log(f"Dataset size: {len(train_dataset)}, batch_size: {args.batch_size}, "
          f"batches_per_epoch: {len(train_loader)}")
 
-    # Create trainer
-    trainer = RoboVLMTrainer(
-        config=config,
-        dataset_stats=dataset_stats,
-        dist_info=dist_info,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        max_steps=args.max_steps,
-        strategy=args.strategy,
-        fsdp_sharding=args.fsdp_sharding,
-        gradient_clip_val=args.gradient_clip_val,
-        ckpt_dir=args.ckpt_dir,
-        save_every_n_steps=args.save_every_n_steps,
-        log_every_n_steps=args.log_every_n_steps,
-        wandb_project=args.wandb_project,
-        wandb_name=args.wandb_name,
-        wandb_entity=args.wandb_entity,
-    )
-
-    if args.disable_wandb:
-        trainer.use_wandb = False
-
-    trainer.setup_model()
     trainer.setup_optimizer()
 
     start_step = 0

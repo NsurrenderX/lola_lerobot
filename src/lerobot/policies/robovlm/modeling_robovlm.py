@@ -125,25 +125,28 @@ class LSTMDecoder(nn.Module):
         elif self.down_sample == "none":
             tok_seq = rearrange(tok_seq, "b l n d-> b l (n d)")
 
-        if tok_seq.shape[1] == 1:
-            # Inference mode: single-step processing with history tracking
-            self.history_memory.append(tok_seq)
-            if len(self.history_memory) <= self.history_len:
+        # cuDNN LSTM does not support bfloat16 — use native PyTorch implementation
+        with torch.backends.cudnn.flags(enabled=False):
+            tok_seq = tok_seq.contiguous()
+            if tok_seq.shape[1] == 1:
+                # Inference mode: single-step processing with history tracking
+                self.history_memory.append(tok_seq)
+                if len(self.history_memory) <= self.history_len:
+                    x, h_n = self.rnn(tok_seq, self.hidden_state)
+                    self.hidden_state = h_n
+                    x = x[:, -1].unsqueeze(1)
+                else:
+                    for _ in range(len(self.history_memory) - self.history_len):
+                        self.history_memory.pop(0)
+                    hist_feature = torch.cat(self.history_memory, dim=1)
+                    self.hidden_state = None
+                    x, h_n = self.rnn(hist_feature, self.hidden_state)
+                    x = x[:, -1].unsqueeze(1)
+            else:
+                # Training mode: full window processing
+                self.hidden_state = h_0
                 x, h_n = self.rnn(tok_seq, self.hidden_state)
                 self.hidden_state = h_n
-                x = x[:, -1].unsqueeze(1)
-            else:
-                for _ in range(len(self.history_memory) - self.history_len):
-                    self.history_memory.pop(0)
-                hist_feature = torch.cat(self.history_memory, dim=1)
-                self.hidden_state = None
-                x, h_n = self.rnn(hist_feature, self.hidden_state)
-                x = x[:, -1].unsqueeze(1)
-        else:
-            # Training mode: full window processing
-            self.hidden_state = h_0
-            x, h_n = self.rnn(tok_seq, self.hidden_state)
-            self.hidden_state = h_n
 
         actions = self.actions(x)
         gripper = self.gripper(x)
@@ -463,11 +466,16 @@ class RoboVLMModel(nn.Module):
                     multimodal_attention_mask, "(b l) n -> b (l n)", l=seq_len
                 )
 
-        # Run VLM backbone
-        output = self.backbone(
+        # Run text decoder directly — we've already encoded images and merged
+        # embeddings via merge_multi_modal_input, so we bypass
+        # Kosmos2ForConditionalGeneration.forward which requires pixel_values
+        # or image_embeds, and call the text transformer directly.
+        output = self.backbone.text_model.model(
             input_ids=None,
             attention_mask=multimodal_attention_mask,
             inputs_embeds=multimodal_embeds,
+            image_embeds=None,
+            image_embeds_position_mask=None,
             use_cache=False,
             output_hidden_states=True,
         )
@@ -544,66 +552,29 @@ class RoboVLMPolicy(PreTrainedPolicy):
             f"{sum(p.numel() for p in self.parameters()) / 1e6:.2f}M"
         )
 
-    def _tokenize_text(self, task_texts):
-        template = "<grounding>An image of a robot {}"
-        texts = [template.format(t.strip()) for t in task_texts]
-        self.model.tokenizer.padding_side = "right"
-        encoded = self.model.tokenizer(
-            texts,
-            truncation="only_first",
-            return_tensors="pt",
-            padding="longest",
-            max_length=512,
-        )
-        return encoded["input_ids"], encoded["attention_mask"]
-
     def _prepare_inputs(self, batch):
-        config = self.config
+        """Extract inputs from RoboVLMDataset batch format.
 
-        # Get primary camera images
-        image_keys = [k for k in batch.keys() if k.startswith("observation.images.")]
-        if not image_keys:
-            raise ValueError("No image keys found in batch")
-        vision_x = batch[image_keys[0]]
+        Expected batch keys:
+          - rgb: [B, window_size, C, H, W] (already CLIP-normalized)
+          - language: [B, text_len] (already tokenized)
+          - text_mask: [B, text_len] (attention mask)
+          - rel_state: [B, window_size, state_dim] (gripper already binarized)
+          - action_chunck: [B, window_size, fwd_pred_next_n, action_dim] (gripper already binarized)
+          - chunck_mask: [B, window_size, fwd_pred_next_n] (True=valid)
+        """
+        vision_x = batch["rgb"]
+        lang_x = batch["language"]
+        attention_mask = batch["text_mask"]
+        rel_state = batch.get("rel_state", None)
+        action_chunck = batch.get("action_chunck", None)
+        chunk_mask = batch.get("chunck_mask", None)
 
-        # Ensure [B, window_size, 3, 224, 224]
-        if vision_x.ndim == 5 and vision_x.shape[1] != config.window_size:
-            vision_x = vision_x[:, :config.window_size]
-
-        # Get task descriptions and tokenize
-        task_texts = batch.get("task", [""] * vision_x.shape[0])
-        if isinstance(task_texts, torch.Tensor):
-            task_texts = task_texts.tolist()
-        lang_x, attention_mask = self._tokenize_text(task_texts)
-
-        # Get state
-        rel_state = batch.get("observation.state", None)
-        if rel_state is not None:
-            if rel_state.ndim == 3 and rel_state.shape[1] != config.window_size:
-                rel_state = rel_state[:, :config.window_size]
-
-        # Get action labels
-        actions = batch.get("action", None)
-
-        return vision_x, lang_x, attention_mask, actions, rel_state
+        return vision_x, lang_x, attention_mask, action_chunck, chunk_mask, rel_state
 
     def forward(self, batch: dict[str, Any]) -> Tuple[torch.Tensor, dict | None]:
         config = self.config
-        vision_x, lang_x, attention_mask, actions, rel_state = self._prepare_inputs(batch)
-
-        # Prepare action labels for LSTM loss
-        if actions is not None:
-            arm_labels = actions[..., :6]  # [B, fwd_pred_next_n, 6]
-            gripper_labels = actions[..., -1]  # [B, fwd_pred_next_n]
-
-            # Convert gripper from [-1,1] to [0,1] for BCE
-            gripper_labels = (gripper_labels + 1) / 2
-
-            action_mask = batch.get("action_is_pad", None)
-        else:
-            arm_labels = None
-            gripper_labels = None
-            action_mask = None
+        vision_x, lang_x, attention_mask, action_chunck, chunk_mask, rel_state = self._prepare_inputs(batch)
 
         with torch.amp.autocast("cuda", dtype=self._dtype):
             pred_actions, pred_gripper, _ = self.model.forward_continuous(
@@ -614,22 +585,48 @@ class RoboVLMPolicy(PreTrainedPolicy):
                 mode="train",
             )
 
-        # Concatenate predictions: [B, window_size, fwd_pred_next_n, action_dim]
-        pred_full = torch.cat([pred_actions, pred_gripper], dim=-1)
+        # pred_actions: [B, window_size, fwd_pred_next_n, 6]
+        # pred_gripper: [B, window_size, fwd_pred_next_n, 1]
+        pred_full = torch.cat([pred_actions, pred_gripper], dim=-1)  # [B, ws, fwd, 7]
 
-        # Compute loss at last window timestep only
-        pred_last = pred_full[:, -1, :, :]  # [B, fwd_pred_next_n, action_dim]
-        pred_arm_last = pred_last[..., :6]
-        pred_gripper_last = pred_last[..., -1]
+        if action_chunck is not None:
+            # Labels from dataset: gripper already binarized to {0, 1}
+            arm_labels = action_chunck[..., :6]            # [B, ws, fwd, 6]
+            gripper_labels = action_chunck[..., -1]         # [B, ws, fwd]
 
-        loss_arm = F.huber_loss(pred_arm_last, arm_labels)
-        loss_gripper = F.binary_cross_entropy_with_logits(pred_gripper_last, gripper_labels)
+            pred_arm = pred_full[..., :6]                   # [B, ws, fwd, 6]
+            pred_gripper_logit = pred_full[..., -1]         # [B, ws, fwd]
 
-        total_loss = loss_arm + config.arm_gripper_loss_ratio * loss_gripper
+            if chunk_mask is not None and not chunk_mask.any():
+                # All masked — return zero loss with grad for backward compatibility
+                loss_arm = (pred_arm * 0).sum()
+                loss_gripper = (pred_gripper_logit * 0).sum()
+                acc_gripper = 0.0
+            elif chunk_mask is not None and not chunk_mask.all():
+                # Partial mask — compute masked loss
+                mask = chunk_mask.bool()
+                loss_arm = F.huber_loss(pred_arm, arm_labels, reduction="none")[mask].mean()
+                loss_gripper = F.binary_cross_entropy_with_logits(
+                    pred_gripper_logit, gripper_labels, reduction="none"
+                )[mask].mean()
+                acc_gripper = (
+                    (F.sigmoid(pred_gripper_logit) > 0.5).eq(gripper_labels).float()[mask].mean().item()
+                )
+            else:
+                # No mask (or all valid) — compute unmasked loss
+                loss_arm = F.huber_loss(pred_arm, arm_labels)
+                loss_gripper = F.binary_cross_entropy_with_logits(pred_gripper_logit, gripper_labels)
+                acc_gripper = (
+                    (F.sigmoid(pred_gripper_logit) > 0.5).eq(gripper_labels).float().mean().item()
+                )
 
-        acc_gripper = (
-            (F.sigmoid(pred_gripper_last) > 0.5).eq(gripper_labels).float().mean().item()
-        )
+            total_loss = loss_arm + config.arm_gripper_loss_ratio * loss_gripper
+        else:
+            # No labels — return zero loss with grad
+            total_loss = (pred_full * 0).sum()
+            loss_arm = torch.tensor(0.0, device=pred_full.device)
+            loss_gripper = torch.tensor(0.0, device=pred_full.device)
+            acc_gripper = 0.0
 
         loss_dict = {
             "loss_arm": loss_arm.item(),
@@ -640,7 +637,7 @@ class RoboVLMPolicy(PreTrainedPolicy):
         return total_loss, loss_dict
 
     def predict_action_chunk(self, batch: dict[str, Any], **kwargs) -> torch.Tensor:
-        vision_x, lang_x, attention_mask, _, rel_state = self._prepare_inputs(batch)
+        vision_x, lang_x, attention_mask, _, _, rel_state = self._prepare_inputs(batch)
 
         with torch.amp.autocast("cuda", dtype=self._dtype):
             pred_actions, pred_gripper = self.model.forward_continuous(

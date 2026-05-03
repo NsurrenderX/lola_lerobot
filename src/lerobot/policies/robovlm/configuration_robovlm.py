@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
-from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 
@@ -14,7 +13,7 @@ class RoboVLMConfig(PreTrainedConfig):
     # 1. VLM Settings
     # ==========================
     vlm_pretrained_path: str = ".vlms/kosmos-2-patch14-224"
-    vlm_model_type: str = "AutoModelForVision2Seq"
+    vlm_model_type: str = "AutoModelForImageTextToText"
 
     # ==========================
     # 2. Image Settings
@@ -24,9 +23,9 @@ class RoboVLMConfig(PreTrainedConfig):
     image_std: tuple = (0.26862954, 0.26130258, 0.27577711)
 
     # ==========================
-    # 3. VLM Hidden Size
+    # 3. VLM Hidden Size (must match backbone text embed_dim)
     # ==========================
-    hidden_size: int = 1024
+    hidden_size: int = 2048
 
     # ==========================
     # 4. Observation / Action
@@ -72,10 +71,22 @@ class RoboVLMConfig(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
         }
     )
+
+    # ==========================
+    # 9b. Action Normalization (matching original RoboVLM)
+    # ==========================
+    norm_action: bool = True
+    norm_min: float = -0.65
+    norm_max: float = 0.65
+
+    # ==========================
+    # 9c. Text Tokenizer
+    # ==========================
+    max_text_len: int = 256
 
     # ==========================
     # 10. Optimizer Settings
@@ -89,9 +100,8 @@ class RoboVLMConfig(PreTrainedConfig):
     # ==========================
     # 11. Scheduler Settings
     # ==========================
+    scheduler_type: str = "constant"  # "constant" (warmup then flat) or "cosine" (warmup then cosine decay)
     scheduler_warmup_steps: int = 250
-    scheduler_decay_steps: int = 30000
-    scheduler_decay_lr: float = 2e-6
 
     def __post_init__(self):
         super().__post_init__()
@@ -122,12 +132,9 @@ class RoboVLMConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
-        return CosineDecayWithWarmupSchedulerConfig(
-            peak_lr=self.optimizer_lr,
-            decay_lr=self.scheduler_decay_lr,
-            num_warmup_steps=self.scheduler_warmup_steps,
-            num_decay_steps=self.scheduler_decay_steps,
-        )
+        # Scheduler is constructed directly in train_robovlm.py
+        # using scheduler_type and scheduler_warmup_steps from this config.
+        return None
 
     @property
     def observation_delta_indices(self) -> list:
