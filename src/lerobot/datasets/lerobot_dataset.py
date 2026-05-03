@@ -562,6 +562,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
+        tolerance_frames: int | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
@@ -687,6 +688,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
         self.tolerance_s = tolerance_s
+        self.tolerance_frames = tolerance_frames
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.delta_indices = None
@@ -1008,7 +1010,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, backend=self.video_backend)
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, tolerance_frames=self.tolerance_frames, backend=self.video_backend)
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -1542,6 +1544,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         robot_type: str | None = None,
         use_videos: bool = True,
         tolerance_s: float = 1e-4,
+        tolerance_frames: int | None = None,
         image_writer_processes: int = 0,
         image_writer_threads: int = 0,
         video_backend: str | None = None,
@@ -1561,6 +1564,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj.root = obj.meta.root
         obj.revision = None
         obj.tolerance_s = tolerance_s
+        obj.tolerance_frames = tolerance_frames
         obj.image_writer = None
         obj.batch_encoding_size = batch_encoding_size
         obj.episodes_since_last_encoding = 0

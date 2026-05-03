@@ -92,7 +92,13 @@ class RoboVLMDataset(Dataset):
         delta_timestamps["observation.state"] = obs_delta_ts
         delta_timestamps["action"] = action_delta_ts
 
-        self.lerobot_ds = LeRobotDataset(repo_id, root=root, delta_timestamps=delta_timestamps)
+        # Use tolerance_frames=2 to avoid strict tolerance_s assertion failures
+        # on videos with slightly imprecise timestamps. tolerance_frames adapts
+        # to each video's actual fps, so it's more robust than computing
+        # tolerance_s from the dataset's nominal fps.
+        self.lerobot_ds = LeRobotDataset(
+            repo_id, root=root, delta_timestamps=delta_timestamps, tolerance_frames=2,
+        )
 
         # Identify primary camera key (first one)
         self.camera_key = self.meta.camera_keys[0]
