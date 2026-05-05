@@ -512,23 +512,27 @@ def parse_args():
     # Model overrides
     parser.add_argument("--vlm_pretrained_path", type=str, default="/data_16T/deepseek/kosmos-2-patch14-224/")
     parser.add_argument("--freeze_backbone", action="store_true", default=False)
-    parser.add_argument("--train_vision", action="store_true", default=True)
-    parser.add_argument("--train_text_embedding", action="store_true", default=True)
-    parser.add_argument("--window_size", type=int, default=16)
+    parser.add_argument("--no_train_vision", action="store_true", default=False,
+                        help="Disable vision tower training (default: vision is trainable)")
+    parser.add_argument("--no_train_text_embedding", action="store_true", default=False,
+                        help="Disable text embedding training (default: text embedding is trainable)")
+    parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--fwd_pred_next_n", type=int, default=10)
     parser.add_argument("--use_state", action="store_true", default=False,
                         help="Use state (robot proprioception) as input. Default False "
-                             "(matching original CALVIN fine-tuning). Pass --use_state to enable.")
+                             "(matching original CALVIN fine-tuning).")
+    parser.add_argument("--no_use_state", action="store_true", default=False,
+                        help="Explicitly disable state input (redundant, for shell script compat)")
     parser.add_argument("--use_hand_rgb", action="store_true", default=True,
-                        help="Use hand/gripper camera. Default True (matching ws-16 config).")
+                        help="Use hand/gripper camera. Default True.")
     parser.add_argument("--no_use_hand_rgb", action="store_true", default=False,
                         help="Disable hand/gripper camera")
     parser.add_argument("--skip_action_normalize", action="store_true", default=True,
                         help="Skip normalize_action when data is already in correct range (default True)")
     parser.add_argument("--no_skip_action_normalize", action="store_true", default=False,
-                        help="Apply normalize_action even if data might already be normalized")
+                        help="Apply normalize_action at training time (for raw Calvin data)")
     parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"],
-                        help="LR scheduler type: 'constant' (warmup then flat, matches original) or 'cosine' (warmup then cosine decay)")
+                        help="LR scheduler: 'constant' (warmup+flat) or 'cosine' (warmup+decay)")
     parser.add_argument("--scheduler_warmup_steps", type=int, default=250)
 
     # Distributed
@@ -539,12 +543,10 @@ def parse_args():
     # Checkpoint / logging
     parser.add_argument("--ckpt_dir", type=str, default="runs/checkpoints")
     parser.add_argument("--save_every_n_steps", type=int, default=500)
-    parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs (epoch-based mode)")
+    parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs")
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--pretrained_checkpoint", type=str, default=None,
-                        help="Path to converted pretrained RoboVLM checkpoint (.pt). "
-                             "Missing keys (e.g. embed_state) stay randomly initialized. "
-                             "Use convert_robovlm_checkpoint.py first to convert original DeepSpeed checkpoints.")
+                        help="Path to converted pretrained RoboVLM checkpoint (.pt)")
     parser.add_argument("--resume", type=str, default=None)
 
     # Wandb
@@ -560,15 +562,18 @@ def main():
     args = parse_args()
     dist_info = setup_distributed()
 
-    # Build config
-    use_state = args.use_state and not args.no_use_state if hasattr(args, 'no_use_state') else args.use_state
-    use_hand_rgb = not args.no_use_hand_rgb if args.no_use_hand_rgb else args.use_hand_rgb
+    # Resolve boolean flags with explicit no_* overrides
+    use_state = args.use_state and not args.no_use_state
+    use_hand_rgb = args.use_hand_rgb and not args.no_use_hand_rgb
+    train_vision = not args.no_train_vision
+    train_text_embedding = not args.no_train_text_embedding
     skip_action_normalize = not args.no_skip_action_normalize if args.no_skip_action_normalize else args.skip_action_normalize
+
     config = RoboVLMConfig(
         vlm_pretrained_path=args.vlm_pretrained_path,
         freeze_backbone=args.freeze_backbone,
-        train_vision=args.train_vision,
-        train_text_embedding=args.train_text_embedding,
+        train_vision=train_vision,
+        train_text_embedding=train_text_embedding,
         use_state=use_state,
         use_hand_rgb=use_hand_rgb,
         skip_action_normalize=skip_action_normalize,
@@ -660,5 +665,4 @@ def main():
 
 if __name__ == "__main__":
     os.environ['WANDB_API_KEY'] = "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"
-    
     main()
