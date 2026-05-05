@@ -1,19 +1,19 @@
 #!/bin/bash
-# RoboVLM Azure 分布式微调脚本
+# CronusVLA Azure 分布式微调脚本
 #
-# 基于 Kosmos-2 + LSTMDecoder 的 RoboVLM 模型微调。
+# 基于 VLM + DiffusionActionHead 的 CronusVLA 模型微调。
 # Azure ML 会为每个节点运行一次此脚本，并自动传入分布式参数。
 #
 # 使用方法:
 #   # 单 GPU 测试
-#   bash test_robovlm_azure.sh --dataset_repo_id <repo_id> --dataset_root <path>
+#   bash test_cronusvla_azure.sh --dataset_repo_id <repo_id> --dataset_root <path>
 #
 #   # 多 GPU (torchrun)
-#   bash test_robovlm_azure.sh --nproc_per_node 4 \
+#   bash test_cronusvla_azure.sh --nproc_per_node 4 \
 #       --dataset_repo_id <repo_id> --dataset_root <path>
 #
 #   # Azure 多节点
-#   bash test_robovlm_azure.sh --nnodes $NODES --nproc_per_node $GPUS \
+#   bash test_cronusvla_azure.sh --nnodes $NODES --nproc_per_node $GPUS \
 #       --node_rank $AZUREML_CR_NODE_RANK \
 #       --master_addr $AZ_BATCHAI_JOB_MASTER_NODE_IP \
 #       --master_port 9901 \
@@ -94,33 +94,39 @@ NUM_WORKERS=8
 # 数据集参数
 DATASET_REPO_ID=""
 DATASET_ROOT=""
+USE_WRIST_IMAGE=false
 
 # 模型参数
-VLM_PRETRAINED_PATH="/data_16T/deepseek/kosmos-2-patch14-224/"
-CKPT_DIR="/mnt/wangxiaofa/checkpoints/robovlm-finetune"
+VLM_BASE="/data_16T/deepseek/cronusvla-checkpoint/"
+ACTION_MODEL_TYPE="diffusion"
+REPEATED_DIFFUSION_STEPS=10
+FUTURE_ACTION_WINDOW_SIZE=15
+PAST_ACTION_WINDOW_SIZE=0
+VIEW_SEQUENCE_LEN=1
+CKPT_DIR="/mnt/wangxiaofa/checkpoints/cronusvla-finetune"
 SAVE_EVERY_N_STEPS=500
 SAVE_EVERY_N_EPOCHS=""    # Epoch 模式下的保存间隔（留空则不按 epoch 保存）
 LOG_EVERY_N_STEPS=10
-FREEZE_BACKBONE=false
-TRAIN_VISION=true
-TRAIN_TEXT_EMBEDDING=true
-USE_STATE=true               # 默认启用 state。设为 false 则传 --no_use_state（匹配 OXE pretrain）
-WINDOW_SIZE=8
-FWD_PRED_NEXT_N=10
+FREEZE_VISION_BACKBONE=false
+FREEZE_LLM_BACKBONE=false
+UNFREEZE_LAST_LLM_LAYER=false
 
 # 调度器参数
 SCHEDULER="constant"       # "constant" (warmup+flat, matches original) or "cosine" (warmup+decay)
 SCHEDULER_WARMUP_STEPS=250
 
 # Wandb 参数
-WANDB_PROJECT="robovlm"
+WANDB_PROJECT="cronusvla"
 WANDB_NAME=""
 WANDB_ENTITY=""
 DISABLE_WANDB=false
 
 # 预训练参数
-PRETRAINED_CHECKPOINT=""  # 转换后的预训练 RoboVLM checkpoint (.pt)
-# 例如 OXE pretrain: 先用 convert_robovlm_checkpoint.py 转换，然后指定路径
+PRETRAINED_CHECKPOINT=""  # 转换后的预训练 CronusVLA checkpoint (.pt)
+
+# 本地 VLM 加载参数
+LOCAL_VLM_PATH=""         # 本地 .pt checkpoint 路径，设置后避免从 HF Hub 下载 LLM 权重
+HF_TOKEN=""               # HuggingFace API token (用于 Llama2 等受限模型)
 
 # Resume 参数
 RESUME=""
@@ -150,6 +156,10 @@ while [[ $# -gt 0 ]]; do
         --master_port)
             MASTER_PORT="$2"
             shift 2
+            ;;
+        --master_port=*)
+            MASTER_PORT="${1#*=}"
+            shift
             ;;
 
         # 训练参数
@@ -199,6 +209,14 @@ while [[ $# -gt 0 ]]; do
             NUM_WORKERS="$2"
             shift 2
             ;;
+        --save_interval)
+            SAVE_INTERVAL="$2"
+            shift 2
+            ;;
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
 
         # 数据集参数
         --dataset_repo_id)
@@ -209,50 +227,66 @@ while [[ $# -gt 0 ]]; do
             DATASET_ROOT="$2"
             shift 2
             ;;
+        --use_wrist_image)
+            USE_WRIST_IMAGE=true
+            shift
+            ;;
+        --no_use_wrist_image)
+            USE_WRIST_IMAGE=false
+            shift
+            ;;
 
         # 模型参数
-        --vlm_pretrained_path)
-            VLM_PRETRAINED_PATH="$2"
+        --vlm_base)
+            VLM_BASE="$2"
+            shift 2
+            ;;
+        --action_model_type)
+            ACTION_MODEL_TYPE="$2"
+            shift 2
+            ;;
+        --repeated_diffusion_steps)
+            REPEATED_DIFFUSION_STEPS="$2"
+            shift 2
+            ;;
+        --future_action_window_size)
+            FUTURE_ACTION_WINDOW_SIZE="$2"
+            shift 2
+            ;;
+        --past_action_window_size)
+            PAST_ACTION_WINDOW_SIZE="$2"
+            shift 2
+            ;;
+        --view_sequence_len)
+            VIEW_SEQUENCE_LEN="$2"
             shift 2
             ;;
         --ckpt_dir)
             CKPT_DIR="$2"
             shift 2
             ;;
-        --freeze_backbone)
-            FREEZE_BACKBONE=true
+        --freeze_vision_backbone)
+            FREEZE_VISION_BACKBONE=true
             shift
             ;;
-        --train_vision)
-            TRAIN_VISION=true
+        --no_freeze_vision_backbone)
+            FREEZE_VISION_BACKBONE=false
             shift
             ;;
-        --no_train_vision)
-            TRAIN_VISION=false
+        --freeze_llm_backbone)
+            FREEZE_LLM_BACKBONE=true
             shift
             ;;
-        --train_text_embedding)
-            TRAIN_TEXT_EMBEDDING=true
+        --no_freeze_llm_backbone)
+            FREEZE_LLM_BACKBONE=false
             shift
             ;;
-        --no_train_text_embedding)
-            TRAIN_TEXT_EMBEDDING=false
+        --unfreeze_last_llm_layer)
+            UNFREEZE_LAST_LLM_LAYER=true
             shift
             ;;
-        --window_size)
-            WINDOW_SIZE="$2"
-            shift 2
-            ;;
-        --fwd_pred_next_n)
-            FWD_PRED_NEXT_N="$2"
-            shift 2
-            ;;
-        --no_use_state)
-            USE_STATE=false
-            shift
-            ;;
-        --use_state)
-            USE_STATE=true
+        --no_unfreeze_last_llm_layer)
+            UNFREEZE_LAST_LLM_LAYER=false
             shift
             ;;
 
@@ -290,9 +324,13 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
-        # Resume
-        --resume)
-            RESUME="$2"
+        # Local VLM loading
+        --local_vlm_path)
+            LOCAL_VLM_PATH="$2"
+            shift 2
+            ;;
+        --hf_token)
+            HF_TOKEN="$2"
             shift 2
             ;;
 
@@ -305,7 +343,7 @@ done
 
 # 打印配置信息
 echo "========================================"
-echo "RoboVLM Azure Distributed Fine-tuning"
+echo "CronusVLA Azure Distributed Fine-tuning"
 echo "========================================"
 echo "Distributed Config:"
 echo "  - Nodes: ${NNODES}"
@@ -329,14 +367,23 @@ echo "  - Save every N steps: ${SAVE_EVERY_N_STEPS}"
 if [ -n "$SAVE_EVERY_N_EPOCHS" ]; then
     echo "  - Save every N epochs: ${SAVE_EVERY_N_EPOCHS}"
 fi
-echo "  - VLM path: ${VLM_PRETRAINED_PATH}"
-echo "  - Window size: ${WINDOW_SIZE}"
-echo "  - Fwd pred next n: ${FWD_PRED_NEXT_N}"
-echo "  - Freeze backbone: ${FREEZE_BACKBONE}"
-echo "  - Train vision: ${TRAIN_VISION}"
-echo "  - Train text embedding: ${TRAIN_TEXT_EMBEDDING}"
+echo ""
+echo "Model Config:"
+echo "  - VLM base: ${VLM_BASE}"
+echo "  - Action model type: ${ACTION_MODEL_TYPE}"
+echo "  - Repeated diffusion steps: ${REPEATED_DIFFUSION_STEPS}"
+echo "  - Future action window size: ${FUTURE_ACTION_WINDOW_SIZE}"
+echo "  - Past action window size: ${PAST_ACTION_WINDOW_SIZE}"
+echo "  - View sequence len: ${VIEW_SEQUENCE_LEN}"
+echo "  - Use wrist image: ${USE_WRIST_IMAGE}"
+echo "  - Freeze vision backbone: ${FREEZE_VISION_BACKBONE}"
+echo "  - Freeze LLM backbone: ${FREEZE_LLM_BACKBONE}"
+echo "  - Unfreeze last LLM layer: ${UNFREEZE_LAST_LLM_LAYER}"
 if [ -n "$PRETRAINED_CHECKPOINT" ]; then
     echo "  - Pretrained checkpoint: ${PRETRAINED_CHECKPOINT}"
+fi
+if [ -n "$LOCAL_VLM_PATH" ]; then
+    echo "  - Local VLM path: ${LOCAL_VLM_PATH}"
 fi
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "========================================"
@@ -346,7 +393,7 @@ echo "========================================"
 # ----------------------------------------------------------------------
 if [ "$NNODES" -eq 1 ]; then
     cmd="/opt/conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
-        src/lerobot/scripts/train_robovlm.py"
+        src/lerobot/scripts/train_cronusvla.py"
 else
     cmd="/opt/conda/envs/lerobot/bin/torchrun \
         --nnodes=${NNODES} \
@@ -354,7 +401,7 @@ else
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
         --master_port=${MASTER_PORT} \
-        src/lerobot/scripts/train_robovlm.py"
+        src/lerobot/scripts/train_cronusvla.py"
 fi
 
 # 通用训练参数
@@ -367,13 +414,15 @@ cmd="${cmd} \
     --save_every_n_steps ${SAVE_EVERY_N_STEPS} \
     --gradient_clip_val ${GRADIENT_CLIP_VAL} \
     --num_workers ${NUM_WORKERS} \
-    --vlm_pretrained_path ${VLM_PRETRAINED_PATH} \
+    --vlm_base ${VLM_BASE} \
+    --action_model_type ${ACTION_MODEL_TYPE} \
+    --repeated_diffusion_steps ${REPEATED_DIFFUSION_STEPS} \
+    --future_action_window_size ${FUTURE_ACTION_WINDOW_SIZE} \
+    --past_action_window_size ${PAST_ACTION_WINDOW_SIZE} \
+    --view_sequence_len ${VIEW_SEQUENCE_LEN} \
     --ckpt_dir ${CKPT_DIR} \
-    --window_size ${WINDOW_SIZE} \
-    --fwd_pred_next_n ${FWD_PRED_NEXT_N} \
     --scheduler ${SCHEDULER} \
     --scheduler_warmup_steps ${SCHEDULER_WARMUP_STEPS} \
-    --no_skip_action_normalize \
     --wandb_project ${WANDB_PROJECT}"
 
 # 训练模式：步数 vs Epoch（互斥）
@@ -397,14 +446,17 @@ if [ -n "$DATASET_ROOT" ]; then
 fi
 
 # 模型参数
-if [ "$FREEZE_BACKBONE" = true ]; then
-    cmd="${cmd} --freeze_backbone"
+if [ "$USE_WRIST_IMAGE" = true ]; then
+    cmd="${cmd} --use_wrist_image"
 fi
-if [ "$USE_STATE" = false ]; then
-    cmd="${cmd} --no_use_state"
+if [ "$FREEZE_VISION_BACKBONE" = true ]; then
+    cmd="${cmd} --freeze_vision_backbone"
 fi
-if [ "$TRAIN_TEXT_EMBEDDING" = false ]; then
-    :
+if [ "$FREEZE_LLM_BACKBONE" = true ]; then
+    cmd="${cmd} --freeze_llm_backbone"
+fi
+if [ "$UNFREEZE_LAST_LLM_LAYER" = true ]; then
+    cmd="${cmd} --unfreeze_last_llm_layer"
 fi
 
 # Wandb 参数
@@ -421,6 +473,14 @@ fi
 # Pretrained checkpoint
 if [ -n "$PRETRAINED_CHECKPOINT" ]; then
     cmd="${cmd} --pretrained_checkpoint ${PRETRAINED_CHECKPOINT}"
+fi
+
+# Local VLM loading
+if [ -n "$LOCAL_VLM_PATH" ]; then
+    cmd="${cmd} --local_vlm_path ${LOCAL_VLM_PATH}"
+fi
+if [ -n "$HF_TOKEN" ]; then
+    cmd="${cmd} --hf_token ${HF_TOKEN}"
 fi
 
 # Resume 参数

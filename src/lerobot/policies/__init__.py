@@ -23,10 +23,12 @@ from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .lola.configuration_lola import LoLAConfig as LoLAConfig
 from .robovlm.configuration_robovlm import RoboVLMConfig as RoboVLMConfig
+from .cronusvla.configuration_cronusvla import CronusVLAConfig as CronusVLAConfig
 
 __all__ = [
     "LoLAConfig",
     "RoboVLMConfig",
+    "CronusVLAConfig",
     "ACTConfig",
     "DiffusionConfig",
     "PI0Config",

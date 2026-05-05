@@ -1,16 +1,18 @@
 """
 RoboVLMDataset: A dataset wrapper that produces data in the same format as the
-original RoboVLMs DiskCalvinDataset.collater(), matching the
-finetune_kosmos_cont-lstm-post_full-ft_text_vision_wd-0_ws-8_act-10 config.
+original RoboVLMs DiskCalvinDataset.collater().
 
 Key differences from raw LeRobotDataset:
 - Loads window_size + fwd_pred_next_n - 1 action frames (for chunking)
-- Applies normalize_action (clip [norm_min, norm_max] -> [-1, 1], preserve gripper)
-- Binarizes gripper in both action and state
+- Optionally applies normalize_action (clip [norm_min, norm_max] -> [-1, 1], preserve gripper)
+  - When skip_action_normalize=True (default), assumes data is already in the correct range
+- Binarizes gripper in actions
+- Trims last timestep from actions before unfold (matching original collater's [:-1])
 - Creates action_chunck [B, window_size, fwd_pred_next_n, 7] via .unfold()
 - Creates chunk_mask from action_is_pad
 - Tokenizes text with Kosmos template
 - Applies CLIP image transforms
+- Supports multiple camera keys (rgb_static, rgb_gripper, primary, secondary)
 """
 
 import logging
@@ -42,6 +44,18 @@ def normalize_action(action: torch.Tensor, action_min: float, action_max: float)
     return action
 
 
+def unnoramalize_action(action: torch.Tensor, action_min: float, action_max: float) -> torch.Tensor:
+    """Map [-1, 1] back to [action_min, action_max].
+
+    The last dimension (gripper) is preserved as-is, matching the original
+    `unnoramalize_action` from RoboVLMs data_utils.py.
+    """
+    last_val = action[..., -1].clone()
+    res = 0.5 * (action + 1) * (action_max - action_min) + action_min
+    res[..., -1] = last_val
+    return res
+
+
 class RoboVLMDataset(Dataset):
     """Wraps LeRobotDataset to produce data matching the original RoboVLM collater format.
 
@@ -61,7 +75,7 @@ class RoboVLMDataset(Dataset):
         self.window_size = config.window_size
         self.fwd_pred_next_n = config.fwd_pred_next_n
         self.state_dim = config.state_dim
-        self.norm_action = config.norm_action
+        self.norm_action = config.norm_action and not config.skip_action_normalize
         self.norm_min = config.norm_min
         self.norm_max = config.norm_max
         self.image_size = config.image_size
@@ -73,17 +87,17 @@ class RoboVLMDataset(Dataset):
         fps = self.meta.fps
 
         # Compute delta_timestamps:
-        # - Observations (images, state): window_size frames ending at current time
+        # - Observations (images): window_size frames ending at current time
         #   [-7/fps, -6/fps, ..., 0/fps] for window_size=8
-        # - Actions: need window_size + fwd_pred_next_n - 1 frames
-        #   because .unfold(1, fwd_pred_next_n, 1) requires T >= fwd_pred_next_n
-        #   and produces T - fwd_pred_next_n + 1 chunks = window_size
-        #   So T = window_size + fwd_pred_next_n - 1
-        #   Starting from -(window_size-1)/fps to (fwd_pred_next_n-1)/fps
+        # - Actions: need window_size + fwd_pred_next_n frames
+        #   because original collater does [:, :-1] trimming before unfold,
+        #   so we need T = window_size + fwd_pred_next_n to get window_size chunks after [:-1]
+        #   After [:-1]: T-1 = window_size + fwd_pred_next_n - 1
+        #   .unfold produces (T-1) - fwd_pred_next_n + 1 = window_size chunks
         obs_delta_indices = list(range(-self.window_size + 1, 1))
         obs_delta_ts = [i / fps for i in obs_delta_indices]
 
-        action_delta_indices = list(range(-self.window_size + 1, self.fwd_pred_next_n))
+        action_delta_indices = list(range(-self.window_size + 1, self.fwd_pred_next_n + 1))
         action_delta_ts = [i / fps for i in action_delta_indices]
 
         delta_timestamps = {}
@@ -154,23 +168,39 @@ class RoboVLMDataset(Dataset):
             images = self._transform_images(images)
         rgb = images  # [window_size, C, H, W]
 
-        # --- State ---
-        # [window_size, state_dim] — take first state_dim=7 dims, binarize gripper
-        state = item["observation.state"][:, :self.state_dim]  # [T, state_dim]
-        # Binarize gripper (last dim): threshold at 0 — values >0 -> 1, <=0 -> 0
-        # Raw gripper from dataset is typically {-1, 1}, so this maps to {0, 1}
-        state[..., -1] = (state[..., -1] > 0).float()
+        # --- Hand camera (rgb_gripper) ---
+        hand_rgb = None
+        if self.config.use_hand_rgb and len(self.meta.camera_keys) > 1:
+            # Find the gripper/hand camera key
+            hand_key = None
+            for key in self.meta.camera_keys:
+                if key != self.camera_key:
+                    hand_key = key
+                    break
+            if hand_key is not None:
+                hand_images = item[hand_key]  # [T, C, H, W]
+                if isinstance(hand_images, torch.Tensor):
+                    hand_images = self._transform_images(hand_images)
+                hand_rgb = hand_images
 
         # --- Actions ---
-        # [window_size + fwd_pred_next_n - 1, action_dim]
+        # [window_size + fwd_pred_next_n, action_dim]
+        # Note: we load window_size + fwd_pred_next_n frames (one more than before)
+        # because the original collater does [:, :-1] trimming before unfold
         actions = item["action"][:, :self.config.action_dim].clone()
 
-        # Trim to window_size + fwd_pred_next_n - 1 if we got more
-        needed_len = self.window_size + self.fwd_pred_next_n - 1
+        # Trim to window_size + fwd_pred_next_n if we got more
+        needed_len = self.window_size + self.fwd_pred_next_n
         if actions.shape[0] > needed_len:
             actions = actions[:needed_len]
 
+        # Original collater does [:, :-1] trimming before unfold — remove last timestep
+        if actions.shape[0] > 1:
+            actions = actions[:-1]
+
         # Normalize arm actions to [-1, 1] (preserve gripper)
+        # Only apply when data is in the original physical range (e.g. [-0.65, 0.65])
+        # Skip when data is already in [-1, 1] (lerobot pre-normalized) or in original range
         if self.norm_action:
             actions = normalize_action(actions, self.norm_min, self.norm_max)
 
@@ -204,6 +234,11 @@ class RoboVLMDataset(Dataset):
                 pad_size = needed_len - action_is_pad.shape[0]
                 action_is_pad = torch.cat([action_is_pad, torch.ones(pad_size, dtype=torch.bool)])
             action_is_pad = action_is_pad[:needed_len]
+
+            # Same [: -1] trimming as actions
+            if action_is_pad.shape[0] > 1:
+                action_is_pad = action_is_pad[:-1]
+
             # unfold same as actions
             if action_is_pad.shape[0] >= self.fwd_pred_next_n:
                 chunk_mask = action_is_pad.unfold(0, self.fwd_pred_next_n, 1)
@@ -221,13 +256,18 @@ class RoboVLMDataset(Dataset):
         if isinstance(task, list):
             task = task[0] if len(task) > 0 else ""
 
-        return {
+        result = {
             "rgb": rgb,                                    # [window_size, C, H, W]
-            "rel_state": state,                            # [window_size, state_dim]
             "action_chunck": action_chunck,                # [window_size, fwd_pred_next_n, 7]
             "chunck_mask": chunk_mask,                     # [window_size, fwd_pred_next_n]
             "task": task,                                  # str
         }
+
+        # Add hand camera if available
+        if hand_rgb is not None:
+            result["hand_rgb"] = hand_rgb                  # [window_size, C, H, W]
+
+        return result
 
     def collater(self, samples: list[dict]) -> dict[str, Any]:
         """Collate function that tokenizes text and stacks all tensors.
@@ -240,9 +280,12 @@ class RoboVLMDataset(Dataset):
 
         # Stack tensor fields
         batch["rgb"] = torch.stack([s["rgb"] for s in samples])                   # [B, ws, C, H, W]
-        batch["rel_state"] = torch.stack([s["rel_state"] for s in samples])       # [B, ws, state_dim]
         batch["action_chunck"] = torch.stack([s["action_chunck"] for s in samples])  # [B, ws, fwd, 7]
         batch["chunck_mask"] = torch.stack([s["chunck_mask"] for s in samples])   # [B, ws, fwd]
+
+        # Hand camera (rgb_gripper)
+        if "hand_rgb" in samples[0]:
+            batch["hand_rgb"] = torch.stack([s["hand_rgb"] for s in samples])     # [B, ws, C, H, W]
 
         # Tokenize text
         tasks = [s["task"] for s in samples]

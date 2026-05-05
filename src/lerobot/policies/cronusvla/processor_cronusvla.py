@@ -1,17 +1,13 @@
 import logging
 from typing import Any
 
-import torch
-
-from lerobot.policies.robovlm.configuration_robovlm import RoboVLMConfig
+from lerobot.policies.cronusvla.configuration_cronusvla import CronusVLAConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
-    ObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
-    ProcessorStepRegistry,
     RenameObservationsProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
@@ -23,20 +19,19 @@ from lerobot.utils.constants import (
 logger = logging.getLogger(__name__)
 
 
-def make_robovlm_pre_post_processors(
-    config: RoboVLMConfig,
-    dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+def make_cronusvla_pre_post_processors(
+    config: CronusVLAConfig,
+    dataset_stats: dict[str, dict[str, Any]] | None = None,
     camera_keys: list[str] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Construct pre/post processor pipelines for the RoboVLM policy.
+    """Construct pre/post processor pipelines for the CronusVLA policy.
 
-    Since RoboVLMDataset handles all normalization and gripper binarization
-    during training, and predict_action_chunk handles inverse normalization
-    and gripper decoding during inference, the processors only handle device
-    placement and batch dimension.
+    Since CronusVLADataset handles all normalization and preprocessing,
+    the preprocessor only handles device placement and batch dimension.
+    The postprocessor handles device placement only.
     """
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),

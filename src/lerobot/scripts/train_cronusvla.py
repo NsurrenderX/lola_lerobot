@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 """
-RoboVLM 分布式微调脚本
+CronusVLA 分布式微调脚本
 
-使用 RoboVLMDataset 加载 lerobot 3.0 格式数据集，适配 RoboVLM (Kosmos-2 + LSTMDecoder) 模型。
+使用 CronusVLADataset 加载 lerobot 3.0 格式数据集，适配 CronusVLA (PrismaticVLM + DiT Diffusion) 模型。
 适用于小规模微调场景，无需流式数据集。
 
 使用方法:
     # 单 GPU
-    python src/lerobot/scripts/train_robovlm.py \
+    python src/lerobot/scripts/train_cronusvla.py \
         --dataset_repo_id <repo_id> --dataset_root <path>
 
     # 多 GPU (torchrun)
-    torchrun --nproc_per_node=4 src/lerobot/scripts/train_robovlm.py \
+    torchrun --nproc_per_node=4 src/lerobot/scripts/train_cronusvla.py \
         --dataset_repo_id <repo_id> --strategy ddp
 
     # 多节点 (torchrun)
     torchrun --nnodes=2 --nproc_per_node=4 --rdzv_id=100 --rdzv_endpoint=MASTER_ADDR:MASTER_PORT \
-        src/lerobot/scripts/train_robovlm.py \
+        src/lerobot/scripts/train_cronusvla.py \
         --dataset_repo_id <repo_id> --strategy ddp
 """
 
@@ -44,9 +44,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.robovlm_dataset import RoboVLMDataset
+from lerobot.datasets.cronusvla_dataset import CronusVLADataset
 from lerobot.datasets.utils import dataset_to_policy_features
-from lerobot.policies.robovlm import RoboVLMConfig, RoboVLMPolicy
+from lerobot.policies.cronusvla import CronusVLAConfig, CronusVLAPolicy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,10 +102,10 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-class RoboVLMTrainer:
+class CronusVLATrainer:
     def __init__(
         self,
-        config: RoboVLMConfig,
+        config: CronusVLAConfig,
         dist_info: dict,
         learning_rate: float = 2e-5,
         weight_decay: float = 0.0,
@@ -158,15 +158,15 @@ class RoboVLMTrainer:
         self.best_loss = float("inf")
 
     def setup_model(self, pretrained_checkpoint=None):
-        """Instantiate RoboVLM policy and apply DDP/FSDP wrapping."""
+        """Instantiate CronusVLA policy and apply DDP/FSDP wrapping."""
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-        _log(f"Loading RoboVLM Policy on {self.device}...")
-        self.policy = RoboVLMPolicy(self.config)
+        _log(f"Loading CronusVLA Policy on {self.device}...")
+        self.policy = CronusVLAPolicy(self.config)
         self.policy.model = self.policy.model.to(self.device)
 
-        # Load pretrained weights (partial load — missing keys stay randomly initialized)
+        # Load pretrained weights (partial load -- missing keys stay randomly initialized)
         if pretrained_checkpoint is not None:
             _log(f"Loading pretrained checkpoint: {pretrained_checkpoint}")
             ckpt = torch.load(pretrained_checkpoint, map_location=self.device)
@@ -212,22 +212,6 @@ class RoboVLMTrainer:
         _log("Setting up FSDP...")
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, BackwardPrefetch
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-
-        # Kosmos-2 specific layer classes for FSDP wrapping
-        try:
-            from transformers.models.kosmos2.modeling_kosmos2 import (
-                Kosmos2DecoderLayer,
-                Kosmos2VisionEncoder,
-            )
-            wrap_classes = {Kosmos2DecoderLayer, Kosmos2VisionEncoder, LSTMDecoder}
-        except ImportError:
-            _log("Warning: Kosmos-2 layer classes not found for FSDP wrapping")
-            from lerobot.policies.robovlm.modeling_robovlm import LSTMDecoder
-            wrap_classes = {LSTMDecoder}
-
-        from lerobot.policies.robovlm.modeling_robovlm import LSTMDecoder
-        wrap_classes.add(LSTMDecoder)
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -235,10 +219,8 @@ class RoboVLMTrainer:
             buffer_dtype=torch.bfloat16,
         )
 
-        auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
-            module, recurse, nonwrapped_numel,
-            transformer_layer_cls=wrap_classes,
-        )
+        # Use CronusVLA's own FSDP wrapping policy (covers PrismaticVLM + DiT)
+        auto_wrap_policy = self.policy.model.get_fsdp_wrapping_policy()
 
         sharding_strategy = (
             ShardingStrategy.FULL_SHARD if self.fsdp_sharding == "full_shard"
@@ -256,7 +238,7 @@ class RoboVLMTrainer:
         )
 
     def setup_optimizer(self):
-        """Create optimizer and LR scheduler (matching original RoboVLM)."""
+        """Create optimizer and LR scheduler."""
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
@@ -277,14 +259,17 @@ class RoboVLMTrainer:
                 num_training_steps=self.max_steps,
             )
         else:
-            # Default: "constant" — warmup then flat LR (matches original RoboVLM)
+            # Default: "constant" -- warmup then flat LR
             self.scheduler = get_constant_schedule_with_warmup(
                 self.optimizer,
                 num_warmup_steps=warmup_steps,
             )
 
     def training_step(self, batch):
-        """Single training step — data already preprocessed by RoboVLMDataset."""
+        """Single training step -- data already preprocessed by CronusVLADataset.
+
+        CronusVLA computes diffusion loss from VLM cognition features + action targets.
+        """
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -307,13 +292,13 @@ class RoboVLMTrainer:
             raise ValueError("Must specify either --max_steps or --max_epochs")
 
         time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        ckpt_dir = os.path.join(self.ckpt_dir, f"robovlm-{time_str}")
+        ckpt_dir = os.path.join(self.ckpt_dir, f"cronusvla-{time_str}")
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             _log(f"Checkpoint directory: {ckpt_dir}")
 
         if self.use_wandb:
-            wandb_run_name = self.wandb_name or f"robovlm-{self.strategy}-{time_str}"
+            wandb_run_name = self.wandb_name or f"cronusvla-{self.strategy}-{time_str}"
             wandb.init(
                 project=self.wandb_project,
                 name=wandb_run_name,
@@ -326,6 +311,9 @@ class RoboVLMTrainer:
                     "batch_size": train_loader.batch_size,
                     "strategy": self.strategy,
                     "world_size": self.world_size,
+                    "vlm_base": self.config.vlm_base,
+                    "action_model_type": self.config.action_model_type,
+                    "repeated_diffusion_steps": self.config.repeated_diffusion_steps,
                 },
             )
 
@@ -494,7 +482,7 @@ class RoboVLMTrainer:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RoboVLM Fine-tuning")
+    parser = argparse.ArgumentParser(description="CronusVLA Fine-tuning")
 
     # Dataset
     parser.add_argument("--dataset_repo_id", type=str, default=None, help="LeRobot dataset repo ID")
@@ -509,26 +497,44 @@ def parse_args():
     train_mode.add_argument("--max_epochs", type=int, default=None, help="Max training epochs (epoch-based mode)")
     parser.add_argument("--num_workers", type=int, default=8)
 
-    # Model overrides
-    parser.add_argument("--vlm_pretrained_path", type=str, default="/data_16T/deepseek/kosmos-2-patch14-224/")
-    parser.add_argument("--freeze_backbone", action="store_true", default=False)
-    parser.add_argument("--train_vision", action="store_true", default=True)
-    parser.add_argument("--train_text_embedding", action="store_true", default=True)
-    parser.add_argument("--window_size", type=int, default=16)
-    parser.add_argument("--fwd_pred_next_n", type=int, default=10)
-    parser.add_argument("--use_state", action="store_true", default=False,
-                        help="Use state (robot proprioception) as input. Default False "
-                             "(matching original CALVIN fine-tuning). Pass --use_state to enable.")
-    parser.add_argument("--use_hand_rgb", action="store_true", default=True,
-                        help="Use hand/gripper camera. Default True (matching ws-16 config).")
-    parser.add_argument("--no_use_hand_rgb", action="store_true", default=False,
-                        help="Disable hand/gripper camera")
-    parser.add_argument("--skip_action_normalize", action="store_true", default=True,
-                        help="Skip normalize_action when data is already in correct range (default True)")
-    parser.add_argument("--no_skip_action_normalize", action="store_true", default=False,
-                        help="Apply normalize_action even if data might already be normalized")
+    # CronusVLA-specific model args
+    parser.add_argument("--vlm_base", type=str, default="prism-dinosiglip-224px+7b",
+                        help="PrismaticVLM base model identifier (resolved via prismatic model registry)")
+    parser.add_argument("--action_model_type", type=str, default="DiT-B",
+                        choices=["DiT-S", "DiT-B", "DiT-L"],
+                        help="DiT diffusion action decoder model size")
+    parser.add_argument("--repeated_diffusion_steps", type=int, default=4,
+                        help="Number of diffusion step repeats per training batch for variance reduction")
+    parser.add_argument("--future_action_window_size", type=int, default=15,
+                        help="Number of future action steps to predict")
+    parser.add_argument("--past_action_window_size", type=int, default=0,
+                        help="Number of past action steps for temporal context")
+    parser.add_argument("--cfg_scale", type=float, default=1.5,
+                        help="Classifier-free guidance scale for inference")
+    parser.add_argument("--use_ddim", action="store_true", default=False,
+                        help="Use DDIM sampling for inference instead of DDPM")
+    parser.add_argument("--view_sequence_len", type=int, default=1,
+                        help="Number of views per timestep (1=primary only, 2=primary+wrist)")
+    parser.add_argument("--use_wrist_image", action="store_true", default=False,
+                        help="Use wrist camera images alongside primary camera")
+    parser.add_argument("--freeze_vision_backbone", action="store_true", default=True,
+                        help="Freeze VLM vision backbone during training")
+    parser.add_argument("--no_freeze_vision_backbone", action="store_true", default=False,
+                        help="Unfreeze VLM vision backbone (full finetune)")
+    parser.add_argument("--freeze_llm_backbone", action="store_true", default=True,
+                        help="Freeze VLM LLM backbone during training")
+    parser.add_argument("--no_freeze_llm_backbone", action="store_true", default=False,
+                        help="Unfreeze VLM LLM backbone (full finetune)")
+    parser.add_argument("--unfreeze_last_llm_layer", action="store_true", default=False,
+                        help="Unfreeze the last LLM decoder layer for finetune")
+    parser.add_argument("--action_dim", type=int, default=7,
+                        help="Action dimensionality")
+    parser.add_argument("--hidden_size", type=int, default=4096,
+                        help="VLM hidden size (must match LLM lm_head.in_features)")
+    parser.add_argument("--diffusion_steps", type=int, default=100,
+                        help="Number of diffusion steps for noise schedule")
     parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"],
-                        help="LR scheduler type: 'constant' (warmup then flat, matches original) or 'cosine' (warmup then cosine decay)")
+                        help="LR scheduler type: 'constant' (warmup then flat) or 'cosine' (warmup then cosine decay)")
     parser.add_argument("--scheduler_warmup_steps", type=int, default=250)
 
     # Distributed
@@ -542,13 +548,19 @@ def parse_args():
     parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs (epoch-based mode)")
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--pretrained_checkpoint", type=str, default=None,
-                        help="Path to converted pretrained RoboVLM checkpoint (.pt). "
-                             "Missing keys (e.g. embed_state) stay randomly initialized. "
-                             "Use convert_robovlm_checkpoint.py first to convert original DeepSpeed checkpoints.")
+                        help="Path to pretrained CronusVLA checkpoint (.pt). "
+                             "Missing keys stay randomly initialized.")
+    parser.add_argument("--local_vlm_path", type=str, default=None,
+                        help="Path to local .pt checkpoint for VLM weights. When set, builds VLM in "
+                             "inference_mode (no HF Hub LLM download) and loads weights from file. "
+                             "Format: {'model': {'vision_backbone': ..., 'llm_backbone': ..., "
+                             "'projector': ..., 'action_model': ...}}")
+    parser.add_argument("--hf_token", type=str, default=None,
+                        help="HuggingFace API token for gated models (e.g., Llama-2-7b-hf)")
     parser.add_argument("--resume", type=str, default=None)
 
     # Wandb
-    parser.add_argument("--wandb_project", type=str, default="robovlm")
+    parser.add_argument("--wandb_project", type=str, default="cronusvla")
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--disable_wandb", action="store_true", default=False)
@@ -560,27 +572,37 @@ def main():
     args = parse_args()
     dist_info = setup_distributed()
 
+    # Resolve freeze flags (handle --no_freeze_* overrides)
+    freeze_vision = not args.no_freeze_vision_backbone if args.no_freeze_vision_backbone else args.freeze_vision_backbone
+    freeze_llm = not args.no_freeze_llm_backbone if args.no_freeze_llm_backbone else args.freeze_llm_backbone
+
     # Build config
-    use_state = args.use_state and not args.no_use_state if hasattr(args, 'no_use_state') else args.use_state
-    use_hand_rgb = not args.no_use_hand_rgb if args.no_use_hand_rgb else args.use_hand_rgb
-    skip_action_normalize = not args.no_skip_action_normalize if args.no_skip_action_normalize else args.skip_action_normalize
-    config = RoboVLMConfig(
-        vlm_pretrained_path=args.vlm_pretrained_path,
-        freeze_backbone=args.freeze_backbone,
-        train_vision=args.train_vision,
-        train_text_embedding=args.train_text_embedding,
-        use_state=use_state,
-        use_hand_rgb=use_hand_rgb,
-        skip_action_normalize=skip_action_normalize,
-        window_size=args.window_size,
-        fwd_pred_next_n=args.fwd_pred_next_n,
+    config = CronusVLAConfig(
+        vlm_base=args.vlm_base,
+        action_model_type=args.action_model_type,
+        repeated_diffusion_steps=args.repeated_diffusion_steps,
+        future_action_window_size=args.future_action_window_size,
+        past_action_window_size=args.past_action_window_size,
+        cfg_scale=args.cfg_scale,
+        use_ddim=args.use_ddim,
+        view_sequence_len=args.view_sequence_len,
+        use_wrist_image=args.use_wrist_image,
+        freeze_vision_backbone=freeze_vision,
+        freeze_llm_backbone=freeze_llm,
+        unfreeze_last_llm_layer=args.unfreeze_last_llm_layer,
+        action_dim=args.action_dim,
+        hidden_size=args.hidden_size,
+        diffusion_steps=args.diffusion_steps,
         optimizer_lr=args.learning_rate,
+        optimizer_weight_decay=args.weight_decay,
         scheduler_type=args.scheduler,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
+        local_vlm_path=args.local_vlm_path,
+        hf_token=args.hf_token,
     )
 
-    # Setup model first (need tokenizer for dataset)
-    trainer = RoboVLMTrainer(
+    # Setup model first (need tokenizer + image_transform from VLM for dataset)
+    trainer = CronusVLATrainer(
         config=config,
         dist_info=dist_info,
         learning_rate=args.learning_rate,
@@ -604,13 +626,17 @@ def main():
 
     trainer.setup_model(pretrained_checkpoint=args.pretrained_checkpoint)
 
-    # Create RoboVLMDataset with tokenizer from the model
-    tokenizer = trainer.policy.model.tokenizer
-    train_dataset = RoboVLMDataset(
+    # Extract tokenizer and image_transform from the PrismaticVLM inside CronusVLAModel
+    tokenizer = trainer.policy.model.vlm.llm_backbone.tokenizer
+    image_transform = trainer.policy.model.vlm.vision_backbone.image_transform
+
+    # Create CronusVLADataset with tokenizer and image_transform from the model
+    train_dataset = CronusVLADataset(
         repo_id=args.dataset_repo_id,
         config=config,
         root=args.dataset_root,
         tokenizer=tokenizer,
+        image_transform=image_transform,
     )
 
     # Setup dataset features in config (needed by PreTrainedPolicy)
@@ -621,6 +647,23 @@ def main():
     if not config.input_features:
         config.input_features = {k: ft for k, ft in features.items() if k not in config.output_features}
     config.validate_features()
+
+    # Set norm_stats on the CronusVLA model from dataset metadata
+    # CronusVLA uses quantile-based (BOUNDS_Q99) normalization for actions
+    # Build norm_stats dict from dataset metadata stats
+    norm_stats = {}
+    repo_id_key = args.dataset_repo_id
+    if dataset_metadata.stats is not None and "action" in dataset_metadata.stats:
+        action_stats = dataset_metadata.stats["action"]
+        norm_stats[repo_id_key] = {
+            "action": {
+                "q01": action_stats.get("q01", [0] * config.action_dim),
+                "q99": action_stats.get("q99", [1] * config.action_dim),
+                "mask": [True] * config.action_dim,
+            }
+        }
+    trainer.policy.model.norm_stats = norm_stats
+    _log(f"Set norm_stats on model from dataset metadata (key: {repo_id_key})")
 
     # Create DataLoader with custom collater
     sampler = None
@@ -659,6 +702,4 @@ def main():
 
 
 if __name__ == "__main__":
-    os.environ['WANDB_API_KEY'] = "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"
-    
     main()

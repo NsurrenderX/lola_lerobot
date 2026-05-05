@@ -3,70 +3,67 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
-from lerobot.utils.constants import OBS_IMAGES
 
 
-@PreTrainedConfig.register_subclass("robovlm")
+@PreTrainedConfig.register_subclass("cronusvla")
 @dataclass
-class RoboVLMConfig(PreTrainedConfig):
+class CronusVLAConfig(PreTrainedConfig):
     # ==========================
-    # 1. VLM Settings
+    # 1. VLM Settings (loaded via prismatic package from CronusVLA repo)
     # ==========================
-    vlm_pretrained_path: str = ".vlms/kosmos-2-patch14-224"
-    vlm_model_type: str = "AutoModelForImageTextToText"
+    vlm_base: str = "prism-dinosiglip-224px+7b"
+    vlm_arch_specifier: str = "fused-gelu-mlp"  # "gelu-mlp", "fused-gelu-mlp", or "linear"
+    view_sequence_len: int = 1  # 1=primary only, 2=primary+wrist
+    use_wrist_image: bool = False
+    local_vlm_path: str | None = None  # Path to local .pt checkpoint; avoids HF Hub download
+    hf_token: str | None = None  # HF API token for gated models (e.g., Llama-2-7b-hf)
 
     # ==========================
-    # 2. Image Settings
+    # 4. Image Settings
     # ==========================
     image_size: int = 224
-    image_mean: tuple = (0.48145466, 0.4578275, 0.40821073)
-    image_std: tuple = (0.26862954, 0.26130258, 0.27577711)
 
     # ==========================
-    # 3. VLM Hidden Size (must match backbone text embed_dim)
+    # 5. VLM Hidden Size (must match LLM lm_head.in_features)
     # ==========================
-    hidden_size: int = 2048
+    hidden_size: int = 4096  # 4096 for Llama-2-7B, 896 for Qwen2.5-0.5B
 
     # ==========================
-    # 4. Observation / Action
+    # 6. DiT Diffusion Decoder Settings
     # ==========================
-    window_size: int = 16
-    fwd_pred_next_n: int = 10
+    action_model_type: str = "DiT-B"  # "DiT-S", "DiT-B", "DiT-L"
+    diffusion_steps: int = 100
+    noise_schedule: str = "squaredcos_cap_v2"
+    class_dropout_prob: float = 0.1
+    extend_num: int = 6
+
+    # ==========================
+    # 7. Action / Temporal Settings
+    # ==========================
     action_dim: int = 7
-    history_type: str = "post"
+    future_action_window_size: int = 15
+    past_action_window_size: int = 0
 
     # ==========================
-    # 5. State Settings
+    # 8. Training Settings
     # ==========================
-    use_state: bool = False
-    state_dim: int = 7
-
-    # ==========================
-    # 6. LSTM Head Settings
-    # ==========================
-    lstm_hidden_size: int = 1024
-    lstm_num_layers: int = 4
-    lstm_dropout_p: float = 0.0
-    lstm_down_sample: str = "none"
-    lstm_latent: int = 1
-
-    # ==========================
-    # 7. Loss Settings
-    # ==========================
-    arm_gripper_loss_ratio: float = 0.01
-
-    # ==========================
-    # 8. Training Setup
-    # ==========================
-    freeze_backbone: bool = False
-    train_vision: bool = True
-    train_text_embedding: bool = True
-    gradient_checkpointing: bool = False
+    repeated_diffusion_steps: int = 4
+    freeze_vision_backbone: bool = True
+    freeze_llm_backbone: bool = True
+    unfreeze_last_llm_layer: bool = False
+    gradient_checkpointing: bool = True
     dtype: str = "bfloat16"
     device: str | None = None
 
     # ==========================
-    # 9. Normalization
+    # 9. Inference Settings
+    # ==========================
+    cfg_scale: float = 1.5
+    use_ddim: bool = False
+    num_ddim_steps: int = 5
+
+    # ==========================
+    # 10. Normalization
     # ==========================
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -75,27 +72,15 @@ class RoboVLMConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.IDENTITY,
         }
     )
+    norm_type: str = "BOUNDS_Q99"
 
     # ==========================
-    # 9b. Action Normalization (matching original RoboVLM)
-    # ==========================
-    norm_action: bool = True
-    norm_min: float = -0.65
-    norm_max: float = 0.65
-    skip_action_normalize: bool = True  # Skip normalize_action when data is already in correct range
-
-    # ==========================
-    # 9c. Hand Camera
-    # ==========================
-    use_hand_rgb: bool = True
-
-    # ==========================
-    # 9c. Text Tokenizer
+    # 11. Text Tokenizer
     # ==========================
     max_text_len: int = 256
 
     # ==========================
-    # 10. Optimizer Settings
+    # 12. Optimizer Settings
     # ==========================
     optimizer_lr: float = 2e-5
     optimizer_weight_decay: float = 0.0
@@ -104,24 +89,17 @@ class RoboVLMConfig(PreTrainedConfig):
     optimizer_grad_clip_norm: float = 1.0
 
     # ==========================
-    # 11. Scheduler Settings
+    # 13. Scheduler Settings
     # ==========================
-    scheduler_type: str = "constant"  # "constant" (warmup then flat) or "cosine" (warmup then cosine decay)
+    scheduler_type: str = "constant"
     scheduler_warmup_steps: int = 250
 
     def __post_init__(self):
         super().__post_init__()
-
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
     def validate_features(self) -> None:
-        if "observation.state" not in self.input_features:
-            self.input_features["observation.state"] = PolicyFeature(
-                type=FeatureType.STATE,
-                shape=(self.state_dim,),
-            )
-
         if "action" not in self.output_features:
             self.output_features["action"] = PolicyFeature(
                 type=FeatureType.ACTION,
@@ -138,17 +116,16 @@ class RoboVLMConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
-        # Scheduler is constructed directly in train_robovlm.py
-        # using scheduler_type and scheduler_warmup_steps from this config.
+        # Scheduler is constructed directly in train_cronusvla.py
         return None
 
     @property
     def observation_delta_indices(self) -> list:
-        return list(range(-self.window_size + 1, 1))
+        return list(range(-self.past_action_window_size, 1))
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.fwd_pred_next_n))
+        return list(range(self.future_action_window_size + 1))
 
     @property
     def reward_delta_indices(self) -> None:

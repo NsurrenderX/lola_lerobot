@@ -389,6 +389,7 @@ class RoboVLMModel(nn.Module):
         action_labels=None,
         action_mask=None,
         rel_state=None,
+        vision_gripper=None,
         mode="train",
     ):
         bs, seq_len = vision_x.shape[:2]
@@ -399,6 +400,8 @@ class RoboVLMModel(nn.Module):
 
         if history_type in ["post", "pre"]:
             vision_x = vision_x.reshape(bs * seq_len, *vision_x.shape[2:]).unsqueeze(1)
+            if vision_gripper is not None:
+                vision_gripper = vision_gripper.reshape(bs * seq_len, *vision_gripper.shape[2:]).unsqueeze(1)
             lang_x = lang_x.unsqueeze(1).repeat(1, seq_len, 1).flatten(0, 1)
             attention_mask = (
                 attention_mask.unsqueeze(1).repeat(1, seq_len, 1).flatten(0, 1)
@@ -418,6 +421,20 @@ class RoboVLMModel(nn.Module):
             attention_mask=attention_mask,
             insert_idx=bos_offset,
         )
+
+        if vision_gripper is not None:
+            (
+                multimodal_embeds,
+                multimodal_labels,
+                multimodal_attention_mask,
+                _,
+            ) = self.merge_multi_modal_input(
+                multimodal_embeds,
+                vision_gripper,
+                multimodal_labels,
+                multimodal_attention_mask,
+                insert_idx=bos_offset,
+            )
 
         # Insert state tokens
         if rel_state is not None and self.use_state:
@@ -557,31 +574,32 @@ class RoboVLMPolicy(PreTrainedPolicy):
 
         Expected batch keys:
           - rgb: [B, window_size, C, H, W] (already CLIP-normalized)
+          - hand_rgb: [B, window_size, C, H, W] (optional, gripper camera)
           - language: [B, text_len] (already tokenized)
           - text_mask: [B, text_len] (attention mask)
-          - rel_state: [B, window_size, state_dim] (gripper already binarized)
           - action_chunck: [B, window_size, fwd_pred_next_n, action_dim] (gripper already binarized)
           - chunck_mask: [B, window_size, fwd_pred_next_n] (True=valid)
         """
         vision_x = batch["rgb"]
+        vision_gripper = batch.get("hand_rgb", None)
         lang_x = batch["language"]
         attention_mask = batch["text_mask"]
-        rel_state = batch.get("rel_state", None)
         action_chunck = batch.get("action_chunck", None)
         chunk_mask = batch.get("chunck_mask", None)
 
-        return vision_x, lang_x, attention_mask, action_chunck, chunk_mask, rel_state
+        return vision_x, vision_gripper, lang_x, attention_mask, action_chunck, chunk_mask
 
     def forward(self, batch: dict[str, Any]) -> Tuple[torch.Tensor, dict | None]:
         config = self.config
-        vision_x, lang_x, attention_mask, action_chunck, chunk_mask, rel_state = self._prepare_inputs(batch)
+        vision_x, vision_gripper, lang_x, attention_mask, action_chunck, chunk_mask = self._prepare_inputs(batch)
 
         with torch.amp.autocast("cuda", dtype=self._dtype):
             pred_actions, pred_gripper, _ = self.model.forward_continuous(
                 vision_x=vision_x.to(self._dtype),
+                vision_gripper=vision_gripper.to(self._dtype) if vision_gripper is not None else None,
                 lang_x=lang_x.to(self.model.word_embedding.weight.device),
                 attention_mask=attention_mask.to(self.model.word_embedding.weight.device),
-                rel_state=rel_state.to(self._dtype) if rel_state is not None else None,
+                rel_state=None,
                 mode="train",
             )
 
@@ -637,14 +655,18 @@ class RoboVLMPolicy(PreTrainedPolicy):
         return total_loss, loss_dict
 
     def predict_action_chunk(self, batch: dict[str, Any], **kwargs) -> torch.Tensor:
-        vision_x, lang_x, attention_mask, _, _, rel_state = self._prepare_inputs(batch)
+        from lerobot.datasets.robovlm_dataset import unnoramalize_action
+
+        config = self.config
+        vision_x, vision_gripper, lang_x, attention_mask, _, _ = self._prepare_inputs(batch)
 
         with torch.amp.autocast("cuda", dtype=self._dtype):
             pred_actions, pred_gripper = self.model.forward_continuous(
                 vision_x=vision_x.to(self._dtype),
+                vision_gripper=vision_gripper.to(self._dtype) if vision_gripper is not None else None,
                 lang_x=lang_x.to(self.model.word_embedding.weight.device),
                 attention_mask=attention_mask.to(self.model.word_embedding.weight.device),
-                rel_state=rel_state.to(self._dtype) if rel_state is not None else None,
+                rel_state=None,
                 mode="inference",
             )
 
@@ -652,10 +674,17 @@ class RoboVLMPolicy(PreTrainedPolicy):
         pred_full = torch.cat([pred_actions, pred_gripper], dim=-1)
 
         # Take last timestep's prediction -> [B, fwd_pred_next_n, action_dim]
-        pred_chunk = pred_full[:, -1, :, :]
+        pred_chunk = pred_full[:, -1, :, :].float()
 
-        # Convert gripper from logits to probability, then to [-1, 1]
-        pred_chunk[..., -1] = 2 * F.sigmoid(pred_chunk[..., -1]) - 1
+        # Decode predictions following original RoboVLM inference pipeline:
+        # 1. Binarize gripper: (sigmoid > 0.5) -> {0, 1}
+        pred_chunk[..., -1] = (F.sigmoid(pred_chunk[..., -1]) > 0.5).float()
+        # 2. Unnormalize: [-1, 1] -> [norm_min, norm_max] for arm, preserve binarized gripper
+        pred_chunk = unnoramalize_action(pred_chunk, config.norm_min, config.norm_max)
+        # 3. Rescale gripper: {0, 1} -> {-1, 1}
+        pred_chunk[..., -1] = (pred_chunk[..., -1] - 0.5) * 2
+        # 4. Final threshold: ensure exactly {-1, 1}
+        pred_chunk[..., -1] = torch.where(pred_chunk[..., -1] > 0, torch.tensor(1.0), torch.tensor(-1.0))
 
         return pred_chunk
 

@@ -33,6 +33,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.lola.configuration_lola import LoLAConfig
 from lerobot.policies.robovlm.configuration_robovlm import RoboVLMConfig
+from lerobot.policies.cronusvla.configuration_cronusvla import CronusVLAConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -117,6 +118,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.robovlm.modeling_robovlm import RoboVLMPolicy
 
         return RoboVLMPolicy
+    elif name == "cronusvla":
+        from lerobot.policies.cronusvla.modeling_cronusvla import CronusVLAPolicy
+
+        return CronusVLAPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -164,6 +169,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return LoLAConfig(**kwargs)
     elif policy_type == "robovlm":
         return RoboVLMConfig(**kwargs)
+    elif policy_type == "cronusvla":
+        return CronusVLAConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
@@ -356,6 +363,14 @@ def make_pre_post_processors(
         from lerobot.policies.robovlm.processor_robovlm import make_robovlm_pre_post_processors
 
         processors = make_robovlm_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, CronusVLAConfig):
+        from lerobot.policies.cronusvla.processor_cronusvla import make_cronusvla_pre_post_processors
+
+        processors = make_cronusvla_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
