@@ -61,6 +61,12 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+try:
+    import pynvml
+    HAS_NVML = True
+except ImportError:
+    HAS_NVML = False
+
 # 设置环境变量
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
@@ -82,6 +88,12 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _log(msg: str):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rank = os.environ.get("RANK", "0")
+    print(f"[{ts}] [Rank {rank}] {msg}", flush=True)
 
 
 def setup_distributed():
@@ -118,10 +130,10 @@ def setup_distributed():
             rank=world_rank,
         )
 
-        logger.info(f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, "
+        _log(f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, "
                     f"world_size={world_size}, master={master_uri}")
     else:
-        logger.info(f"Single GPU mode: local_rank={local_rank}")
+        _log(f"Single GPU mode: local_rank={local_rank}")
     
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
@@ -139,6 +151,181 @@ def cleanup_distributed():
     """清理分布式环境"""
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+class InterconnectMonitor:
+    """Monitor NVLink, PCIe, and InfiniBand throughput via NVML and sysfs."""
+
+    def __init__(self, device: torch.device):
+        self.available = HAS_NVML
+        if not self.available:
+            return
+
+        self.gpu_index = device.index or 0
+        try:
+            pynvml.nvmlInit()
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+        except Exception as e:
+            _log(f"InterconnectMonitor: NVML init failed ({e}), skipping")
+            self.available = False
+            return
+
+        # Detect NVLink capability
+        self._nvlink_supported = True
+        self._active_nvlink_links = []
+        for link in range(pynvml.NVML_NVLINK_MAX_LINKS):
+            try:
+                state = pynvml.nvmlDeviceGetNvLinkState(self.handle, link)
+                if state == pynvml.NVML_NVLINK_STATE_ACTIVE:
+                    self._active_nvlink_links.append(link)
+            except pynvml.NVMLError:
+                pass
+
+        # Pre-check NVLink byte counter fields
+        if self._active_nvlink_links:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_RCV_BYTES,
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_XMIT_BYTES,
+                ])
+                if any(v.nvmlReturn != 0 for v in vals):
+                    self._nvlink_supported = False
+            except Exception:
+                self._nvlink_supported = False
+        else:
+            self._nvlink_supported = False
+
+        # Pre-check PCIe byte counter fields
+        self._pcie_supported = True
+        try:
+            vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                pynvml.NVML_FI_DEV_PCIE_COUNT_RX_BYTES,
+                pynvml.NVML_FI_DEV_PCIE_COUNT_TX_BYTES,
+            ])
+            if any(v.nvmlReturn != 0 for v in vals):
+                self._pcie_supported = False
+        except Exception:
+            self._pcie_supported = False
+
+        # Discover IB devices from sysfs
+        self._ib_supported = True
+        self._ib_counter_paths = []
+        ib_base = "/sys/class/infiniband"
+        try:
+            ib_devs = os.listdir(ib_base)
+        except OSError:
+            ib_devs = []
+
+        for dev_name in ib_devs:
+            dev_path = os.path.join(ib_base, dev_name)
+            try:
+                ports = os.listdir(os.path.join(dev_path, "ports"))
+            except OSError:
+                continue
+            for port_name in ports:
+                counters_dir = os.path.join(dev_path, "ports", port_name, "counters")
+                rcv_path = os.path.join(counters_dir, "port_rcv_data")
+                xmit_path = os.path.join(counters_dir, "port_xmit_data")
+                if os.path.isfile(rcv_path) and os.path.isfile(xmit_path):
+                    self._ib_counter_paths.append((rcv_path, xmit_path))
+
+        if not self._ib_counter_paths:
+            self._ib_supported = False
+
+        # State for delta computation
+        self._prev_pcie_rx = None
+        self._prev_pcie_tx = None
+        self._prev_nvlink_rcv = None
+        self._prev_nvlink_xmit = None
+        self._prev_ib_rcv = None
+        self._prev_ib_xmit = None
+        self._prev_timestamp = None
+
+    def snapshot(self) -> dict:
+        """Take a snapshot and compute throughput from delta with previous snapshot."""
+        if not self.available:
+            return {}
+
+        now = time.monotonic()
+        metrics = {}
+
+        # PCIe throughput
+        if self._pcie_supported:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_PCIE_COUNT_RX_BYTES,
+                    pynvml.NVML_FI_DEV_PCIE_COUNT_TX_BYTES,
+                ])
+                rx = vals[0].value.ullVal
+                tx = vals[1].value.ullVal
+                if self._prev_pcie_rx is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["pcie_rx_gb_s"] = (rx - self._prev_pcie_rx) / dt / 1e9
+                        metrics["pcie_tx_gb_s"] = (tx - self._prev_pcie_tx) / dt / 1e9
+                self._prev_pcie_rx = rx
+                self._prev_pcie_tx = tx
+            except Exception:
+                pass
+
+        if not self._pcie_supported and not metrics:
+            try:
+                rx_kbs = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_RX_BYTES)
+                tx_kbs = pynvml.nvmlDeviceGetPcieThroughput(self.handle, pynvml.NVML_PCIE_UTIL_TX_BYTES)
+                metrics["pcie_rx_gb_s"] = rx_kbs / 1e6
+                metrics["pcie_tx_gb_s"] = tx_kbs / 1e6
+            except Exception:
+                pass
+
+        # NVLink throughput
+        if self._nvlink_supported:
+            try:
+                vals = pynvml.nvmlDeviceGetFieldValues(self.handle, [
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_RCV_BYTES,
+                    pynvml.NVML_FI_DEV_NVLINK_COUNT_XMIT_BYTES,
+                ])
+                rcv = vals[0].value.ullVal
+                xmit = vals[1].value.ullVal
+                if self._prev_nvlink_rcv is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["nvlink_rx_gb_s"] = (rcv - self._prev_nvlink_rcv) / dt / 1e9
+                        metrics["nvlink_tx_gb_s"] = (xmit - self._prev_nvlink_xmit) / dt / 1e9
+                self._prev_nvlink_rcv = rcv
+                self._prev_nvlink_xmit = xmit
+            except Exception:
+                pass
+
+        # IB throughput
+        if self._ib_supported:
+            try:
+                total_rcv = 0
+                total_xmit = 0
+                for rcv_path, xmit_path in self._ib_counter_paths:
+                    with open(rcv_path) as f:
+                        total_rcv += int(f.read().strip())
+                    with open(xmit_path) as f:
+                        total_xmit += int(f.read().strip())
+                if self._prev_ib_rcv is not None and self._prev_timestamp is not None:
+                    dt = now - self._prev_timestamp
+                    if dt > 0:
+                        metrics["ib_rx_gb_s"] = (total_rcv - self._prev_ib_rcv) / dt / 1e9
+                        metrics["ib_tx_gb_s"] = (total_xmit - self._prev_ib_xmit) / dt / 1e9
+                self._prev_ib_rcv = total_rcv
+                self._prev_ib_xmit = total_xmit
+            except Exception:
+                pass
+
+        self._prev_timestamp = now
+        return metrics
+
+    def close(self):
+        if self.available:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self.available = False
 
 
 # ----------------------------------------------------------------------
@@ -168,10 +355,10 @@ def create_lola_dataset(
     for key in dataset_metadata.camera_keys:
         delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
 
-    logger.info(f"delta_timestamps: {delta_timestamps}")
+    _log(f"delta_timestamps: {delta_timestamps}")
 
     if use_lola_dataset:
-        logger.info(f"Using LoLADataset with max_history_length={max_history_length}")
+        _log(f"Using LoLADataset with max_history_length={max_history_length}")
         dataset = LoLADataset(
             repo_id=repo_id,
             max_history_length=max_history_length,
@@ -309,10 +496,11 @@ class LoLATrainer:
         # 训练状态
         self.global_step = 0
         self.best_loss = float("inf")
+        self.interconnect_monitor = None
 
     def setup_model(self):
         """设置模型"""
-        logger.info(f"Loading LoLA Policy on {self.device}...")
+        _log(f"Loading LoLA Policy on {self.device}...")
 
         # 加载 LoLA Policy
         self.policy = LoLAPolicy(self.config)
@@ -328,7 +516,7 @@ class LoLATrainer:
 
         # 冻结 VLM 参数
         if not self.train_vlm and hasattr(self.policy, "vlm"):
-            logger.info("Freezing VLM parameters...")
+            _log("Freezing VLM parameters...")
             for param in self.policy.vlm.parameters():
                 param.requires_grad = False
             self.policy.vlm.eval()
@@ -336,7 +524,7 @@ class LoLATrainer:
         # 打印参数统计
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.policy.parameters())
-        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+        _log(f"Trainable params: {trainable_params:,} / {total_params:,}")
 
         # 设置分布式
         if self.is_distributed:
@@ -347,9 +535,11 @@ class LoLATrainer:
         else:
             self.model = self.policy
 
+        self.interconnect_monitor = InterconnectMonitor(self.device)
+
     def _setup_ddp(self):
         """设置 DDP"""
-        logger.info("Setting up DDP...")
+        _log("Setting up DDP...")
         self.model = DDP(
             self.policy,
             device_ids=[self.local_rank],
@@ -359,7 +549,7 @@ class LoLATrainer:
 
     def _setup_fsdp(self):
         """设置 FSDP"""
-        logger.info("Setting up FSDP...")
+        _log("Setting up FSDP...")
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -437,26 +627,38 @@ class LoLATrainer:
         batch.update(special_data)
         return batch
 
-    def training_step(self, batch):
+    def training_step(self, batch, timing_dict: dict | None = None):
         """单步训练"""
+        t0 = time.monotonic()
+
         # 移动数据到设备
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        t_device = time.monotonic() - t0
 
+        t1 = time.monotonic()
         # 提取特殊字段
         special_data = self._extract_special_fields(batch)
 
         # 预处理
         batch = self.preprocessor(batch)
         batch = self._restore_special_fields(batch, special_data)
+        t_preprocess = time.monotonic() - t1
 
         # 前向传播（混合精度）
+        t2 = time.monotonic()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             loss, loss_dict = self.model(batch)
+        t_model_fwd = time.monotonic() - t2
+
+        if timing_dict is not None:
+            timing_dict["device_s"] = t_device
+            timing_dict["preprocess_s"] = t_preprocess
+            timing_dict["model_fwd_s"] = t_model_fwd
 
         return loss, loss_dict
 
     def train(self, train_loader, start_step: int = 0, start_epoch: int = 0):
-        """训练循环"""
+        """训练循环，增强 wandb 日志（throughput / timing / GPU metrics）"""
         self.global_step = start_step
         self.model.train()
 
@@ -465,7 +667,7 @@ class LoLATrainer:
         ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-{time_str}")
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
-            logger.info(f"Checkpoint directory: {ckpt_dir}")
+            _log(f"Checkpoint directory: {ckpt_dir}")
 
         # 初始化 Wandb
         if self.use_wandb:
@@ -488,31 +690,31 @@ class LoLATrainer:
                     "gradient_clip_val": self.gradient_clip_val,
                 },
             )
-            logger.info(f"Wandb initialized: {wandb_run_name}")
+            _log(f"Wandb initialized: {wandb_run_name}")
 
-        logger.info(f"Starting training from step {start_step}, epoch {start_epoch}")
+        _log(f"Starting training from step {start_step}, epoch {start_epoch}")
 
         # 计算 resume 时需要跳过的 batch 数
         try:
             batches_per_epoch = len(train_loader)
-            logger.info(f"Total batches per epoch: {batches_per_epoch}")
+            _log(f"Total batches per epoch: {batches_per_epoch}")
         except TypeError:
             batches_per_epoch = None
-            logger.info("IterableDataset detected: cannot determine batches per epoch")
+            _log("IterableDataset detected: cannot determine batches per epoch")
 
         # resume skip logic: use start_epoch for epoch-based skip
         if start_epoch > 0 and batches_per_epoch is not None:
             skip_epochs = start_epoch
             skip_batches = start_step % batches_per_epoch if start_step > 0 else 0
-            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
+            _log(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
         elif start_step > 0 and batches_per_epoch is not None:
             skip_epochs = start_step // batches_per_epoch
             skip_batches = start_step % batches_per_epoch
-            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
+            _log(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
         elif start_step > 0 and batches_per_epoch is None:
             skip_epochs = 0
             skip_batches = 0
-            logger.warning(
+            _log(
                 f"Resuming from step {start_step} with IterableDataset: "
                 "data will restart from the beginning (model/optimizer/scheduler states are restored). "
                 "For precise data resume, use map-style dataset or add start_index to IterableDataset."
@@ -549,63 +751,156 @@ class LoLATrainer:
 
                 self.optimizer.zero_grad()
 
-                loss, loss_dict = self.training_step(batch)
+                # ── Forward pass (with split timing) ────────────────
+                fwd_timing = {}
+                fwd_start = time.monotonic()
+                loss, loss_dict = self.training_step(batch, timing_dict=fwd_timing)
+                fwd_s = time.monotonic() - fwd_start
+                device_s = fwd_timing.get("device_s", 0)
+                preprocess_s = fwd_timing.get("preprocess_s", 0)
+                model_fwd_s = fwd_timing.get("model_fwd_s", 0)
 
-                # 反向传播
+                # ── Backward pass (with timing) ──────────────────────
+                bwd_start = time.monotonic()
                 if self.use_bf16:
-                    # BF16: 直接 backward，不需要 scaler
                     loss.backward()
                 else:
-                    # FP16: 使用 scaler
                     self.scaler.scale(loss).backward()
+                bwd_s = time.monotonic() - bwd_start
 
-                # 梯度裁剪
+                # ── Gradient clipping ─────────────────────────────────
+                clip_start = time.monotonic()
                 if self.gradient_clip_val > 0:
                     if not self.use_bf16:
                         self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.gradient_clip_val,
-                    )
+                    if self.strategy == "fsdp":
+                        grad_norm = self.model.clip_grad_norm_(self.gradient_clip_val)
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.gradient_clip_val,
+                        )
+                else:
+                    grad_norm = None
+                clip_s = time.monotonic() - clip_start
 
-                # 优化器步进
+                # ── Optimizer step ────────────────────────────────────
+                opt_start = time.monotonic()
                 if self.use_bf16:
                     self.optimizer.step()
                 else:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                opt_s = time.monotonic() - opt_start
 
                 # 学习率调度
                 self.scheduler.step()
 
                 self.global_step += 1
 
-                # 计算步耗时
-                update_s = round(time.monotonic() - step_start, 2)
+                update_s = time.monotonic() - step_start
+                batch_per_s = 1.0 / update_s if update_s > 0 else 0
 
-                # 日志
+                # ── Logging (enhanced wandb metrics) ──────────────────
                 if self.global_step % self.log_every_n_steps == 0:
                     lr = self.scheduler.get_last_lr()[0]
+                    gpu_mem_alloc = torch.cuda.memory_allocated(self.device) / 1e9
+                    gpu_mem_reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                    interconnect_metrics = self.interconnect_monitor.snapshot() if self.interconnect_monitor else {}
+
+                    # ── Per-rank memory distribution ──────────────────
+                    total_mem = torch.cuda.get_device_properties(self.device).total_memory
+                    local_reserved_pct = torch.cuda.memory_reserved(self.device) / total_mem * 100
+                    local_alloc_pct = torch.cuda.memory_allocated(self.device) / total_mem * 100
+                    if self.is_distributed:
+                        reserved_tensor = torch.tensor([local_reserved_pct], device=self.device)
+                        alloc_tensor = torch.tensor([local_alloc_pct], device=self.device)
+                        reserved_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                        alloc_gathered = [torch.zeros(1, device=self.device) for _ in range(self.world_size)]
+                        dist.all_gather(reserved_gathered, reserved_tensor)
+                        dist.all_gather(alloc_gathered, alloc_tensor)
+                    else:
+                        reserved_gathered = [torch.tensor([local_reserved_pct])]
+                        alloc_gathered = [torch.tensor([local_alloc_pct])]
+
                     if self.is_main_process:
-                        logger.info(
-                            f"Step {self.global_step}/{self.total_steps} | Epoch {epoch}/{self.max_epochs or '-'} | "
-                            f"Loss: {loss.item():.4f} | "
-                            f"LR: {lr:.2e} | "
-                            f"Update: {update_s}s"
+                        grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm if grad_norm is not None else None
+
+                        # ── Console logging (mirrors all wandb metrics) ──
+                        _log(
+                            f"[Step {self.global_step}/{self.total_steps}] "
+                            f"Epoch {epoch}/{self.max_epochs or '-'} "
+                            f"Loss={loss.item():.4f} LR={lr:.2e} "
+                            f"Update={update_s:.2f}s Throughput={batch_per_s:.2f}batch/s"
                         )
-                        # Wandb 日志
+                        if grad_norm_val is not None:
+                            _log(f"  grad_norm={grad_norm_val:.4f}")
+                        _log(
+                            f"  Timing: fwd={fwd_s:.3f}s (device={device_s:.3f}s "
+                            f"preprocess={preprocess_s:.3f}s model_fwd={model_fwd_s:.3f}s) "
+                            f"bwd={bwd_s:.3f}s clip={clip_s:.3f}s opt={opt_s:.3f}s"
+                        )
+                        _log(
+                            f"  GPU: alloc={gpu_mem_alloc:.1f}GB "
+                            f"reserved={gpu_mem_reserved:.1f}GB"
+                        )
+                        # ── Per-rank memory distribution ──
+                        mem_str = " | ".join(
+                            f"GPU{i}: r={r.item():.1f}% a={a.item():.1f}%"
+                            for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered))
+                        )
+                        _log(f"  Memory Distribution: {mem_str}")
+                        if interconnect_metrics:
+                            parts = []
+                            if "pcie_rx_gb_s" in interconnect_metrics:
+                                parts.append(
+                                    f"PCIe rx={interconnect_metrics['pcie_rx_gb_s']:.2f} "
+                                    f"tx={interconnect_metrics['pcie_tx_gb_s']:.2f} GB/s"
+                                )
+                            if "nvlink_rx_gb_s" in interconnect_metrics:
+                                parts.append(
+                                    f"NVLink rx={interconnect_metrics['nvlink_rx_gb_s']:.2f} "
+                                    f"tx={interconnect_metrics['nvlink_tx_gb_s']:.2f} GB/s"
+                                )
+                            if "ib_rx_gb_s" in interconnect_metrics:
+                                parts.append(
+                                    f"IB rx={interconnect_metrics['ib_rx_gb_s']:.2f} "
+                                    f"tx={interconnect_metrics['ib_tx_gb_s']:.2f} GB/s"
+                                )
+                            _log(f"  Interconnect: {' | '.join(parts)}")
+                        for k, v in loss_dict.items():
+                            if k != "loss" and isinstance(v, (int, float)):
+                                _log(f"  {k}={v:.4f}")
+
+                        # ── Wandb logging ──────────────────────────────
                         if self.use_wandb:
                             log_dict = {
                                 "train/loss": loss.item(),
                                 "train/learning_rate": lr,
                                 "train/step": self.global_step,
                                 "train/epoch": epoch,
-                                "train/update_s": update_s,
+                                "train/batch_per_s": batch_per_s,
+                                "timing/step_s": update_s,
+                                "timing/fwd_s": fwd_s,
+                                "timing/fwd_device_s": device_s,
+                                "timing/fwd_preprocess_s": preprocess_s,
+                                "timing/fwd_model_fwd_s": model_fwd_s,
+                                "timing/bwd_s": bwd_s,
+                                "timing/clip_s": clip_s,
+                                "timing/opt_s": opt_s,
+                                "memory/gpu_alloc_gb": gpu_mem_alloc,
+                                "memory/gpu_reserved_gb": gpu_mem_reserved,
                             }
-                            # 添加 loss_dict 中的其他 loss
+                            if grad_norm_val is not None:
+                                log_dict["train/grad_norm"] = grad_norm_val
                             for k, v in loss_dict.items():
                                 if k != "loss" and isinstance(v, (int, float)):
                                     log_dict[f"train/{k}"] = v
+                            for k, v in interconnect_metrics.items():
+                                log_dict[f"interconnect/{k}"] = v
+                            for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
+                                log_dict[f"memory/gpu{i}_reserved_pct"] = r.item()
+                                log_dict[f"memory/gpu{i}_alloc_pct"] = a.item()
                             wandb.log(log_dict)
 
                 # 保存 checkpoint
@@ -620,7 +915,11 @@ class LoLATrainer:
         # 保存最终 checkpoint
         if self.is_main_process:
             self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
-            logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+            _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
+
+        # 关闭 InterconnectMonitor
+        if self.interconnect_monitor:
+            self.interconnect_monitor.close()
 
         # 关闭 Wandb
         if self.use_wandb:
@@ -663,7 +962,7 @@ class LoLATrainer:
                 "scheduler_state_dict": self.scheduler.state_dict(),
             }, ckpt_path)
 
-        logger.info(f"Checkpoint saved: {ckpt_path}")
+        _log(f"Checkpoint saved: {ckpt_path}")
 
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
@@ -699,7 +998,7 @@ class LoLATrainer:
             self.global_step = checkpoint.get("step", 0)
             self.current_epoch = checkpoint.get("epoch", 0)
 
-        logger.info(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
+        _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
 
 # ----------------------------------------------------------------------
@@ -802,22 +1101,22 @@ def main():
 
     # 打印配置
     if dist_info["world_rank"] == 0:
-        logger.info("=" * 60)
-        logger.info("LoLA Azure Distributed Training")
-        logger.info("=" * 60)
-        logger.info(f"Dataset: {args.dataset_repo_id or args.dataset_root}")
-        logger.info(f"Strategy: {args.strategy}")
-        logger.info(f"World Size: {dist_info['world_size']}")
-        logger.info(f"Batch Size: {args.batch_size}")
-        logger.info(f"Learning Rate: {args.learning_rate}")
-        logger.info(f"Max Steps: {args.max_steps or 'N/A (epoch-based)'}")
-        logger.info(f"Max Epochs: {args.max_epochs or 'N/A (step-based)'}")
-        logger.info(f"VLM Path: {args.vlm_path}")
-        logger.info(f"Train VLM: {args.train_vlm}")
-        logger.info("=" * 60)
+        _log("=" * 60)
+        _log("LoLA Azure Distributed Training")
+        _log("=" * 60)
+        _log(f"Dataset: {args.dataset_repo_id or args.dataset_root}")
+        _log(f"Strategy: {args.strategy}")
+        _log(f"World Size: {dist_info['world_size']}")
+        _log(f"Batch Size: {args.batch_size}")
+        _log(f"Learning Rate: {args.learning_rate}")
+        _log(f"Max Steps: {args.max_steps or 'N/A (epoch-based)'}")
+        _log(f"Max Epochs: {args.max_epochs or 'N/A (step-based)'}")
+        _log(f"VLM Path: {args.vlm_path}")
+        _log(f"Train VLM: {args.train_vlm}")
+        _log("=" * 60)
 
     # 获取数据集元数据
-    logger.info(f"Loading dataset metadata...")
+    _log(f"Loading dataset metadata...")
     dataset_metadata = LeRobotDatasetMetadata(
         args.dataset_repo_id,
         root=args.dataset_root,
@@ -829,8 +1128,8 @@ def main():
     else:
         action_dim = args.action_dim
 
-    logger.info(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
-    logger.info(f"Action dim: {action_dim}")
+    _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
+    _log(f"Action dim: {action_dim}")
 
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
@@ -866,7 +1165,7 @@ def main():
         }
 
     # 创建数据集
-    logger.info("Creating dataset...")
+    _log("Creating dataset...")
     norm_action = (args.norm_mode == "robovlm")
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
@@ -880,7 +1179,7 @@ def main():
         norm_min=args.norm_min,
         norm_max=args.norm_max,
     )
-    logger.info(f"Dataset size: {len(train_dataset)}")
+    _log(f"Dataset size: {len(train_dataset)}")
 
     # 创建 DataLoader（使用 DistributedSampler）
     sampler = None
@@ -940,7 +1239,7 @@ def main():
     else:
         batches_per_epoch = len(train_loader)
         total_steps = args.max_epochs * batches_per_epoch
-        logger.info(f"Epoch-based training: {args.max_epochs} epochs × {batches_per_epoch} batches = {total_steps} total steps")
+        _log(f"Epoch-based training: {args.max_epochs} epochs × {batches_per_epoch} batches = {total_steps} total steps")
 
     # 设置优化器
     trainer.setup_optimizer(total_steps=total_steps)
@@ -958,7 +1257,7 @@ def main():
 
     # 清理
     cleanup_distributed()
-    logger.info("Training completed!")
+    _log("Training completed!")
 
 
 if __name__ == "__main__":

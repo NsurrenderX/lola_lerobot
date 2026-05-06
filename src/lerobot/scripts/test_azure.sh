@@ -90,7 +90,7 @@ WANDB_ENTITY=""
 DISABLE_WANDB=false
 
 # DataLoader 参数
-NUM_WORKERS=4
+NUM_WORKERS=8
 
 # Resume 参数
 RESUME=""
