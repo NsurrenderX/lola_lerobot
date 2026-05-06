@@ -20,6 +20,15 @@ set -e
 # 环境变量设置
 export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
 export TOKENIZERS_PARALLELISM=false
+# Add conda env lib to LD_LIBRARY_PATH so torchcodec can find ffmpeg shared libs
+# Also ensures conda's newer libstdc++ is used (avoids CXXABI_1.3.15 not found error)
+if [ -d "/opt/conda/envs/lerobot/lib" ]; then
+    export LD_LIBRARY_PATH="/opt/conda/envs/lerobot/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+# Ensure kernel cache directory exists (avoids "Specified kernel cache directory
+# could not be created" warning from torch.cuda on first CUDA JIT compile)
+mkdir -p /root/.cache/torch/kernels
 
 # ----------------------------------------------------------------------
 # 默认参数（可被命令行参数覆盖）
