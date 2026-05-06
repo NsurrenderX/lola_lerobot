@@ -319,7 +319,7 @@ echo "========================================"
 # ----------------------------------------------------------------------
 if [ "$NNODES" -eq 1 ]; then
     # 单节点：使用简化的 torchrun 命令
-    cmd="torchrun --nproc_per_node=${NPROC_PER_NODE} \
+    cmd="/opt/conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
         src/lerobot/scripts/train_lola_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
@@ -343,7 +343,7 @@ if [ "$NNODES" -eq 1 ]; then
         --wandb_project ${WANDB_PROJECT}"
 else
     # 多节点：使用完整的分布式参数
-    cmd="torchrun \
+    cmd="/opt/conda/envs/lerobot/bin/torchrun \
         --nnodes=${NNODES} \
         --nproc_per_node=${NPROC_PER_NODE} \
         --node_rank=${NODE_RANK} \
