@@ -23,7 +23,7 @@ from diffusers.models.transformers.transformer_flux2 import (
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.lola.configuration_lola import LoLAConfig
 
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
 
 # ----------------------------------------------------------------------
 # Helper Functions
@@ -645,7 +645,7 @@ class LoLAPolicy(PreTrainedPolicy):
         # 对于分布式训练（DeepSpeed/FSDP），VLM 需要特殊处理
         # 方案：先加载到 CPU，然后让分布式策略管理设备分配
         if self.config.vlm_path is not None:
-            self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
+            self.vlm = Qwen3_5Model.from_pretrained(
                 self.config.vlm_path,
                 torch_dtype=self._dtype,
                 device_map=None,  # 不自动分配，让分布式策略管理
@@ -654,14 +654,24 @@ class LoLAPolicy(PreTrainedPolicy):
                 attn_implementation="sdpa",
             )
         else:
-            self.vlm = Qwen3_5ForConditionalGeneration.from_pretrained(
+            self.vlm = Qwen3_5Model.from_pretrained(
                 self.config.vlm_model_name,
                 torch_dtype=self._dtype,
                 device_map=None,
                 low_cpu_mem_usage=True,
                 attn_implementation="sdpa",
             )
-        
+
+        # Remove unused VLM parameters to fix DDP find_unused_parameters=False error.
+        # LoLA only extracts hidden_states from layers 8/16/24, so layers 24-31,
+        # final norm, and lm_head are dead branches with zero gradients.
+        # Qwen3_5Model (vs Qwen3_5ForConditionalGeneration) already eliminates lm_head.
+        last_extract_layer = max(self.config.vlm_extract_layers)
+        lang_model = self.vlm.language_model
+        for i in range(len(lang_model.layers) - 1, last_extract_layer - 1, -1):
+            del lang_model.layers[i]
+        lang_model.norm = nn.Identity()
+
         self.model.to(self._dtype)
 
         # Enable gradient checkpointing if configured
@@ -718,7 +728,7 @@ class LoLAPolicy(PreTrainedPolicy):
         """
         for extract_layer_idx in self.config.vlm_extract_layers:
             decoder_layer_idx = extract_layer_idx - 1
-            decoder_layer = self.vlm.model.language_model.layers[decoder_layer_idx]
+            decoder_layer = self.vlm.language_model.layers[decoder_layer_idx]
 
             def make_hook(eidx):
                 def hook_fn(module, input, output):
@@ -967,7 +977,7 @@ class LoLAPolicy(PreTrainedPolicy):
 
         This makes the entire VLM forward visible to torch.compile as a single graph.
         """
-        vlm_model = self.vlm.model  # Qwen3_5Model
+        vlm_model = self.vlm  # Qwen3_5Model
         lang_model = vlm_model.language_model  # Qwen3_5TextModel
 
         # Step 1: Embed inputs (same as Qwen3_5Model.forward)
@@ -1094,9 +1104,6 @@ class LoLAPolicy(PreTrainedPolicy):
             # which corresponds to hidden_states[end] (0-indexed: embedding=0, layer0=1, ...)
             if end in extract_layers:
                 captured[end] = hidden_states
-
-        # Step 5: Final norm (needed for completeness, though we don't use the output)
-        hidden_states = lang_model.norm(hidden_states)
 
         return captured
 
