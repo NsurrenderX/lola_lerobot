@@ -65,6 +65,7 @@ class LoLADataset(LeRobotDataset):
         image_transforms: Callable | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
+        tolerance_frame: int = 1,
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
@@ -93,12 +94,14 @@ class LoLADataset(LeRobotDataset):
             image_transforms=image_transforms,
             delta_timestamps=delta_timestamps,
             tolerance_s=tolerance_s,
+            tolerance_frames=tolerance_frame,
             revision=revision,
             force_cache_sync=force_cache_sync,
             download_videos=download_videos,
             video_backend=video_backend,
         )
 
+        # self.tolerance_frame = tolerance_frame
         self.max_history_length = max_history_length
         self.action_chunk_size = action_chunk_size
         self.history_padding_side = history_padding_side
@@ -138,7 +141,8 @@ class LoLADataset(LeRobotDataset):
                 video_rel = video_rel[len("videos/"):]
             seek_mode = self._video_seek_modes.get(video_rel, "approximate")
 
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend, seek_mode=seek_mode)
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, tolerance_frames=self.tolerance_frames, backend=self.video_backend, seek_mode=seek_mode)
+            
             item[vid_key] = frames.squeeze(0)
 
         return item

@@ -112,6 +112,8 @@ FWD_PRED_NEXT_N=10
 # --- 调度器参数 ---
 SCHEDULER="constant"       # "constant" or "cosine"
 SCHEDULER_WARMUP_STEPS=250
+ACTION_HEAD_LR_SCALE=5.0   # LSTMDecoder / action_token LR = learning_rate * this value
+ARM_GRIPPER_LOSS_RATIO=1.0 # Weight for gripper loss relative to arm loss
 
 # --- Wandb 参数 ---
 WANDB_PROJECT="robovlm"
@@ -171,6 +173,8 @@ while [[ $# -gt 0 ]]; do
         # 调度器参数
         --scheduler)              SCHEDULER="$2"; shift 2 ;;
         --scheduler_warmup_steps) SCHEDULER_WARMUP_STEPS="$2"; shift 2 ;;
+        --action_head_lr_scale)   ACTION_HEAD_LR_SCALE="$2"; shift 2 ;;
+        --arm_gripper_loss_ratio) ARM_GRIPPER_LOSS_RATIO="$2"; shift 2 ;;
 
         # Wandb 参数
         --wandb_project)   WANDB_PROJECT="$2"; shift 2 ;;
@@ -214,6 +218,8 @@ echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Weight decay: ${WEIGHT_DECAY}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Scheduler: ${SCHEDULER} (warmup: ${SCHEDULER_WARMUP_STEPS} steps)"
+echo "  - Action head LR scale: ${ACTION_HEAD_LR_SCALE}"
+echo "  - Arm gripper loss ratio: ${ARM_GRIPPER_LOSS_RATIO}"
 echo "  - Save every N steps: ${SAVE_EVERY_N_STEPS}"
 if [ -n "$SAVE_EVERY_N_EPOCHS" ]; then
     echo "  - Save every N epochs: ${SAVE_EVERY_N_EPOCHS}"
@@ -266,6 +272,8 @@ cmd="${cmd} \
     --fwd_pred_next_n ${FWD_PRED_NEXT_N} \
     --scheduler ${SCHEDULER} \
     --scheduler_warmup_steps ${SCHEDULER_WARMUP_STEPS} \
+    --action_head_lr_scale ${ACTION_HEAD_LR_SCALE} \
+    --arm_gripper_loss_ratio ${ARM_GRIPPER_LOSS_RATIO} \
     --wandb_project ${WANDB_PROJECT}"
 
 # 训练模式：步数 vs Epoch（互斥）

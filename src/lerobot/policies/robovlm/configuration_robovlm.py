@@ -53,7 +53,7 @@ class RoboVLMConfig(PreTrainedConfig):
     # ==========================
     # 7. Loss Settings
     # ==========================
-    arm_gripper_loss_ratio: float = 0.01
+    arm_gripper_loss_ratio: float = 1.0
 
     # ==========================
     # 8. Training Setup
@@ -102,6 +102,7 @@ class RoboVLMConfig(PreTrainedConfig):
     optimizer_betas: tuple[float, float] = (0.9, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_grad_clip_norm: float = 1.0
+    action_head_lr_scale: float = 5.0  # LSTMDecoder / action_token LR = optimizer_lr * this value
 
     # ==========================
     # 11. Scheduler Settings

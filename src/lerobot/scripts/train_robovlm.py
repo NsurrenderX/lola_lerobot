@@ -256,16 +256,31 @@ class RoboVLMTrainer:
         )
 
     def setup_optimizer(self):
-        """Create optimizer and LR scheduler (matching original RoboVLM)."""
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        """Create optimizer with grouped LR: backbone vs action head."""
+        model = self.model.module if hasattr(self.model, "module") else self.model
 
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=self.config.optimizer_betas,
-            eps=self.config.optimizer_eps,
-        )
+        backbone_params = []
+        action_head_params = []
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "act_head" in name or "action_token" in name:
+                action_head_params.append(param)
+            else:
+                backbone_params.append(param)
+
+        action_head_lr = self.learning_rate * self.config.action_head_lr_scale
+
+        self.optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": self.learning_rate},
+            {"params": action_head_params, "lr": action_head_lr},
+        ], weight_decay=self.weight_decay, betas=self.config.optimizer_betas, eps=self.config.optimizer_eps)
+
+        _log(f"Optimizer: backbone LR={self.learning_rate}, action_head LR={action_head_lr} "
+             f"(scale={self.config.action_head_lr_scale})")
+        _log(f"  backbone params: {sum(p.numel() for p in backbone_params):,}")
+        _log(f"  action_head params: {sum(p.numel() for p in action_head_params):,}")
 
         from transformers import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
@@ -534,6 +549,10 @@ def parse_args():
     parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"],
                         help="LR scheduler: 'constant' (warmup+flat) or 'cosine' (warmup+decay)")
     parser.add_argument("--scheduler_warmup_steps", type=int, default=250)
+    parser.add_argument("--action_head_lr_scale", type=float, default=5.0,
+                        help="LR scale for action head (LSTMDecoder + action_token) relative to base LR")
+    parser.add_argument("--arm_gripper_loss_ratio", type=float, default=1.0,
+                        help="Weight for gripper loss relative to arm loss (default: 1.0)")
 
     # Distributed
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
@@ -582,6 +601,8 @@ def main():
         optimizer_lr=args.learning_rate,
         scheduler_type=args.scheduler,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
+        action_head_lr_scale=args.action_head_lr_scale,
+        arm_gripper_loss_ratio=args.arm_gripper_loss_ratio,
     )
 
     # Setup model first (need tokenizer for dataset)
