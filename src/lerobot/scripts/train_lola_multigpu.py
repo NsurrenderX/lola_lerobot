@@ -255,6 +255,9 @@ def create_lola_dataset(
     use_lola_dataset: bool = False,
     max_history_length: int = 100,
     history_padding_side: str = "left",
+    norm_action: bool = False,
+    norm_min: float = -0.65,
+    norm_max: float = 0.65,
 ) -> LeRobotDataset | LoLADataset:
     """
     创建 LoLA 训练用的数据集。
@@ -318,6 +321,9 @@ def create_lola_dataset(
             image_transforms=image_transforms,
             delta_timestamps=delta_timestamps,
             video_backend=video_backend,
+            norm_action=norm_action,
+            norm_min=norm_min,
+            norm_max=norm_max,
         )
     else:
         # 使用标准 LeRobotDataset
@@ -360,6 +366,10 @@ def collate_fn(batch):
 
         if key == "task":
             # 任务描述保持为字符串列表
+            result[key] = values
+        elif key.startswith("observation.images."):
+            # 相机图像保持为 list，不做 torch.stack
+            # LolaImageProcessor batch mode 需要 list 格式来检测 batch 维度
             result[key] = values
         elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
             # 变长序列：pad 到 batch 内最大长度
@@ -483,12 +493,45 @@ def main():
     parser.add_argument("--n_obs_steps", type=int, default=1, help="Number of observation steps")
     
     # 历史action加载参数
-    parser.add_argument("--load_full_history", action="store_true", 
+    parser.add_argument("--load_full_history", action="store_true",
                         help="Load full episode history actions (use LoLADataset)")
-    parser.add_argument("--max_history_length", type=int, default=100, 
+    parser.add_argument("--max_history_length", type=int, default=100,
                         help="Maximum history length for padding/truncation")
     parser.add_argument("--history_padding_side", type=str, default="left", choices=["left", "right"],
                         help="Padding side for history actions")
+
+    # LoLA 模型配置参数
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
+                        help="启用梯度检查点（默认开启）")
+    parser.add_argument("--no_gradient_checkpointing", action="store_true",
+                        help="关闭梯度检查点")
+    parser.add_argument("--compile_model", action="store_true",
+                        help="启用 torch.compile 优化")
+    parser.add_argument("--compile_mode", type=str, default="max-autotune",
+                        help="torch.compile 模式")
+    parser.add_argument("--vlm_lr", type=float, default=1e-6,
+                        help="VLM 学习率（仅 train_vlm=True 时生效）")
+    parser.add_argument("--vlm_extract_layers", type=int, nargs="+", default=[8, 16, 24],
+                        help="VLM 提取层索引")
+    parser.add_argument("--max_image_pixels", type=int, default=230400,
+                        help="每张图片最大像素数（控制 visual token 数）")
+    parser.add_argument("--min_image_pixels", type=int, default=65536,
+                        help="每张图片最小像素数")
+    parser.add_argument("--num_inference_steps", type=int, default=10,
+                        help="Flow matching 推理去噪步数")
+
+    # DataLoader 参数
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker 数量")
+
+    # 归一化参数
+    parser.add_argument("--norm_mode", type=str, default="default",
+                        choices=["default", "robovlm"],
+                        help="归一化模式: default(LoLA默认MEAN_STD), robovlm(min-max→[-1,1],全IDENTITY)")
+    parser.add_argument("--norm_min", type=float, default=-0.65,
+                        help="RoboVLM 归一化下界")
+    parser.add_argument("--norm_max", type=float, default=0.65,
+                        help="RoboVLM 归一化上界")
 
     args = parser.parse_args()
 
@@ -528,6 +571,7 @@ def main():
     print(f"  - Features: {list(features.keys())}")
     
     # 创建 LoLA 配置
+    gradient_checkpointing = not args.no_gradient_checkpointing
     config = LoLAConfig(
         vlm_model_name="Qwen/Qwen3.5-4B",
         vlm_path=args.vlm_path,
@@ -538,14 +582,30 @@ def main():
         input_features={key: ft for key, ft in features.items() if ft.type != FeatureType.ACTION},
         output_features={key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION},
         train_vlm=args.train_vlm,
-        # 历史action配置
         load_full_history=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
+        gradient_checkpointing=gradient_checkpointing,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
+        vlm_lr=args.vlm_lr,
+        vlm_extract_layers=tuple(args.vlm_extract_layers),
+        max_image_pixels=args.max_image_pixels,
+        min_image_pixels=args.min_image_pixels,
     )
-    
+
+    # 归一化模式
+    if args.norm_mode == "robovlm":
+        from lerobot.configs.types import NormalizationMode
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+
     # 创建训练和验证数据集
     print("Creating datasets...")
+    norm_action = (args.norm_mode == "robovlm")
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
         config=config,
@@ -554,6 +614,9 @@ def main():
         use_lola_dataset=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
+        norm_action=norm_action,
+        norm_min=args.norm_min,
+        norm_max=args.norm_max,
     )
     print("Done.\n Train Data Example:")
     for key, value in train_dataset[0].items():
@@ -569,7 +632,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
     )

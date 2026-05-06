@@ -10,7 +10,9 @@
       "Bash(ls /data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v2/)",
       "Read(//data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v2/**)",
       "Bash(ls /data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v3/)",
-      "Read(//data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v3/**)"
+      "Read(//data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v3/**)",
+      "Read(//home/v-wenhuitan/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/transformers/models/qwen3_5/**)",
+      "Read(//datassd_1T/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/transformers/models/qwen3_5/**)"
     ]
   }
 }

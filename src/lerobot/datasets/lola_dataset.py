@@ -70,6 +70,9 @@ class LoLADataset(LeRobotDataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        norm_action: bool = False,
+        norm_min: float = -0.65,
+        norm_max: float = 0.65,
     ):
         """
         Args:
@@ -105,6 +108,9 @@ class LoLADataset(LeRobotDataset):
         self.max_history_length = max_history_length
         self.action_chunk_size = action_chunk_size
         self.history_padding_side = history_padding_side
+        self.norm_action = norm_action
+        self.norm_min = norm_min
+        self.norm_max = norm_max
 
         # 获取action维度
         if "action" in self.features:
@@ -231,6 +237,14 @@ class LoLADataset(LeRobotDataset):
         item["hist_actions_full"] = hist_actions  # [padded_length, action_dim]
         item["hist_actions_mask"] = hist_actions_mask  # [padded_length]
         item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
+
+        # RoboVLM-style action normalization: min-max → [-1, 1]
+        if self.norm_action:
+            from lerobot.datasets.robovlm_dataset import normalize_action
+            if "action" in item:
+                item["action"] = normalize_action(item["action"], self.norm_min, self.norm_max)
+            if "hist_actions_full" in item:
+                item["hist_actions_full"] = normalize_action(item["hist_actions_full"], self.norm_min, self.norm_max)
 
         return item
 

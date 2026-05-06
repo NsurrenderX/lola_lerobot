@@ -47,17 +47,39 @@ DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
 CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
 TRAIN_VLM=false
+ACTION_DIM=14
+ACTION_CHUNK_SIZE=10
+PRED_CHUNK_SIZE=50
+N_OBS_STEPS=1
 
 # 历史action加载参数
 LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
 
+# LoLA 模型配置
+GRADIENT_CHECKPOINTING=true
+COMPILE_MODEL=false
+COMPILE_MODE="max-autotune"
+VLM_LR=1e-6
+VLM_EXTRACT_LAYERS="8 16 24"
+MAX_IMAGE_PIXELS=230400
+MIN_IMAGE_PIXELS=65536
+NUM_INFERENCE_STEPS=10
+
+# 归一化参数
+NORM_MODE="default"
+NORM_MIN=-0.65
+NORM_MAX=0.65
+
 # Wandb 参数
 WANDB_PROJECT="lola-azure"
 WANDB_NAME=""
 WANDB_ENTITY=""
 DISABLE_WANDB=false
+
+# DataLoader 参数
+NUM_WORKERS=4
 
 # Resume 参数
 RESUME=""
@@ -142,6 +164,22 @@ while [[ $# -gt 0 ]]; do
             TRAIN_VLM=true
             shift
             ;;
+        --action_dim)
+            ACTION_DIM="$2"
+            shift 2
+            ;;
+        --action_chunk_size)
+            ACTION_CHUNK_SIZE="$2"
+            shift 2
+            ;;
+        --pred_chunk_size)
+            PRED_CHUNK_SIZE="$2"
+            shift 2
+            ;;
+        --n_obs_steps)
+            N_OBS_STEPS="$2"
+            shift 2
+            ;;
 
         # 历史action参数
         --load_full_history)
@@ -158,6 +196,54 @@ while [[ $# -gt 0 ]]; do
             ;;
         --history_padding_side)
             HISTORY_PADDING_SIDE="$2"
+            shift 2
+            ;;
+
+        # LoLA 模型配置参数
+        --no_gradient_checkpointing)
+            GRADIENT_CHECKPOINTING=false
+            shift
+            ;;
+        --compile_model)
+            COMPILE_MODEL=true
+            shift
+            ;;
+        --compile_mode)
+            COMPILE_MODE="$2"
+            shift 2
+            ;;
+        --vlm_lr)
+            VLM_LR="$2"
+            shift 2
+            ;;
+        --vlm_extract_layers)
+            VLM_EXTRACT_LAYERS="$2"
+            shift 2
+            ;;
+        --max_image_pixels)
+            MAX_IMAGE_PIXELS="$2"
+            shift 2
+            ;;
+        --min_image_pixels)
+            MIN_IMAGE_PIXELS="$2"
+            shift 2
+            ;;
+        --num_inference_steps)
+            NUM_INFERENCE_STEPS="$2"
+            shift 2
+            ;;
+
+        # 归一化参数
+        --norm_mode)
+            NORM_MODE="$2"
+            shift 2
+            ;;
+        --norm_min)
+            NORM_MIN="$2"
+            shift 2
+            ;;
+        --norm_max)
+            NORM_MAX="$2"
             shift 2
             ;;
 
@@ -233,6 +319,18 @@ if [ "$NNODES" -eq 1 ]; then
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
+        --action_dim ${ACTION_DIM} \
+        --action_chunk_size ${ACTION_CHUNK_SIZE} \
+        --pred_chunk_size ${PRED_CHUNK_SIZE} \
+        --n_obs_steps ${N_OBS_STEPS} \
+        --vlm_extract_layers ${VLM_EXTRACT_LAYERS} \
+        --max_image_pixels ${MAX_IMAGE_PIXELS} \
+        --min_image_pixels ${MIN_IMAGE_PIXELS} \
+        --num_inference_steps ${NUM_INFERENCE_STEPS} \
+        --num_workers ${NUM_WORKERS} \
+        --norm_mode ${NORM_MODE} \
+        --norm_min ${NORM_MIN} \
+        --norm_max ${NORM_MAX} \
         --wandb_project ${WANDB_PROJECT}"
 else
     # 多节点：使用完整的分布式参数
@@ -252,6 +350,18 @@ else
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
+        --action_dim ${ACTION_DIM} \
+        --action_chunk_size ${ACTION_CHUNK_SIZE} \
+        --pred_chunk_size ${PRED_CHUNK_SIZE} \
+        --n_obs_steps ${N_OBS_STEPS} \
+        --vlm_extract_layers ${VLM_EXTRACT_LAYERS} \
+        --max_image_pixels ${MAX_IMAGE_PIXELS} \
+        --min_image_pixels ${MIN_IMAGE_PIXELS} \
+        --num_inference_steps ${NUM_INFERENCE_STEPS} \
+        --num_workers ${NUM_WORKERS} \
+        --norm_mode ${NORM_MODE} \
+        --norm_min ${NORM_MIN} \
+        --norm_max ${NORM_MAX} \
         --wandb_project ${WANDB_PROJECT}"
 fi
 
@@ -269,7 +379,15 @@ fi
 
 # 训练 VLM 参数
 if [ "$TRAIN_VLM" = true ]; then
-    cmd="${cmd} --train_vlm"
+    cmd="${cmd} --train_vlm --vlm_lr ${VLM_LR}"
+fi
+
+# 梯度检查点 & compile
+if [ "$GRADIENT_CHECKPOINTING" = false ]; then
+    cmd="${cmd} --no_gradient_checkpointing"
+fi
+if [ "$COMPILE_MODEL" = true ]; then
+    cmd="${cmd} --compile_model --compile_mode ${COMPILE_MODE}"
 fi
 
 # Wandb 参数

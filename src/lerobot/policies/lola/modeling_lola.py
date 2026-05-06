@@ -275,6 +275,7 @@ class LoLADiT(nn.Module):
         temb_mod_txt = self.double_stream_modulation_txt(temb)
         temb_mod_single = self.single_stream_modulation(temb)
 
+        # print(f"vlm features: {vlm_features.shape}, hist actions: {hist_actions.shape}, target actions: {target_actions.shape}")
         context_features = torch.cat([vlm_features, hist_actions], dim=1)
 
         # 构建 attention_mask（如果提供了 mask 信息）

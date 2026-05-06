@@ -46,7 +46,7 @@ TEMP_PROCESS=true
 EPISODE_CHUNK_SIZE=8
 
 # 运行训练
-cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigpu_stream.py \
+cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigpu.py \
     --dataset_root ${DATASET_ROOT} \
     --strategy ${STRATEGY} \
     --devices ${DEVICES} \

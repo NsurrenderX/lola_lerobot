@@ -237,7 +237,7 @@ class LolaImageProcessor(ObservationProcessorStep):
         is_batch = (
             isinstance(first_cam_data, list)
             and len(first_cam_data) > 0
-            and isinstance(first_cam_data[0], (Image.Image, type(None)))
+            and isinstance(first_cam_data[0], (Image.Image, type(None), torch.Tensor))
         )
 
         if is_batch:
@@ -267,8 +267,11 @@ class LolaImageProcessor(ObservationProcessorStep):
                     if img is not None:
                         if isinstance(img, Image.Image):
                             images_per_item[i].append(img)
-                        elif isinstance(img, torch.Tensor) and img.dim() == 3:
-                            images_per_item[i].append(self._tensor_to_pil(img))
+                        elif isinstance(img, torch.Tensor):
+                            if img.dim() == 3:
+                                images_per_item[i].append(self._tensor_to_pil(img))
+                            elif img.dim() == 4:
+                                images_per_item[i].append(self._tensor_to_pil(img[-1]))
 
             new_observation['_lola_images_per_item'] = images_per_item
         else:
@@ -287,8 +290,11 @@ class LolaImageProcessor(ObservationProcessorStep):
                 img_data = observation[cam_key]
                 if isinstance(img_data, Image.Image):
                     images.append(img_data)
-                elif isinstance(img_data, torch.Tensor) and img_data.dim() == 3:
-                    images.append(self._tensor_to_pil(img_data))
+                elif isinstance(img_data, torch.Tensor):
+                    if img_data.dim() == 3:
+                        images.append(self._tensor_to_pil(img_data))
+                    elif img_data.dim() == 4:
+                        images.append(self._tensor_to_pil(img_data[-1]))
                 elif isinstance(img_data, dict) and 'image' in img_data:
                     images.append(img_data['image'])
 
@@ -299,9 +305,10 @@ class LolaImageProcessor(ObservationProcessorStep):
 
     @staticmethod
     def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
-        """Convert [C, H, W] float32 tensor to PIL Image."""
+        """Convert [C, H, W] tensor to PIL Image."""
         img = tensor.permute(1, 2, 0)  # [C, H, W] → [H, W, C]
-        if img.dtype in [torch.float32, torch.float64]:
+        if img.dtype in [torch.float32, torch.float64, torch.bfloat16, torch.float16]:
+            img = img.float()
             img = (img * 255).clamp(0, 255).to(torch.uint8)
         return Image.fromarray(img.cpu().numpy())
     
