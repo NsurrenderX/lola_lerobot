@@ -10,11 +10,13 @@ STRATEGY="fsdp"
 DEVICES=2
 NUM_NODES=1
 BATCH_SIZE=2
-MAX_STEPS=10000
+MAX_STEPS=""
+MAX_EPOCHS=10
 LEARNING_RATE=2.5e-5
 PRECISION="bf16-mixed"
 LOG_EVERY_N_STEPS=10
-SAVE_INTERVAL=100
+SAVE_INTERVAL=''
+SAVE_EVERY_N_EPOCHS="1"
 
 # 数据集参数
 DATASET_REPO_ID="calvin_task_ABC_D_training_v3"
@@ -60,11 +62,9 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --devices ${DEVICES} \
     --num_nodes ${NUM_NODES} \
     --batch_size ${BATCH_SIZE} \
-    --max_steps ${MAX_STEPS} \
     --learning_rate ${LEARNING_RATE} \
     --precision ${PRECISION} \
     --log_every_n_steps ${LOG_EVERY_N_STEPS} \
-    --save_every_n_steps ${SAVE_INTERVAL} \
     --vlm_path ${VLM_PATH} \
     --action_dim ${ACTION_DIM} \
     --action_chunk_size ${ACTION_CHUNK_SIZE} \
@@ -81,6 +81,21 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --norm_mode ${NORM_MODE} \
     --norm_min ${NORM_MIN} \
     --norm_max ${NORM_MAX}"
+
+# 训练终止条件参数（二选一）
+if [ -n "$MAX_STEPS" ]; then
+    cmd="${cmd} --max_steps ${MAX_STEPS}"
+elif [ -n "$MAX_EPOCHS" ]; then
+    cmd="${cmd} --max_epochs ${MAX_EPOCHS}"
+fi
+
+# 保存间隔参数
+if [ -n "$SAVE_INTERVAL" ]; then
+    cmd="${cmd} --save_every_n_steps ${SAVE_INTERVAL}"
+fi
+if [ -n "$SAVE_EVERY_N_EPOCHS" ]; then
+    cmd="${cmd} --save_every_n_epochs ${SAVE_EVERY_N_EPOCHS}"
+fi
 
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history"

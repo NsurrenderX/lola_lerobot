@@ -33,10 +33,12 @@ MASTER_PORT=29500
 # 训练参数
 STRATEGY="fsdp"
 BATCH_SIZE=4
-MAX_STEPS=10000
+MAX_STEPS=""
+MAX_EPOCHS=10
 LEARNING_RATE=2.5e-5
 LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
+SAVE_EVERY_N_EPOCHS=""
 GRADIENT_CLIP_VAL=1.0
 
 # 数据集参数
@@ -73,7 +75,7 @@ NORM_MIN=-0.65
 NORM_MAX=0.65
 
 # Wandb 参数
-WANDB_PROJECT="lola-azure"
+WANDB_PROJECT="lola-azure-calvin"
 WANDB_NAME=""
 WANDB_ENTITY=""
 DISABLE_WANDB=false
@@ -124,6 +126,10 @@ while [[ $# -gt 0 ]]; do
             MAX_STEPS="$2"
             shift 2
             ;;
+        --max_epochs)
+            MAX_EPOCHS="$2"
+            shift 2
+            ;;
         --learning_rate)
             LEARNING_RATE="$2"
             shift 2
@@ -134,6 +140,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --save_every_n_steps)
             SAVE_INTERVAL="$2"
+            shift 2
+            ;;
+        --save_every_n_epochs)
+            SAVE_EVERY_N_EPOCHS="$2"
             shift 2
             ;;
         --gradient_clip_val)
@@ -294,7 +304,8 @@ echo ""
 echo "Training Config:"
 echo "  - Strategy: ${STRATEGY}"
 echo "  - Batch size: ${BATCH_SIZE}"
-echo "  - Max steps: ${MAX_STEPS}"
+echo "  - Max steps: ${MAX_STEPS:-N/A}"
+echo "  - Max epochs: ${MAX_EPOCHS:-N/A}"
 echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
@@ -312,10 +323,8 @@ if [ "$NNODES" -eq 1 ]; then
         src/lerobot/scripts/train_lola_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
-        --max_steps ${MAX_STEPS} \
         --learning_rate ${LEARNING_RATE} \
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
-        --save_every_n_steps ${SAVE_INTERVAL} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
@@ -343,10 +352,8 @@ else
         src/lerobot/scripts/train_lola_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
-        --max_steps ${MAX_STEPS} \
         --learning_rate ${LEARNING_RATE} \
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
-        --save_every_n_steps ${SAVE_INTERVAL} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
@@ -363,6 +370,21 @@ else
         --norm_min ${NORM_MIN} \
         --norm_max ${NORM_MAX} \
         --wandb_project ${WANDB_PROJECT}"
+fi
+
+# 训练终止条件参数（二选一）
+if [ -n "$MAX_STEPS" ]; then
+    cmd="${cmd} --max_steps ${MAX_STEPS}"
+elif [ -n "$MAX_EPOCHS" ]; then
+    cmd="${cmd} --max_epochs ${MAX_EPOCHS}"
+fi
+
+# 保存间隔参数
+if [ -n "$SAVE_INTERVAL" ]; then
+    cmd="${cmd} --save_every_n_steps ${SAVE_INTERVAL}"
+fi
+if [ -n "$SAVE_EVERY_N_EPOCHS" ]; then
+    cmd="${cmd} --save_every_n_epochs ${SAVE_EVERY_N_EPOCHS}"
 fi
 
 # 数据集参数

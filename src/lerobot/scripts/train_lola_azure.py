@@ -248,12 +248,14 @@ class LoLATrainer:
         learning_rate: float = 2.5e-5,
         weight_decay: float = 0.01,
         warmup_ratio: float = 0.03,
-        max_steps: int = 30000,
+        max_steps: int | None = None,
+        max_epochs: int | None = None,
         train_vlm: bool = False,
         strategy: str = "ddp",
         gradient_clip_val: float = 1.0,
         ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
-        save_every_n_steps: int = 500,
+        save_every_n_steps: int | None = 500,
+        save_every_n_epochs: int | None = None,
         log_every_n_steps: int = 10,
         # Wandb 参数
         wandb_project: str = "lola-azure",
@@ -268,12 +270,15 @@ class LoLATrainer:
         self.weight_decay = weight_decay
         self.warmup_ratio = warmup_ratio
         self.max_steps = max_steps
+        self.max_epochs = max_epochs
         self.train_vlm = train_vlm
         self.strategy = strategy
         self.gradient_clip_val = gradient_clip_val
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
+        self.save_every_n_epochs = save_every_n_epochs
         self.log_every_n_steps = log_every_n_steps
+        self.current_epoch = 0
 
         # Wandb 配置
         self.wandb_project = wandb_project
@@ -387,8 +392,15 @@ class LoLATrainer:
             device_id=self.local_rank,
         )
 
-    def setup_optimizer(self):
+    def setup_optimizer(self, total_steps: int | None = None):
         """设置优化器"""
+        if total_steps is None:
+            total_steps = self.max_steps
+        if total_steps is None:
+            raise ValueError("Either max_steps or max_epochs must be provided")
+
+        self.total_steps = total_steps
+
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
@@ -404,7 +416,7 @@ class LoLATrainer:
         self.scheduler = OneCycleLR(
             self.optimizer,
             max_lr=self.learning_rate,
-            total_steps=self.max_steps,
+            total_steps=total_steps,
             pct_start=warmup_ratio,
             anneal_strategy="cos",
         )
@@ -443,7 +455,7 @@ class LoLATrainer:
 
         return loss, loss_dict
 
-    def train(self, train_loader, start_step: int = 0):
+    def train(self, train_loader, start_step: int = 0, start_epoch: int = 0):
         """训练循环"""
         self.global_step = start_step
         self.model.train()
@@ -467,7 +479,8 @@ class LoLATrainer:
                 config={
                     "learning_rate": self.learning_rate,
                     "weight_decay": self.weight_decay,
-                    "max_steps": self.max_steps,
+                    "max_steps": self.total_steps,
+                    "max_epochs": self.max_epochs,
                     "batch_size": train_loader.batch_size,
                     "strategy": self.strategy,
                     "world_size": self.world_size,
@@ -477,11 +490,9 @@ class LoLATrainer:
             )
             logger.info(f"Wandb initialized: {wandb_run_name}")
 
-        logger.info(f"Starting training from step {start_step} to {self.max_steps}")
+        logger.info(f"Starting training from step {start_step}, epoch {start_epoch}")
 
         # 计算 resume 时需要跳过的 batch 数
-        # Map-style 数据集：可以用 skip_epochs + break 快速跳过完整 epoch
-        # IterableDataset（streaming）：没有 __len__，只能逐 batch 迭代丢弃
         try:
             batches_per_epoch = len(train_loader)
             logger.info(f"Total batches per epoch: {batches_per_epoch}")
@@ -489,13 +500,16 @@ class LoLATrainer:
             batches_per_epoch = None
             logger.info("IterableDataset detected: cannot determine batches per epoch")
 
-        if start_step > 0 and batches_per_epoch is not None:
+        # resume skip logic: use start_epoch for epoch-based skip
+        if start_epoch > 0 and batches_per_epoch is not None:
+            skip_epochs = start_epoch
+            skip_batches = start_step % batches_per_epoch if start_step > 0 else 0
+            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
+        elif start_step > 0 and batches_per_epoch is not None:
             skip_epochs = start_step // batches_per_epoch
             skip_batches = start_step % batches_per_epoch
             logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
         elif start_step > 0 and batches_per_epoch is None:
-            # IterableDataset: 无法按 epoch 跳过，for 循环会创建新迭代器从头开始
-            # 所以 streaming resume 时数据会从头开始，但模型/优化器/scheduler 状态已恢复
             skip_epochs = 0
             skip_batches = 0
             logger.warning(
@@ -507,14 +521,20 @@ class LoLATrainer:
             skip_epochs = 0
             skip_batches = 0
 
-        epoch = 0
-        while self.global_step < self.max_steps:
+        epoch = start_epoch
+        while True:
+            # 终止条件
+            if self.max_epochs is not None and epoch >= self.max_epochs:
+                break
+            if self.max_steps is not None and self.global_step >= self.total_steps:
+                break
             epoch += 1
+            self.current_epoch = epoch
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
 
             for batch_idx, batch in enumerate(train_loader):
-                if self.global_step >= self.max_steps:
+                if self.max_steps is not None and self.global_step >= self.total_steps:
                     break
 
                 # Map-style 数据集：跳过已训练的 batch
@@ -568,7 +588,7 @@ class LoLATrainer:
                     lr = self.scheduler.get_last_lr()[0]
                     if self.is_main_process:
                         logger.info(
-                            f"Step {self.global_step}/{self.max_steps} | "
+                            f"Step {self.global_step}/{self.total_steps} | Epoch {epoch}/{self.max_epochs or '-'} | "
                             f"Loss: {loss.item():.4f} | "
                             f"LR: {lr:.2e} | "
                             f"Update: {update_s}s"
@@ -589,7 +609,12 @@ class LoLATrainer:
                             wandb.log(log_dict)
 
                 # 保存 checkpoint
-                if self.global_step % self.save_every_n_steps == 0 and self.is_main_process:
+                should_save = False
+                if self.save_every_n_steps is not None and self.global_step % self.save_every_n_steps == 0:
+                    should_save = True
+                if self.save_every_n_epochs is not None and batch_idx == 0 and epoch % self.save_every_n_epochs == 0:
+                    should_save = True
+                if should_save and self.is_main_process:
                     self.save_checkpoint(ckpt_dir, self.global_step)
 
         # 保存最终 checkpoint
@@ -615,6 +640,7 @@ class LoLATrainer:
                     "model": model_sd,
                     "optimizer": optimizer_sd,
                     "step": [step],
+                    "epoch": [self.current_epoch],
                 },
                 checkpoint_id=ckpt_path,
             )
@@ -631,6 +657,7 @@ class LoLATrainer:
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             torch.save({
                 "step": step,
+                "epoch": self.current_epoch,
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
@@ -648,12 +675,14 @@ class LoLATrainer:
             model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
             # 用 list 包装 step，因为 int 是不可变对象，load 无法原地修改
             step_container = [0]
+            epoch_container = [0]
             load_fsdp_checkpoint(
-                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container},
+                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container, "epoch": epoch_container},
                 checkpoint_id=ckpt_path,
             )
             set_state_dict(self.model, self.optimizer, model_state_dict=model_sd, optim_state_dict=optimizer_sd)
             self.global_step = step_container[0]
+            self.current_epoch = epoch_container[0]
             # 恢复 scheduler 状态
             scheduler_path = os.path.join(ckpt_path, "scheduler.pt")
             if os.path.exists(scheduler_path):
@@ -668,6 +697,7 @@ class LoLATrainer:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             self.global_step = checkpoint.get("step", 0)
+            self.current_epoch = checkpoint.get("epoch", 0)
 
         logger.info(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
@@ -690,10 +720,12 @@ def main():
     # 训练参数
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--max_steps", type=int, default=None, help="Max training steps (mutually exclusive with --max_epochs)")
+    parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs (mutually exclusive with --max_steps)")
     parser.add_argument("--learning_rate", type=float, default=2.5e-5)
     parser.add_argument("--log_every_n_steps", type=int, default=10)
-    parser.add_argument("--save_every_n_steps", type=int, default=500)
+    parser.add_argument("--save_every_n_steps", type=int, default=None, help="Save checkpoint every N steps (mutually exclusive with --save_every_n_epochs)")
+    parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs (mutually exclusive with --save_every_n_steps)")
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
 
     # 模型参数
@@ -758,6 +790,16 @@ def main():
     if args.dataset_repo_id is None and args.dataset_root is None:
         raise ValueError("Either --dataset_repo_id or --dataset_root must be provided.")
 
+    # 检查训练终止条件参数
+    if args.max_steps is None and args.max_epochs is None:
+        raise ValueError("Either --max_steps or --max_epochs must be provided.")
+    if args.max_steps is not None and args.max_epochs is not None:
+        raise ValueError("--max_steps and --max_epochs are mutually exclusive. Please specify only one.")
+
+    # 检查保存间隔参数
+    if args.save_every_n_steps is not None and args.save_every_n_epochs is not None:
+        raise ValueError("--save_every_n_steps and --save_every_n_epochs are mutually exclusive. Please specify only one.")
+
     # 打印配置
     if dist_info["world_rank"] == 0:
         logger.info("=" * 60)
@@ -768,7 +810,8 @@ def main():
         logger.info(f"World Size: {dist_info['world_size']}")
         logger.info(f"Batch Size: {args.batch_size}")
         logger.info(f"Learning Rate: {args.learning_rate}")
-        logger.info(f"Max Steps: {args.max_steps}")
+        logger.info(f"Max Steps: {args.max_steps or 'N/A (epoch-based)'}")
+        logger.info(f"Max Epochs: {args.max_epochs or 'N/A (step-based)'}")
         logger.info(f"VLM Path: {args.vlm_path}")
         logger.info(f"Train VLM: {args.train_vlm}")
         logger.info("=" * 60)
@@ -869,11 +912,13 @@ def main():
         dist_info=dist_info,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
+        max_epochs=args.max_epochs,
         train_vlm=args.train_vlm,
         strategy=args.strategy,
         gradient_clip_val=args.gradient_clip_val,
         ckpt_dir=args.ckpt_dir,
         save_every_n_steps=args.save_every_n_steps,
+        save_every_n_epochs=args.save_every_n_epochs,
         log_every_n_steps=args.log_every_n_steps,
         # Wandb 参数
         wandb_project=args.wandb_project,
@@ -886,18 +931,30 @@ def main():
     if args.disable_wandb:
         trainer.use_wandb = False
 
-    # 设置模型和优化器
+    # 设置模型
     trainer.setup_model()
-    trainer.setup_optimizer()
+
+    # 计算 total_steps
+    if args.max_steps is not None:
+        total_steps = args.max_steps
+    else:
+        batches_per_epoch = len(train_loader)
+        total_steps = args.max_epochs * batches_per_epoch
+        logger.info(f"Epoch-based training: {args.max_epochs} epochs × {batches_per_epoch} batches = {total_steps} total steps")
+
+    # 设置优化器
+    trainer.setup_optimizer(total_steps=total_steps)
 
     # 加载 checkpoint
     start_step = 0
+    start_epoch = 0
     if args.resume:
         trainer.load_checkpoint(args.resume)
         start_step = trainer.global_step
+        start_epoch = trainer.current_epoch
 
     # 开始训练
-    trainer.train(train_loader, start_step=start_step)
+    trainer.train(train_loader, start_step=start_step, start_epoch=start_epoch)
 
     # 清理
     cleanup_distributed()

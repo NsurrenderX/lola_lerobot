@@ -72,7 +72,8 @@ class LoLALightningModule(pl.LightningModule):
         learning_rate: float = 2.5e-5,
         weight_decay: float = 0.01,
         warmup_steps: int = 1000,
-        max_steps: int = 30000,
+        max_steps: int | None = None,
+        max_epochs: int | None = None,
         warmup_ratio: float = 0.03,
         train_vlm: bool = False,
     ):
@@ -85,6 +86,7 @@ class LoLALightningModule(pl.LightningModule):
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
+        self.max_epochs = max_epochs
         self.train_vlm = train_vlm
         
         # 延迟加载模型到 setup() 阶段
@@ -225,10 +227,11 @@ class LoLALightningModule(pl.LightningModule):
         # Cosine decay scheduler
         from torch.optim.lr_scheduler import OneCycleLR
         warmup_ratio = min(self.hparams.warmup_ratio, 0.1)
+        total_steps = self.max_steps if self.max_steps is not None else int(self.trainer.estimated_stepping_batches)
         scheduler = OneCycleLR(
             optimizer,
             max_lr=self.learning_rate,
-            total_steps=self.max_steps,
+            total_steps=total_steps,
             pct_start=warmup_ratio,
             anneal_strategy='cos',
         )
@@ -472,12 +475,15 @@ def main():
     parser.add_argument("--devices", type=int, default=torch.cuda.device_count())
     parser.add_argument("--num_nodes", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--max_steps", type=int, default=1000)
+    parser.add_argument("--max_steps", type=int, default=None, help="Max training steps (mutually exclusive with --max_epochs)")
+    parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs (mutually exclusive with --max_steps)")
     parser.add_argument("--learning_rate", type=float, default=2.5e-5)
     parser.add_argument("--precision", type=str, default="bf16-mixed", choices=["32", "16-mixed", "bf16-mixed"])
     parser.add_argument("--log_every_n_steps", type=int, default=10)
-    parser.add_argument("--save_every_n_steps", type=int, default=500,
-                        help="Save checkpoint every N training steps")
+    parser.add_argument("--save_every_n_steps", type=int, default=None,
+                        help="Save checkpoint every N training steps (mutually exclusive with --save_every_n_epochs)")
+    parser.add_argument("--save_every_n_epochs", type=int, default=None,
+                        help="Save checkpoint every N epochs (mutually exclusive with --save_every_n_steps)")
 
     # 模型参数
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/",
@@ -538,6 +544,16 @@ def main():
     # 检查数据集是否有参数
     if args.dataset_repo_id is None and args.dataset_root is None:
         raise ValueError("Either --dataset_repo_id or --dataset_root must be provided.")
+
+    # 检查训练终止条件参数
+    if args.max_steps is None and args.max_epochs is None:
+        raise ValueError("Either --max_steps or --max_epochs must be provided.")
+    if args.max_steps is not None and args.max_epochs is not None:
+        raise ValueError("--max_steps and --max_epochs are mutually exclusive. Please specify only one.")
+
+    # 检查保存间隔参数
+    if args.save_every_n_steps is not None and args.save_every_n_epochs is not None:
+        raise ValueError("--save_every_n_steps and --save_every_n_epochs are mutually exclusive. Please specify only one.")
     
     # 设置策略
     if args.strategy == "fsdp":
@@ -643,20 +659,26 @@ def main():
         dataset_stats=dataset_metadata.stats,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
+        max_epochs=args.max_epochs,
         train_vlm=args.train_vlm,
     )
     
     # 回调函数
     time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     ckpt_dir = os.path.join(args.ckpt_dir, f"lola-{time_str}")
+    checkpoint_kwargs = {
+        "dirpath": ckpt_dir,
+        "filename": "lola-{step:06d}",
+        "save_top_k": -1,
+        "save_last": True,
+    }
+    if args.save_every_n_steps is not None:
+        checkpoint_kwargs["every_n_train_steps"] = args.save_every_n_steps
+    if args.save_every_n_epochs is not None:
+        checkpoint_kwargs["every_n_epochs"] = args.save_every_n_epochs
+
     callbacks = [
-        ModelCheckpoint(
-            dirpath=ckpt_dir,
-            filename="lola-{step:06d}",
-            save_top_k=-1,  # -1 表示保存所有 checkpoint
-            every_n_train_steps=args.save_every_n_steps,
-            save_last=True,
-        ),
+        ModelCheckpoint(**checkpoint_kwargs),
         LearningRateMonitor(logging_interval="step"),
     ]
     
@@ -670,14 +692,13 @@ def main():
     
     # 创建 Trainer
     gradient_clip_val = 1.0 if args.strategy != "fsdp" else None
-    
-    trainer = pl.Trainer(
+
+    trainer_kwargs = dict(
         accelerator="gpu",
         devices=args.devices,
         num_nodes=args.num_nodes,
         strategy=strategy,
         precision=args.precision,
-        max_steps=args.max_steps,
         log_every_n_steps=args.log_every_n_steps,
         callbacks=callbacks,
         logger=logger,
@@ -687,6 +708,12 @@ def main():
         enable_progress_bar=True,
         sync_batchnorm=True,
     )
+    if args.max_steps is not None:
+        trainer_kwargs["max_steps"] = args.max_steps
+    if args.max_epochs is not None:
+        trainer_kwargs["max_epochs"] = args.max_epochs
+
+    trainer = pl.Trainer(**trainer_kwargs)
     
     # 打印配置信息
     print("=" * 60)
@@ -698,8 +725,10 @@ def main():
     print(f"Num Nodes: {args.num_nodes}")
     print(f"Batch Size: {args.batch_size}")
     print(f"Learning Rate: {args.learning_rate}")
-    print(f"Max Steps: {args.max_steps}")
-    print(f"Save Every N Steps: {args.save_every_n_steps}")
+    print(f"Max Steps: {args.max_steps or 'N/A (epoch-based)'}")
+    print(f"Max Epochs: {args.max_epochs or 'N/A (step-based)'}")
+    print(f"Save Every N Steps: {args.save_every_n_steps or 'N/A'}")
+    print(f"Save Every N Epochs: {args.save_every_n_epochs or 'N/A'}")
     print(f"Precision: {args.precision}")
     print(f"VLM Path: {args.vlm_path}")
     print(f"Train VLM: {args.train_vlm}")
