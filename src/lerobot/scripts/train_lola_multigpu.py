@@ -211,6 +211,20 @@ class LoLALightningModule(pl.LightningModule):
 
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        """验证步骤：在验证数据上计算 v-loss 和 action_loss"""
+        special_data = self._extract_special_fields(batch)
+        batch = self.preprocessor(batch)
+        batch = self._restore_special_fields(batch, special_data)
+
+        loss, loss_dict = self(batch)
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        for k, v in loss_dict.items():
+            if k != "loss":
+                self.log(f"val_{k}", v, prog_bar=False, sync_dist=True)
+
+        return loss
+
     def configure_optimizers(self):
         """配置优化器"""
         # 只优化需要梯度的参数
@@ -469,6 +483,16 @@ def main():
                         help="Local dataset root directory (optional)")
     parser.add_argument("--episodes", type=int, nargs="*", default=None,
                         help="Specific episodes to load (optional)")
+
+    # 验证集参数
+    parser.add_argument("--val_dataset_repo_id", type=str, default=None,
+                        help="Validation dataset repo ID (separate from training)")
+    parser.add_argument("--val_dataset_root", type=str, default=None,
+                        help="Local root for validation dataset (optional)")
+    parser.add_argument("--val_batch_size", type=int, default=None,
+                        help="Validation batch size (defaults to batch_size)")
+    parser.add_argument("--val_frequency", type=int, default=None,
+                        help="Validate every N training steps")
     
     # 训练策略参数
     parser.add_argument("--strategy", type=str, default="fsdp", choices=["fsdp", "deepspeed", "ddp"])
@@ -652,6 +676,32 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
     )
+
+    # 创建验证集 DataLoader（如果提供了验证数据集）
+    val_loader = None
+    if args.val_dataset_repo_id or args.val_dataset_root:
+        print("Creating validation dataset...")
+        val_dataset = create_lola_dataset(
+            repo_id=args.val_dataset_repo_id,
+            config=config,
+            root=args.val_dataset_root,
+            use_lola_dataset=args.load_full_history,
+            max_history_length=args.max_history_length,
+            history_padding_side=args.history_padding_side,
+            norm_action=norm_action,
+            norm_min=args.norm_min,
+            norm_max=args.norm_max,
+        )
+        val_batch_size = args.val_batch_size or args.batch_size
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+        print(f"Total validation samples: {len(val_dataset)}")
     
     # 创建模型
     model = LoLALightningModule(
@@ -712,6 +762,8 @@ def main():
         trainer_kwargs["max_steps"] = args.max_steps
     if args.max_epochs is not None:
         trainer_kwargs["max_epochs"] = args.max_epochs
+    if args.val_frequency is not None:
+        trainer_kwargs["val_check_interval"] = args.val_frequency
 
     trainer = pl.Trainer(**trainer_kwargs)
     
@@ -738,12 +790,16 @@ def main():
     print(f"Load Full History: {args.load_full_history}")
     print(f"Max History Length: {args.max_history_length}")
     print(f"History Padding Side: {args.history_padding_side}")
+    print(f"Validation Dataset: {args.val_dataset_repo_id or args.val_dataset_root or 'N/A'}")
+    print(f"Val Batch Size: {args.val_batch_size or args.batch_size}")
+    print(f"Val Frequency: {args.val_frequency or 'N/A'}")
     print("=" * 60)
     
     # 开始训练
     trainer.fit(
         model,
         train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
     )
 
     print("Training completed!")

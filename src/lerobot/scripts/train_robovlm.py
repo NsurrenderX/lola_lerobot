@@ -307,7 +307,7 @@ class RoboVLMTrainer:
 
         return loss, loss_dict
 
-    def train(self, train_loader, start_step: int = 0):
+    def train(self, train_loader, start_step: int = 0, val_loader=None, val_every_n_steps=None):
         """Training loop supporting both step-based and epoch-based modes."""
         self.global_step = start_step
         self.model.train()
@@ -448,14 +448,122 @@ class RoboVLMTrainer:
             if self.global_step % self.save_every_n_steps == 0:
                 self.save_checkpoint(ckpt_dir, self.global_step)
 
+            # Validation
+            if val_loader is not None and val_every_n_steps is not None and self.global_step % val_every_n_steps == 0:
+                self.validate(val_loader)
+                self.validate_inference(val_loader)
+
             data_yield_start = time.monotonic()
 
         self.save_checkpoint(ckpt_dir, self.global_step, is_final=True,
                              epoch=self.current_epoch + 1 if self.max_epochs else None)
+
+        # Final validation
+        if val_loader is not None:
+            self.validate(val_loader)
+            self.validate_inference(val_loader)
+
         _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
 
         if self.use_wandb:
             wandb.finish()
+
+    def validate(self, val_loader):
+        """在验证集上计算 forward loss（arm loss, gripper loss, gripper accuracy）"""
+        self.model.eval()
+        total_loss = 0.0
+        total_loss_arm = 0.0
+        total_loss_gripper = 0.0
+        total_acc_gripper = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss, loss_dict = self.model(batch)
+                total_loss += loss.item()
+                total_loss_arm += loss_dict["loss_arm"]
+                total_loss_gripper += loss_dict["loss_gripper"]
+                total_acc_gripper += loss_dict["acc_gripper"]
+                num_batches += 1
+
+        if num_batches == 0:
+            return {}
+
+        avg_loss = total_loss / num_batches
+        avg_loss_arm = total_loss_arm / num_batches
+        avg_loss_gripper = total_loss_gripper / num_batches
+        avg_acc_gripper = total_acc_gripper / num_batches
+
+        metrics = {
+            "val_loss": avg_loss,
+            "val_loss_arm": avg_loss_arm,
+            "val_loss_gripper": avg_loss_gripper,
+            "val_acc_gripper": avg_acc_gripper,
+        }
+
+        if self.use_wandb:
+            wandb.log({f"val/{k}": v for k, v in metrics.items()})
+
+        _log(f"Validation: loss={avg_loss:.4f} arm={avg_loss_arm:.4f} "
+             f"gripper={avg_loss_gripper:.4f} acc={avg_acc_gripper:.4f}")
+
+        self.model.train()
+        return metrics
+
+    def validate_inference(self, val_loader, max_samples=100):
+        """运行推理管线，对比预测动作与真实动作"""
+        from lerobot.datasets.robovlm_dataset import unnoramalize_action
+        import torch.nn.functional as F
+
+        self.model.eval()
+        all_mse = []
+        all_l1 = []
+        sample_count = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if sample_count >= max_samples:
+                    break
+
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+                # Ground truth: last timestep's action chunk
+                gt_actions = batch["action_chunck"][:, -1, :, :].clone()  # [B, fwd, 7]
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred_actions = self.model.predict_action_chunk(batch)  # [B, fwd, 7]
+
+                # Unnormalize ground truth to match prediction space
+                gt_actions = unnoramalize_action(gt_actions, self.config.norm_min, self.config.norm_max)
+                # Binarize gripper dim in gt to match prediction
+                gt_actions[..., -1] = (gt_actions[..., -1] > 0).float() * 2 - 1
+
+                # Match lengths
+                min_len = min(pred_actions.shape[1], gt_actions.shape[1])
+                mse = F.mse_loss(pred_actions[:, :min_len], gt_actions[:, :min_len].to(pred_actions.device))
+                l1 = F.l1_loss(pred_actions[:, :min_len], gt_actions[:, :min_len].to(pred_actions.device))
+                all_mse.append(mse.item())
+                all_l1.append(l1.item())
+                sample_count += pred_actions.shape[0]
+
+        if not all_mse:
+            return {}
+
+        metrics = {
+            "val_action_mse": sum(all_mse) / len(all_mse),
+            "val_action_l1": sum(all_l1) / len(all_l1),
+        }
+
+        if self.use_wandb:
+            wandb.log({f"val/{k}": v for k, v in metrics.items()})
+
+        _log(f"Validation Inference: action_mse={metrics['val_action_mse']:.6f} "
+             f"action_l1={metrics['val_action_l1']:.6f}")
+
+        self.model.train()
+        return metrics
 
     def save_checkpoint(self, ckpt_dir, step, is_final=False, epoch=None):
         """Save checkpoint."""
@@ -514,6 +622,14 @@ def parse_args():
     # Dataset
     parser.add_argument("--dataset_repo_id", type=str, default=None, help="LeRobot dataset repo ID")
     parser.add_argument("--dataset_root", type=str, default=None, help="Local dataset root path")
+
+    # Validation dataset
+    parser.add_argument("--val_dataset_repo_id", type=str, default=None,
+                        help="Validation dataset repo ID (separate from training)")
+    parser.add_argument("--val_dataset_root", type=str, default=None,
+                        help="Local root for validation dataset (optional)")
+    parser.add_argument("--val_every_n_steps", type=int, default=None,
+                        help="Validate every N training steps")
 
     # Training
     parser.add_argument("--learning_rate", type=float, default=2e-5)
@@ -668,6 +784,26 @@ def main():
         collate_fn=train_dataset.collater,
     )
 
+    # 创建验证集 DataLoader（如果提供了验证数据集）
+    val_loader = None
+    if args.val_dataset_repo_id or args.val_dataset_root:
+        _log("Creating validation dataset...")
+        val_dataset = RoboVLMDataset(
+            repo_id=args.val_dataset_repo_id,
+            config=config,
+            root=args.val_dataset_root,
+            tokenizer=tokenizer,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=val_dataset.collater,
+        )
+        _log(f"Validation dataset size: {len(val_dataset)}")
+
     _log(f"Dataset size: {len(train_dataset)}, batch_size: {args.batch_size}, "
          f"batches_per_epoch: {len(train_loader)}")
 
@@ -678,7 +814,8 @@ def main():
         trainer.load_checkpoint(args.resume)
         start_step = trainer.global_step
 
-    trainer.train(train_loader, start_step=start_step)
+    trainer.train(train_loader, start_step=start_step,
+                  val_loader=val_loader, val_every_n_steps=args.val_every_n_steps)
 
     cleanup_distributed()
     _log("Training completed!")

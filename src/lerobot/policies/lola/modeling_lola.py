@@ -531,11 +531,16 @@ class LoLAPytorch(nn.Module):
         
         # 7. 组合损失
         # action_loss_weight 控制 action_out_proj 训练的强度
-        # 建议从配置中读取，默认为 1.0
         action_loss_weight = getattr(self.config, 'action_loss_weight', 1.0)
-        total_loss = v_loss.mean() + action_loss_weight * action_loss.mean()
-        
-        return total_loss
+        v_loss_mean = v_loss.mean()
+        action_loss_mean = action_loss.mean()
+        total_loss = v_loss_mean + action_loss_weight * action_loss_mean
+
+        return {
+            "total_loss": total_loss,
+            "v_loss": v_loss_mean,
+            "action_loss": action_loss_mean,
+        }
 
     @torch.no_grad()
     def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None):
@@ -1136,9 +1141,11 @@ class LoLAPolicy(PreTrainedPolicy):
             vlm_attention_mask=vlm_attention_mask,
         )
 
-        loss = losses.mean()
+        loss = losses["total_loss"]
         loss_dict = {
             "loss": loss.item(),
+            "v_loss": losses["v_loss"].item(),
+            "action_loss": losses["action_loss"].item(),
         }
         return loss, loss_dict
 

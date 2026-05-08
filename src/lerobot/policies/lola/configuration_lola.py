@@ -62,6 +62,7 @@ class LoLAConfig(PreTrainedConfig):
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+    action_loss_weight: float = 1.0              # 动作空间重构损失权重
     
     # Training settings
     gradient_checkpointing: bool = True
