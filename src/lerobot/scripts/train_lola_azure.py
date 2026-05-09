@@ -341,8 +341,6 @@ def get_deepspeed_config(
     train_vlm: bool = False,
     batch_size: int = 4,
     world_size: int = 1,
-    total_steps: int = 10000,
-    warmup_ratio: float = 0.03,
 ):
     """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
 
@@ -376,15 +374,6 @@ def get_deepspeed_config(
                 "betas": [0.9, 0.95],
                 "eps": 1e-8,
                 "weight_decay": weight_decay,
-            },
-        },
-        "scheduler": {
-            "type": "OneCycle",
-            "params": {
-                "max_lr": learning_rate,
-                "total_num_steps": total_steps,
-                "pct_start": min(warmup_ratio, 0.1),
-                "anneal_strategy": "cos",
             },
         },
         "activation_checkpointing": {
@@ -717,8 +706,6 @@ class LoLATrainer:
             train_vlm=self.train_vlm,
             batch_size=self.batch_size,
             world_size=self.world_size,
-            total_steps=self.total_steps,
-            warmup_ratio=self.warmup_ratio,
         )
         if self.deepspeed_config_path is not None:
             import json
@@ -728,10 +715,23 @@ class LoLATrainer:
 
         trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
 
+        # DeepSpeed passes the basic (unwrapped) optimizer to this callable,
+        # so OneCycleLR's isinstance(optimizer, Optimizer) check passes.
+        def lr_scheduler_callable(optimizer):
+            from torch.optim.lr_scheduler import OneCycleLR
+            return OneCycleLR(
+                optimizer,
+                max_lr=self.learning_rate,
+                total_steps=self.total_steps,
+                pct_start=min(self.warmup_ratio, 0.1),
+                anneal_strategy="cos",
+            )
+
         model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=self.policy,
             model_parameters=trainable_params,
             config=ds_config,
+            lr_scheduler=lr_scheduler_callable,
             dist_init_required=False,
         )
 
