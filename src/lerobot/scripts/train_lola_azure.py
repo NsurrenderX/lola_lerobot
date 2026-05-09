@@ -339,6 +339,8 @@ def get_deepspeed_config(
     weight_decay: float = 0.01,
     gradient_clip_val: float = 1.0,
     train_vlm: bool = False,
+    batch_size: int = 4,
+    world_size: int = 1,
 ):
     """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
 
@@ -363,8 +365,8 @@ def get_deepspeed_config(
         },
         "gradient_accumulation_steps": 1,
         "gradient_clipping": gradient_clip_val,
-        "train_batch_size": "auto",
-        "train_micro_batch_size_per_gpu": "auto",
+        "train_batch_size": batch_size * world_size,
+        "train_micro_batch_size_per_gpu": batch_size,
         "optimizer": {
             "type": "AdamW",
             "params": {
@@ -533,6 +535,7 @@ class LoLATrainer:
         train_vlm: bool = False,
         strategy: str = "ddp",
         gradient_clip_val: float = 1.0,
+        batch_size: int = 4,
         ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
         save_every_n_steps: int | None = 500,
         save_every_n_epochs: int | None = None,
@@ -555,6 +558,7 @@ class LoLATrainer:
         self.train_vlm = train_vlm
         self.strategy = strategy
         self.gradient_clip_val = gradient_clip_val
+        self.batch_size = batch_size
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
         self.save_every_n_epochs = save_every_n_epochs
@@ -700,6 +704,8 @@ class LoLATrainer:
             weight_decay=self.weight_decay,
             gradient_clip_val=self.gradient_clip_val,
             train_vlm=self.train_vlm,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
         )
         if self.deepspeed_config_path is not None:
             import json
@@ -1466,6 +1472,7 @@ def main():
         train_vlm=args.train_vlm,
         strategy=args.strategy,
         gradient_clip_val=args.gradient_clip_val,
+        batch_size=args.batch_size,
         ckpt_dir=args.ckpt_dir,
         save_every_n_steps=args.save_every_n_steps,
         save_every_n_epochs=args.save_every_n_epochs,
