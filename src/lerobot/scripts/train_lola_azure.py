@@ -341,6 +341,8 @@ def get_deepspeed_config(
     train_vlm: bool = False,
     batch_size: int = 4,
     world_size: int = 1,
+    total_steps: int = 10000,
+    warmup_ratio: float = 0.03,
 ):
     """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
 
@@ -374,6 +376,15 @@ def get_deepspeed_config(
                 "betas": [0.9, 0.95],
                 "eps": 1e-8,
                 "weight_decay": weight_decay,
+            },
+        },
+        "scheduler": {
+            "type": "OneCycle",
+            "params": {
+                "max_lr": learning_rate,
+                "total_num_steps": total_steps,
+                "pct_start": min(warmup_ratio, 0.1),
+                "anneal_strategy": "cos",
             },
         },
         "activation_checkpointing": {
@@ -706,6 +717,8 @@ class LoLATrainer:
             train_vlm=self.train_vlm,
             batch_size=self.batch_size,
             world_size=self.world_size,
+            total_steps=self.total_steps,
+            warmup_ratio=self.warmup_ratio,
         )
         if self.deepspeed_config_path is not None:
             import json
@@ -715,26 +728,17 @@ class LoLATrainer:
 
         trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
 
-        model_engine, optimizer, _, _ = deepspeed.initialize(
+        model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=self.policy,
             model_parameters=trainable_params,
             config=ds_config,
             dist_init_required=False,
         )
 
-        from torch.optim.lr_scheduler import OneCycleLR
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=self.learning_rate,
-            total_steps=self.total_steps,
-            pct_start=min(self.warmup_ratio, 0.1),
-            anneal_strategy="cos",
-        )
-
         self.model = model_engine
         self.model_engine = model_engine
         self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.scheduler = lr_scheduler
 
         self._configure_deepspeed_checkpointing()
 
@@ -988,8 +992,9 @@ class LoLATrainer:
                     self.scaler.update()
                 opt_s = time.monotonic() - opt_start
 
-                # 学习率调度
-                self.scheduler.step()
+                # 学习率调度（DeepSpeed engine.step() 已内置 scheduler.step()）
+                if self.strategy != "deepspeed":
+                    self.scheduler.step()
 
                 self.global_step += 1
 
@@ -1132,7 +1137,6 @@ class LoLATrainer:
             client_state = {
                 "step": step,
                 "epoch": self.current_epoch,
-                "scheduler_state_dict": self.scheduler.state_dict(),
             }
             self.model.save_checkpoint(
                 save_dir=ckpt_dir,
@@ -1190,8 +1194,6 @@ class LoLATrainer:
                 raise ValueError(f"Failed to load DeepSpeed checkpoint from {ckpt_path}")
             self.global_step = client_state.get("step", 0)
             self.current_epoch = client_state.get("epoch", 0)
-            if "scheduler_state_dict" in client_state:
-                self.scheduler.load_state_dict(client_state["scheduler_state_dict"])
         elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import load as load_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
