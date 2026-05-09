@@ -40,7 +40,7 @@ MASTER_ADDR="127.0.0.1"  # 使用 IP 而非 localhost，避免 IPv6 问题
 MASTER_PORT=29500
 
 # 训练参数
-STRATEGY="fsdp"
+STRATEGY="deepspeed"
 BATCH_SIZE=4
 MAX_STEPS=""
 MAX_EPOCHS=10
@@ -77,9 +77,12 @@ VLM_EXTRACT_LAYERS="8 16 24"
 MAX_IMAGE_PIXELS=230400
 MIN_IMAGE_PIXELS=65536
 NUM_INFERENCE_STEPS=10
+GRIPPER_DIMS="-1"
+ACTION_LOSS_WEIGHT=1.0
+GRIPPER_LOSS_WEIGHT=1.0
 
-# 归一化参数
-NORM_MODE="default"
+# 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
+NORM_MODE="zscore"
 NORM_MIN=-0.65
 NORM_MAX=0.65
 
@@ -91,6 +94,9 @@ DISABLE_WANDB=false
 
 # DataLoader 参数
 NUM_WORKERS=8
+
+# DeepSpeed 参数
+DEEPSPEED_CONFIG=""
 
 # Resume 参数
 RESUME=""
@@ -251,6 +257,18 @@ while [[ $# -gt 0 ]]; do
             NUM_INFERENCE_STEPS="$2"
             shift 2
             ;;
+        --gripper_dims)
+            GRIPPER_DIMS="$2"
+            shift 2
+            ;;
+        --gripper_loss_weight)
+            GRIPPER_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
+        --action_loss_weight)
+            ACTION_LOSS_WEIGHT="$2"
+            shift 2
+            ;;
 
         # 归一化参数
         --norm_mode)
@@ -289,6 +307,10 @@ while [[ $# -gt 0 ]]; do
             RESUME="$2"
             shift 2
             ;;
+        --deepspeed_config)
+            DEEPSPEED_CONFIG="$2"
+            shift 2
+            ;;
 
         *)
             echo "Unknown argument: $1"
@@ -317,8 +339,10 @@ echo "  - Max steps: ${MAX_STEPS:-N/A}"
 echo "  - Max epochs: ${MAX_EPOCHS:-N/A}"
 echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
+echo "  - Norm mode: ${NORM_MODE}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - VLM path: ${VLM_PATH}"
+echo "  - DeepSpeed config: ${DEEPSPEED_CONFIG:-default}"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -345,6 +369,9 @@ if [ "$NNODES" -eq 1 ]; then
         --max_image_pixels ${MAX_IMAGE_PIXELS} \
         --min_image_pixels ${MIN_IMAGE_PIXELS} \
         --num_inference_steps ${NUM_INFERENCE_STEPS} \
+        --gripper_dims ${GRIPPER_DIMS} \
+        --action_loss_weight ${ACTION_LOSS_WEIGHT} \
+        --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --num_workers ${NUM_WORKERS} \
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
@@ -374,6 +401,9 @@ else
         --max_image_pixels ${MAX_IMAGE_PIXELS} \
         --min_image_pixels ${MIN_IMAGE_PIXELS} \
         --num_inference_steps ${NUM_INFERENCE_STEPS} \
+        --gripper_dims ${GRIPPER_DIMS} \
+        --action_loss_weight ${ACTION_LOSS_WEIGHT} \
+        --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --num_workers ${NUM_WORKERS} \
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
@@ -435,6 +465,11 @@ fi
 # Resume 参数
 if [ -n "$RESUME" ]; then
     cmd="${cmd} --resume ${RESUME}"
+fi
+
+# DeepSpeed 参数
+if [ -n "$DEEPSPEED_CONFIG" ]; then
+    cmd="${cmd} --deepspeed_config ${DEEPSPEED_CONFIG}"
 fi
 
 echo "Running: $cmd"

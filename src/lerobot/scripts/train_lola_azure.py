@@ -67,6 +67,12 @@ try:
 except ImportError:
     HAS_NVML = False
 
+try:
+    import deepspeed
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
+
 # 设置环境变量
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
@@ -328,6 +334,56 @@ class InterconnectMonitor:
             self.available = False
 
 
+def get_deepspeed_config(
+    learning_rate: float = 2.5e-5,
+    weight_decay: float = 0.01,
+    gradient_clip_val: float = 1.0,
+    train_vlm: bool = False,
+):
+    """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
+
+    Key design decisions:
+    - No CPU offload: 183GB per B200 sufficient for 2B-10B models
+    - overlap_comm + reduce_scatter: efficient on NVLink-connected systems
+    - contiguous_gradients + round_robin_gradients: memory efficiency
+    - Bucket sizes 5e8: large buckets reduce communication rounds on NVLink
+    - partition_activations=False: not needed at 4-5B scale on 183GB GPUs; enable for 10B+
+    - Optimizer in config: DeepSpeed creates AdamW, ensuring proper ZeRO-2 state partitioning
+    """
+    return {
+        "bf16": {"enabled": True},
+        "zero_optimization": {
+            "stage": 2,
+            "allgather_bucket_size": 5e8,
+            "reduce_bucket_size": 5e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "contiguous_gradients": True,
+            "round_robin_gradients": True,
+        },
+        "gradient_accumulation_steps": 1,
+        "gradient_clipping": gradient_clip_val,
+        "train_batch_size": "auto",
+        "train_micro_batch_size_per_gpu": "auto",
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": learning_rate,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "weight_decay": weight_decay,
+            },
+        },
+        "activation_checkpointing": {
+            "partition_activations": False,
+            "cpu_checkpointing": False,
+            "contiguous_memory_optimization": False,
+            "number_checkpoints": None,
+            "synchronize_checkpoint_boundary": False,
+        },
+    }
+
+
 # ----------------------------------------------------------------------
 # 数据集工具函数
 # ----------------------------------------------------------------------
@@ -341,9 +397,11 @@ def create_lola_dataset(
     use_lola_dataset: bool = False,
     max_history_length: int = 100,
     history_padding_side: str = "left",
-    norm_action: bool = False,
+    norm_action: bool | str = False,
     norm_min: float = -0.65,
     norm_max: float = 0.65,
+    gripper_dim_indices_abs: tuple[int, ...] | None = None,
+    dataset_stats: dict | None = None,
 ) -> LeRobotDataset | LoLADataset:
     """创建 LoLA 训练用的数据集。"""
     dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
@@ -372,6 +430,7 @@ def create_lola_dataset(
             norm_action=norm_action,
             norm_min=norm_min,
             norm_max=norm_max,
+            gripper_dim_indices_abs=gripper_dim_indices_abs,
         )
     else:
         dataset = LeRobotDataset(
@@ -382,8 +441,42 @@ def create_lola_dataset(
             delta_timestamps=delta_timestamps,
             video_backend=video_backend,
         )
+        # Z-score mode with LeRobotDataset: wrap with per-item normalization
+        if norm_action == "zscore":
+            from lerobot.datasets.robovlm_dataset import normalize_action_zscore
+            import numpy as np
+            _mean = dataset_stats["action"]["mean"]
+            _std = dataset_stats["action"]["std"]
+            action_mean = torch.tensor(_mean, dtype=torch.float32) if isinstance(_mean, np.ndarray) else _mean.float()
+            action_std = torch.tensor(_std, dtype=torch.float32) if isinstance(_std, np.ndarray) else _std.float()
+            dataset = _ZScoreActionDataset(dataset, action_mean, action_std, gripper_dim_indices_abs)
+            _log(f"Wrapped LeRobotDataset with ZScoreActionDataset (gripper dims: {gripper_dim_indices_abs})")
 
     return dataset
+
+
+class _ZScoreActionDataset:
+    """Wrapper that applies z-score arm normalization + gripper binarization to LeRobotDataset items."""
+
+    def __init__(self, dataset, action_mean: torch.Tensor, action_std: torch.Tensor,
+                 gripper_dim_indices_abs: tuple[int, ...] | None = None):
+        self.dataset = dataset
+        self.action_mean = action_mean
+        self.action_std = action_std
+        self.gripper_dim_indices_abs = gripper_dim_indices_abs
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        from lerobot.datasets.robovlm_dataset import normalize_action_zscore
+        item = self.dataset[idx]
+        if "action" in item and isinstance(item["action"], torch.Tensor):
+            item["action"] = normalize_action_zscore(
+                item["action"], self.action_mean, self.action_std,
+                self.gripper_dim_indices_abs,
+            )
+        return item
 
 
 def collate_fn(batch):
@@ -449,6 +542,7 @@ class LoLATrainer:
         wandb_name: str | None = None,
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
+        deepspeed_config_path: str | None = None,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -466,6 +560,7 @@ class LoLATrainer:
         self.save_every_n_epochs = save_every_n_epochs
         self.log_every_n_steps = log_every_n_steps
         self.current_epoch = 0
+        self.deepspeed_config_path = deepspeed_config_path
 
         # Wandb 配置
         self.wandb_project = wandb_project
@@ -486,6 +581,7 @@ class LoLATrainer:
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.model_engine = None  # DeepSpeed engine (set by _setup_deepspeed)
         self.preprocessor = None
         self.postprocessor = None
 
@@ -499,6 +595,11 @@ class LoLATrainer:
         self.interconnect_monitor = None
 
     def setup_model(self):
+        # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        cudnn_sdp_available = torch.backends.cuda.cudnn_sdp_enabled()
+        _log(f"cuDNN SDPA backend: enabled={cudnn_sdp_available}")
+        
         """设置模型"""
         _log(f"Loading LoLA Policy on {self.device}...")
 
@@ -530,6 +631,8 @@ class LoLATrainer:
         if self.is_distributed:
             if self.strategy == "fsdp":
                 self._setup_fsdp()
+            elif self.strategy == "deepspeed":
+                self.model = self.policy  # DeepSpeed wrapping deferred to _setup_deepspeed()
             else:
                 self._setup_ddp()
         else:
@@ -555,7 +658,7 @@ class LoLATrainer:
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
         from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
-        from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor
+        from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor, LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -571,6 +674,8 @@ class LoLATrainer:
                 Flux2TransformerBlock,
                 Flux2SingleTransformerBlock,
                 LolaVLMFeatureExtractor,
+                LoLADualExpertDoubleBlock,
+                LoLADualExpertSingleBlock,
             }
         )
 
@@ -582,6 +687,75 @@ class LoLATrainer:
             device_id=self.local_rank,
         )
 
+    def _setup_deepspeed(self):
+        """Set up DeepSpeed ZeRO-2 engine. Called after setup_model() and setup_optimizer()."""
+        if not HAS_DEEPSPEED:
+            raise ImportError("DeepSpeed required for strategy='deepspeed'. pip install deepspeed")
+
+        import deepspeed
+        _log("Setting up DeepSpeed ZeRO-2...")
+
+        ds_config = get_deepspeed_config(
+            learning_rate=self.learning_rate,
+            weight_decay=self.weight_decay,
+            gradient_clip_val=self.gradient_clip_val,
+            train_vlm=self.train_vlm,
+        )
+        if self.deepspeed_config_path is not None:
+            import json
+            with open(self.deepspeed_config_path) as f:
+                custom_config = json.load(f)
+            ds_config.update(custom_config)
+
+        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+
+        model_engine, optimizer, _, _ = deepspeed.initialize(
+            model=self.policy,
+            model_parameters=trainable_params,
+            config=ds_config,
+            dist_init_required=False,
+        )
+
+        from torch.optim.lr_scheduler import OneCycleLR
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=self.learning_rate,
+            total_steps=self.total_steps,
+            pct_start=min(self.warmup_ratio, 0.1),
+            anneal_strategy="cos",
+        )
+
+        self.model = model_engine
+        self.model_engine = model_engine
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+
+        self._configure_deepspeed_checkpointing()
+
+        trainable_count = sum(p.numel() for p in trainable_params)
+        _log(f"DeepSpeed ZeRO-2 initialized: {trainable_count:,} trainable params")
+
+    def _configure_deepspeed_checkpointing(self):
+        """Replace PyTorch checkpointing with DeepSpeed's in LoLA model."""
+        if not self.config.gradient_checkpointing:
+            return
+
+        _log("Configuring DeepSpeed activation checkpointing for DiT...")
+        self.policy.model.set_deepspeed_checkpointing()
+
+        if self.train_vlm:
+            _log("Configuring DeepSpeed activation checkpointing for VLM...")
+            import deepspeed
+            ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
+            vlm = self.policy.vlm
+            if hasattr(vlm, '_gradient_checkpointing_func'):
+                vlm._gradient_checkpointing_func = ds_fn
+            for module in vlm.modules():
+                if hasattr(module, '_gradient_checkpointing_func'):
+                    module._gradient_checkpointing_func = ds_fn
+            if hasattr(self.policy, '_vlm_forward_mode'):
+                self.policy._vlm_forward_mode = "output_hidden_states"
+
     def setup_optimizer(self, total_steps: int | None = None):
         """设置优化器"""
         if total_steps is None:
@@ -590,6 +764,10 @@ class LoLATrainer:
             raise ValueError("Either max_steps or max_epochs must be provided")
 
         self.total_steps = total_steps
+
+        if self.strategy == "deepspeed":
+            _log("Skipping optimizer creation - DeepSpeed will create from config")
+            return
 
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
@@ -646,8 +824,12 @@ class LoLATrainer:
 
         # 前向传播（混合精度）
         t2 = time.monotonic()
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        if self.strategy == "deepspeed":
+            # DeepSpeed handles BF16 autocast internally when bf16.enabled=True
             loss, loss_dict = self.model(batch)
+        else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                loss, loss_dict = self.model(batch)
         t_model_fwd = time.monotonic() - t2
 
         if timing_dict is not None:
@@ -749,7 +931,8 @@ class LoLATrainer:
 
                 step_start = time.monotonic()
 
-                self.optimizer.zero_grad()
+                if self.strategy != "deepspeed":
+                    self.optimizer.zero_grad()
 
                 # ── Forward pass (with split timing) ────────────────
                 fwd_timing = {}
@@ -762,7 +945,9 @@ class LoLATrainer:
 
                 # ── Backward pass (with timing) ──────────────────────
                 bwd_start = time.monotonic()
-                if self.use_bf16:
+                if self.strategy == "deepspeed":
+                    self.model.backward(loss)
+                elif self.use_bf16:
                     loss.backward()
                 else:
                     self.scaler.scale(loss).backward()
@@ -770,7 +955,9 @@ class LoLATrainer:
 
                 # ── Gradient clipping ─────────────────────────────────
                 clip_start = time.monotonic()
-                if self.gradient_clip_val > 0:
+                if self.strategy == "deepspeed":
+                    grad_norm = None  # DeepSpeed clips from config
+                elif self.gradient_clip_val > 0:
                     if not self.use_bf16:
                         self.scaler.unscale_(self.optimizer)
                     if self.strategy == "fsdp":
@@ -786,7 +973,9 @@ class LoLATrainer:
 
                 # ── Optimizer step ────────────────────────────────────
                 opt_start = time.monotonic()
-                if self.use_bf16:
+                if self.strategy == "deepspeed":
+                    self.model.step()
+                elif self.use_bf16:
                     self.optimizer.step()
                 else:
                     self.scaler.step(self.optimizer)
@@ -909,11 +1098,16 @@ class LoLATrainer:
                     should_save = True
                 if self.save_every_n_epochs is not None and batch_idx == 0 and epoch % self.save_every_n_epochs == 0:
                     should_save = True
-                if should_save and self.is_main_process:
+                if self.strategy == "deepspeed":
+                    if should_save:
+                        self.save_checkpoint(ckpt_dir, self.global_step)
+                elif should_save and self.is_main_process:
                     self.save_checkpoint(ckpt_dir, self.global_step)
 
         # 保存最终 checkpoint
-        if self.is_main_process:
+        if self.strategy == "deepspeed":
+            self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
+        elif self.is_main_process:
             self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
             _log(f"Training completed! Final checkpoint saved at step {self.global_step}")
 
@@ -927,7 +1121,21 @@ class LoLATrainer:
 
     def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
         """保存 checkpoint"""
-        if self.strategy == "fsdp":
+        if self.strategy == "deepspeed":
+            tag = f"step_{step:06d}" if not is_final else "final"
+            client_state = {
+                "step": step,
+                "epoch": self.current_epoch,
+                "scheduler_state_dict": self.scheduler.state_dict(),
+            }
+            self.model.save_checkpoint(
+                save_dir=ckpt_dir,
+                tag=tag,
+                client_state=client_state,
+                exclude_frozen_parameters=True,
+            )
+            ckpt_path = f"{ckpt_dir}/{tag}"
+        elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import save as save_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict
 
@@ -966,7 +1174,19 @@ class LoLATrainer:
 
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
-        if self.strategy == "fsdp":
+        if self.strategy == "deepspeed":
+            load_path, client_state = self.model.load_checkpoint(
+                load_dir=ckpt_path,
+                load_optimizer_states=True,
+                load_lr_scheduler_states=True,
+            )
+            if load_path is None:
+                raise ValueError(f"Failed to load DeepSpeed checkpoint from {ckpt_path}")
+            self.global_step = client_state.get("step", 0)
+            self.current_epoch = client_state.get("epoch", 0)
+            if "scheduler_state_dict" in client_state:
+                self.scheduler.load_state_dict(client_state["scheduler_state_dict"])
+        elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import load as load_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 
@@ -1017,7 +1237,7 @@ def main():
     parser.add_argument("--episodes", type=int, nargs="*", default=None)
 
     # 训练参数
-    parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
+    parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp", "deepspeed"])
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=None, help="Max training steps (mutually exclusive with --max_epochs)")
     parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs (mutually exclusive with --max_steps)")
@@ -1063,6 +1283,12 @@ def main():
                         help="每张图片最小像素数")
     parser.add_argument("--num_inference_steps", type=int, default=10,
                         help="Flow matching 推理去噪步数")
+    parser.add_argument("--gripper_loss_weight", type=float, default=1.0,
+                        help="BCE loss weight for gripper dimension")
+    parser.add_argument("--action_loss_weight", type=float, default=1.0,
+                        help="Huber loss weight for continuous arm dimensions")
+    parser.add_argument("--gripper_dims", type=str, default="-1",
+                        help="Comma-separated gripper dim indices (supports negative)")
 
     # Wandb 参数
     parser.add_argument("--wandb_project", type=str, default="lola-azure", help="Wandb project name")
@@ -1071,13 +1297,17 @@ def main():
     parser.add_argument("--wandb_id", type=str, default=None, help="Wandb run id (for resume)")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
 
+    # DeepSpeed 参数
+    parser.add_argument("--deepspeed_config", type=str, default=None,
+                        help="Path to custom DeepSpeed config JSON. Default: ZeRO-2 config tuned for B200.")
+
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
 
     # 归一化参数
     parser.add_argument("--norm_mode", type=str, default="default",
-                        choices=["default", "robovlm"],
-                        help="归一化模式: default(LoLA默认MEAN_STD), robovlm(min-max→[-1,1],全IDENTITY)")
+                        choices=["default", "robovlm", "zscore"],
+                        help="归一化模式: default(LoLA默认MEAN_STD), robovlm(min-max→[-1,1],全IDENTITY), zscore(arm=z-score,gripper=二值化{0,1})")
     parser.add_argument("--norm_min", type=float, default=-0.65,
                         help="RoboVLM 归一化下界")
     parser.add_argument("--norm_max", type=float, default=0.65,
@@ -1098,6 +1328,10 @@ def main():
     # 检查保存间隔参数
     if args.save_every_n_steps is not None and args.save_every_n_epochs is not None:
         raise ValueError("--save_every_n_steps and --save_every_n_epochs are mutually exclusive. Please specify only one.")
+
+    # 检查 DeepSpeed 可用性
+    if args.strategy == "deepspeed" and not HAS_DEEPSPEED:
+        raise ImportError("DeepSpeed required for strategy='deepspeed'. Install: pip install deepspeed")
 
     # 打印配置
     if dist_info["world_rank"] == 0:
@@ -1153,6 +1387,9 @@ def main():
         vlm_extract_layers=tuple(args.vlm_extract_layers),
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
+        gripper_loss_weight=args.gripper_loss_weight,
+        action_loss_weight=args.action_loss_weight,
+        gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
     )
 
     # 归一化模式
@@ -1163,10 +1400,22 @@ def main():
             "STATE": NormalizationMode.IDENTITY,
             "ACTION": NormalizationMode.IDENTITY,
         }
+    elif args.norm_mode == "zscore":
+        from lerobot.configs.types import NormalizationMode
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
 
     # 创建数据集
     _log("Creating dataset...")
-    norm_action = (args.norm_mode == "robovlm")
+    if args.norm_mode == "robovlm":
+        norm_action = True
+    elif args.norm_mode == "zscore":
+        norm_action = "zscore"
+    else:
+        norm_action = False
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
         config=config,
@@ -1178,6 +1427,8 @@ def main():
         norm_action=norm_action,
         norm_min=args.norm_min,
         norm_max=args.norm_max,
+        gripper_dim_indices_abs=config.gripper_dim_indices_abs,
+        dataset_stats=dataset_metadata.stats,
     )
     _log(f"Dataset size: {len(train_dataset)}")
 
@@ -1224,6 +1475,7 @@ def main():
         wandb_name=args.wandb_name,
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
+        deepspeed_config_path=args.deepspeed_config,
     )
 
     # 禁用 wandb
@@ -1243,6 +1495,10 @@ def main():
 
     # 设置优化器
     trainer.setup_optimizer(total_steps=total_steps)
+
+    # DeepSpeed 初始化（必须在 setup_model() 和 setup_optimizer() 之后）
+    if args.strategy == "deepspeed":
+        trainer._setup_deepspeed()
 
     # 加载 checkpoint
     start_step = 0

@@ -70,9 +70,10 @@ class LoLADataset(LeRobotDataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
-        norm_action: bool = False,
+        norm_action: bool | str = False,
         norm_min: float = -0.65,
         norm_max: float = 0.65,
+        gripper_dim_indices_abs: tuple[int, ...] | None = None,
     ):
         """
         Args:
@@ -111,6 +112,22 @@ class LoLADataset(LeRobotDataset):
         self.norm_action = norm_action
         self.norm_min = norm_min
         self.norm_max = norm_max
+        self.gripper_dim_indices_abs = gripper_dim_indices_abs
+
+        # Z-score normalization stats (computed from dataset metadata)
+        self._action_mean = None
+        self._action_std = None
+        if self.norm_action == "zscore":
+            if "action" in self.meta.stats:
+                import numpy as np
+                _mean = self.meta.stats["action"]["mean"]
+                _std = self.meta.stats["action"]["std"]
+                self._action_mean = torch.tensor(_mean, dtype=torch.float32) if isinstance(_mean, np.ndarray) else _mean.float()
+                self._action_std = torch.tensor(_std, dtype=torch.float32) if isinstance(_std, np.ndarray) else _std.float()
+            else:
+                raise ValueError("z-score normalization requires 'action' stats in dataset metadata")
+            if self.gripper_dim_indices_abs is None:
+                raise ValueError("z-score normalization requires gripper_dim_indices_abs to separate arm/gripper dims")
 
         # 获取action维度
         if "action" in self.features:
@@ -238,13 +255,27 @@ class LoLADataset(LeRobotDataset):
         item["hist_actions_mask"] = hist_actions_mask  # [padded_length]
         item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
 
-        # RoboVLM-style action normalization: min-max → [-1, 1]
-        if self.norm_action:
+        # Action normalization
+        if self.norm_action in (True, "minmax", "robovlm"):
+            # RoboVLM-style: min-max → [-1, 1], preserve gripper as-is
             from lerobot.datasets.robovlm_dataset import normalize_action
             if "action" in item:
                 item["action"] = normalize_action(item["action"], self.norm_min, self.norm_max)
             if "hist_actions_full" in item:
                 item["hist_actions_full"] = normalize_action(item["hist_actions_full"], self.norm_min, self.norm_max)
+        elif self.norm_action == "zscore":
+            # Z-score arm dims + binarize gripper dims for BCE
+            from lerobot.datasets.robovlm_dataset import normalize_action_zscore
+            if "action" in item:
+                item["action"] = normalize_action_zscore(
+                    item["action"], self._action_mean, self._action_std,
+                    self.gripper_dim_indices_abs,
+                )
+            if "hist_actions_full" in item:
+                item["hist_actions_full"] = normalize_action_zscore(
+                    item["hist_actions_full"], self._action_mean, self._action_std,
+                    self.gripper_dim_indices_abs,
+                )
 
         return item
 

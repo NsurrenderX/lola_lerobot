@@ -44,6 +44,48 @@ def normalize_action(action: torch.Tensor, action_min: float, action_max: float)
     return action
 
 
+def normalize_action_zscore(
+    action: torch.Tensor,
+    action_mean: torch.Tensor,
+    action_std: torch.Tensor,
+    gripper_dim_indices: tuple[int, ...] | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Z-score normalize arm dimensions and binarize gripper dimensions.
+
+    Arm dims: (x - mean) / (std + eps)
+    Gripper dims: (x > 0).float() — maps {-1, 1} -> {0, 1} for BCE loss
+
+    Args:
+        action: [..., action_dim] tensor
+        action_mean: [action_dim] per-dimension mean
+        action_std: [action_dim] per-dimension std
+        gripper_dim_indices: absolute indices of gripper dims (e.g., (9, 19))
+        eps: small value to prevent division by zero
+    """
+    result = action.clone()
+    action_dim = action.shape[-1]
+
+    if gripper_dim_indices is not None and len(gripper_dim_indices) > 0:
+        arm_mask = torch.ones(action_dim, dtype=torch.bool)
+        arm_mask[list(gripper_dim_indices)] = False
+        gripper_mask = ~arm_mask
+
+        # Z-score arm dims
+        result[..., arm_mask] = (
+            (action[..., arm_mask] - action_mean[arm_mask])
+            / (action_std[arm_mask] + eps)
+        )
+
+        # Binarize gripper dims: {-1, 1} -> {0, 1}
+        result[..., gripper_mask] = (action[..., gripper_mask] > 0).float()
+    else:
+        # No gripper dims specified: z-score all dims
+        result = (action - action_mean) / (action_std + eps)
+
+    return result
+
+
 def unnoramalize_action(action: torch.Tensor, action_min: float, action_max: float) -> torch.Tensor:
     """Map [-1, 1] back to [action_min, action_max].
 

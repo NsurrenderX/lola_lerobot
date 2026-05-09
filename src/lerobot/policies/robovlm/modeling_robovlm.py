@@ -589,7 +589,7 @@ class RoboVLMPolicy(PreTrainedPolicy):
 
         return vision_x, vision_gripper, lang_x, attention_mask, action_chunck, chunk_mask
 
-    def forward(self, batch: dict[str, Any]) -> Tuple[torch.Tensor, dict | None]:
+    def forward(self, batch: dict[str, Any], compute_per_dim: bool = False) -> Tuple[torch.Tensor, dict | None]:
         config = self.config
         vision_x, vision_gripper, lang_x, attention_mask, action_chunck, chunk_mask = self._prepare_inputs(batch)
 
@@ -651,6 +651,20 @@ class RoboVLMPolicy(PreTrainedPolicy):
             "loss_gripper": loss_gripper.item(),
             "acc_gripper": acc_gripper,
         }
+
+        if compute_per_dim:
+            # 每维度 arm loss: 在 no-mask 或 all-valid 分支中重新计算
+            # pred_arm shape: [B, ws, fwd, 6]
+            if chunk_mask is not None and not chunk_mask.any():
+                arm_loss_per_dim = torch.zeros(6, device=pred_arm.device)
+            elif chunk_mask is not None and not chunk_mask.all():
+                mask_bool = chunk_mask.bool().unsqueeze(-1)  # [B, ws, fwd, 1] broadcasts to [B, ws, fwd, 6]
+                per_elem_loss = F.huber_loss(pred_arm, arm_labels, reduction="none")  # [B, ws, fwd, 6]
+                valid_count = mask_bool.sum()  # total valid (B,ws,fwd) entries, same per dim
+                arm_loss_per_dim = (per_elem_loss * mask_bool).sum(dim=(0, 1, 2)) / valid_count
+            else:
+                arm_loss_per_dim = F.huber_loss(pred_arm, arm_labels, reduction="none").mean(dim=(0, 1, 2))
+            loss_dict["arm_loss_per_dim"] = arm_loss_per_dim.detach()
 
         return total_loss, loss_dict
 

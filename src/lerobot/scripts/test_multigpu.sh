@@ -6,7 +6,7 @@ eval "$(conda shell.bash hook)"
 conda activate lerobot-gcr3
 
 # 基础训练参数
-STRATEGY="fsdp"
+STRATEGY="deepspeed"
 DEVICES=2
 NUM_NODES=1
 BATCH_SIZE=4
@@ -33,12 +33,15 @@ N_OBS_STEPS=1
 TRAIN_VLM=false
 VLM_LR=1e-6
 VLM_EXTRACT_LAYERS="8 16 24"
-GRADIENT_CHECKPOINTING=true
+GRADIENT_CHECKPOINTING=false
 COMPILE_MODEL=false
 COMPILE_MODE="max-autotune"
 MAX_IMAGE_PIXELS=230400
 MIN_IMAGE_PIXELS=65536
 NUM_INFERENCE_STEPS=10
+GRIPPER_DIMS="-1"
+ACTION_LOSS_WEIGHT=1.0
+GRIPPER_LOSS_WEIGHT=1.0
 CKPT_DIR="/data_16T/deepseek/checkpoints/lola"
 
 # 历史 action 加载参数
@@ -49,8 +52,11 @@ HISTORY_PADDING_SIDE="left"
 # DataLoader 参数
 NUM_WORKERS=8
 
-# 归一化参数
-NORM_MODE="robovlm"
+# DeepSpeed 参数
+DEEPSPEED_CONFIG=""
+
+# 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
+NORM_MODE="zscore"
 NORM_MIN=-0.65
 NORM_MAX=0.65
 
@@ -77,6 +83,9 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --max_image_pixels ${MAX_IMAGE_PIXELS} \
     --min_image_pixels ${MIN_IMAGE_PIXELS} \
     --num_inference_steps ${NUM_INFERENCE_STEPS} \
+    --gripper_dims ${GRIPPER_DIMS} \
+    --action_loss_weight ${ACTION_LOSS_WEIGHT} \
+    --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
     --ckpt_dir ${CKPT_DIR} \
     --norm_mode ${NORM_MODE} \
     --norm_min ${NORM_MIN} \
@@ -108,6 +117,11 @@ if [ "$GRADIENT_CHECKPOINTING" = false ]; then
 fi
 if [ "$COMPILE_MODEL" = true ]; then
     cmd="${cmd} --compile_model --compile_mode ${COMPILE_MODE}"
+fi
+
+# DeepSpeed 参数
+if [ -n "$DEEPSPEED_CONFIG" ]; then
+    cmd="${cmd} --deepspeed_config ${DEEPSPEED_CONFIG}"
 fi
 
 echo "Running: $cmd"

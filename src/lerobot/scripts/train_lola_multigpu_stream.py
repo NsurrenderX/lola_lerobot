@@ -439,6 +439,10 @@ def main():
     parser.add_argument("--action_chunk_size", type=int, default=10, help="Action chunk size")
     parser.add_argument("--pred_chunk_size", type=int, default=50, help="Prediction chunk size")
     parser.add_argument("--n_obs_steps", type=int, default=1, help="Number of observation steps")
+    parser.add_argument("--action_loss_weight", type=float, default=1.0,
+                        help="Huber loss weight for continuous arm dimensions")
+    parser.add_argument("--gripper_loss_weight", type=float, default=1.0,
+                        help="BCE loss weight for gripper dimension")
 
     # 历史 action 参数
     parser.add_argument("--max_history_length", type=int, default=100,
@@ -525,6 +529,8 @@ def main():
         action_chunk_size=args.action_chunk_size,
         pred_chunk_size=args.pred_chunk_size,
         n_obs_steps=args.n_obs_steps,
+        action_loss_weight=args.action_loss_weight,
+        gripper_loss_weight=args.gripper_loss_weight,
         input_features={key: ft for key, ft in features.items() if ft.type != FeatureType.ACTION},
         output_features={key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION},
         train_vlm=args.train_vlm,

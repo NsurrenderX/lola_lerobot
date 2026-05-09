@@ -42,6 +42,12 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import FSDPStrategy, DeepSpeedStrategy
 
+try:
+    import deepspeed
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
+
 # 设置环境变量
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -145,6 +151,23 @@ class LoLALightningModule(pl.LightningModule):
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.policy.parameters())
         print(f"[Rank {self.global_rank}] Trainable params: {trainable_params:,} / {total_params:,}")
+
+        # DeepSpeed 模式下：切换梯度检查点为 DeepSpeed 实现
+        is_deepspeed = hasattr(self.trainer, 'strategy') and isinstance(self.trainer.strategy, DeepSpeedStrategy)
+        if is_deepspeed and self.config.gradient_checkpointing:
+            print(f"[Rank {self.global_rank}] Configuring DeepSpeed activation checkpointing...")
+            self.policy.model.set_deepspeed_checkpointing()
+            if self.train_vlm:
+                import deepspeed
+                ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
+                vlm = self.policy.vlm
+                if hasattr(vlm, '_gradient_checkpointing_func'):
+                    vlm._gradient_checkpointing_func = ds_fn
+                for module in vlm.modules():
+                    if hasattr(module, '_gradient_checkpointing_func'):
+                        module._gradient_checkpointing_func = ds_fn
+                if hasattr(self.policy, '_vlm_forward_mode'):
+                    self.policy._vlm_forward_mode = "output_hidden_states"
         
     def forward(self, batch):
         """前向传播"""
@@ -212,7 +235,7 @@ class LoLALightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """验证步骤：在验证数据上计算 v-loss 和 action_loss"""
+        """验证步骤：在验证数据上计算 v-loss 和 arm_loss"""
         special_data = self._extract_special_fields(batch)
         batch = self.preprocessor(batch)
         batch = self._restore_special_fields(batch, special_data)
@@ -272,18 +295,21 @@ def create_lola_dataset(
     use_lola_dataset: bool = False,
     max_history_length: int = 100,
     history_padding_side: str = "left",
-    norm_action: bool = False,
+    norm_action: bool | str = False,
     norm_min: float = -0.65,
     norm_max: float = 0.65,
+    tolerance_frames: int | None = None,
+    gripper_dim_indices_abs: tuple[int, ...] | None = None,
+    dataset_stats: dict | None = None,
 ) -> LeRobotDataset | LoLADataset:
     """
     创建 LoLA 训练用的数据集。
-    
+
     根据 LoLA 的配置设置 delta_timestamps：
     - observation.state: 用于历史动作输入
     - action: 用于预测目标动作
     - observation.images.*: 用于视觉输入（如果存在）
-    
+
     Args:
         repo_id: 数据集仓库ID (如 "lerobot/pusht")
         config: LoLA 配置
@@ -294,36 +320,41 @@ def create_lola_dataset(
         use_lola_dataset: 是否使用 LoLADataset（加载完整历史action）
         max_history_length: 历史action最大长度
         history_padding_side: padding方向
-        
+        norm_action: 归一化模式 (False/True/"minmax"/"zscore")
+        norm_min: RoboVLM min-max 归一化下界
+        norm_max: RoboVLM min-max 归一化上界
+        gripper_dim_indices_abs: gripper维度的绝对索引（z-score模式需要）
+        dataset_stats: 数据集统计信息（z-score模式需要）
+
     Returns:
         配置好的 LeRobotDataset 或 LoLADataset
     """
     # 获取数据集元数据以确定 fps
     dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
     fps = dataset_metadata.fps
-    
+
     # 构建 delta_timestamps
     # 将帧索引转换为时间戳（秒）
     delta_timestamps = {}
-    
+
     # 观测状态：使用 n_obs_steps 个历史帧
     delta_timestamps["observation.state"] = [
         i / fps for i in config.observation_delta_indices
     ]
-    
+
     # 动作：预测 pred_chunk_size 步
     delta_timestamps["action"] = [
         i / fps for i in config.action_delta_indices
     ]
-    
+
     # 图像/视频观测：与状态同步
     for key in dataset_metadata.camera_keys:
         delta_timestamps[key] = [
             i / fps for i in config.observation_delta_indices
-        ]
-    
+    ]
+
     print(f"[Dataset] delta_timestamps: {delta_timestamps}")
-    
+
     # 创建数据集
     if use_lola_dataset:
         # 使用 LoLADataset：支持加载完整历史action
@@ -336,11 +367,13 @@ def create_lola_dataset(
             root=root,
             episodes=episodes,
             image_transforms=image_transforms,
+            tolerance_frame=tolerance_frames if tolerance_frames is not None else 2,
             delta_timestamps=delta_timestamps,
             video_backend=video_backend,
             norm_action=norm_action,
             norm_min=norm_min,
             norm_max=norm_max,
+            gripper_dim_indices_abs=gripper_dim_indices_abs,
         )
     else:
         # 使用标准 LeRobotDataset
@@ -350,10 +383,45 @@ def create_lola_dataset(
             episodes=episodes,
             image_transforms=image_transforms,
             delta_timestamps=delta_timestamps,
+            tolerance_frames=tolerance_frames,
             video_backend=video_backend,
         )
-    
+        # Z-score mode with LeRobotDataset: wrap with per-item normalization
+        if norm_action == "zscore":
+            from lerobot.datasets.robovlm_dataset import normalize_action_zscore
+            import numpy as np
+            _mean = dataset_stats["action"]["mean"]
+            _std = dataset_stats["action"]["std"]
+            action_mean = torch.tensor(_mean, dtype=torch.float32) if isinstance(_mean, np.ndarray) else _mean.float()
+            action_std = torch.tensor(_std, dtype=torch.float32) if isinstance(_std, np.ndarray) else _std.float()
+            dataset = _ZScoreActionDataset(dataset, action_mean, action_std, gripper_dim_indices_abs)
+            print(f"[Dataset] Wrapped LeRobotDataset with ZScoreActionDataset (gripper dims: {gripper_dim_indices_abs})")
+
     return dataset
+
+
+class _ZScoreActionDataset:
+    """Wrapper that applies z-score arm normalization + gripper binarization to LeRobotDataset items."""
+
+    def __init__(self, dataset, action_mean: torch.Tensor, action_std: torch.Tensor,
+                 gripper_dim_indices_abs: tuple[int, ...] | None = None):
+        self.dataset = dataset
+        self.action_mean = action_mean
+        self.action_std = action_std
+        self.gripper_dim_indices_abs = gripper_dim_indices_abs
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        from lerobot.datasets.robovlm_dataset import normalize_action_zscore
+        item = self.dataset[idx]
+        if "action" in item and isinstance(item["action"], torch.Tensor):
+            item["action"] = normalize_action_zscore(
+                item["action"], self.action_mean, self.action_std,
+                self.gripper_dim_indices_abs,
+            )
+        return item
 
 
 def collate_fn(batch):
@@ -420,6 +488,49 @@ def collate_fn(batch):
 
 
 # ----------------------------------------------------------------------
+# DeepSpeed 配置
+# ----------------------------------------------------------------------
+def get_deepspeed_config(
+    learning_rate: float = 2.5e-5,
+    weight_decay: float = 0.01,
+    gradient_clip_val: float = 1.0,
+):
+    """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each)."""
+    return {
+        "bf16": {"enabled": True},
+        "zero_optimization": {
+            "stage": 2,
+            "allgather_bucket_size": 5e8,
+            "reduce_bucket_size": 5e8,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "contiguous_gradients": True,
+            "round_robin_gradients": True,
+        },
+        "gradient_accumulation_steps": 1,
+        "gradient_clipping": gradient_clip_val,
+        "train_batch_size": "auto",
+        "train_micro_batch_size_per_gpu": "auto",
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": learning_rate,
+                "betas": [0.9, 0.95],
+                "eps": 1e-8,
+                "weight_decay": weight_decay,
+            },
+        },
+        "activation_checkpointing": {
+            "partition_activations": False,
+            "cpu_checkpointing": False,
+            "contiguous_memory_optimization": False,
+            "number_checkpoints": None,
+            "synchronize_checkpoint_boundary": False,
+        },
+    }
+
+
+# ----------------------------------------------------------------------
 # FSDP 配置
 # ----------------------------------------------------------------------
 def get_fsdp_strategy():
@@ -428,7 +539,7 @@ def get_fsdp_strategy():
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
     from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
-    from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor
+    from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor, LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock
 
     mixed_precision = MixedPrecision(
         param_dtype=torch.bfloat16,
@@ -445,6 +556,8 @@ def get_fsdp_strategy():
             Flux2TransformerBlock,
             Flux2SingleTransformerBlock,
             LolaVLMFeatureExtractor,
+            LoLADualExpertDoubleBlock,
+            LoLADualExpertSingleBlock,
         }
     )
     
@@ -459,13 +572,23 @@ def get_fsdp_strategy():
     return strategy
 
 
-def get_deepspeed_strategy():
-    """获取 DeepSpeed 策略配置"""
-    strategy = DeepSpeedStrategy(
-        stage=2,
-        offload_optimizer=False,
-        offload_parameters=False,
+def get_deepspeed_strategy(learning_rate=2.5e-5, gradient_clip_val=1.0, deepspeed_config_path=None):
+    """获取 DeepSpeed ZeRO-2 策略配置，针对 B200 GPU 调优"""
+    ds_config = get_deepspeed_config(
+        learning_rate=learning_rate,
+        gradient_clip_val=gradient_clip_val,
     )
+    if deepspeed_config_path is not None:
+        import json
+        with open(deepspeed_config_path) as f:
+            custom_config = json.load(f)
+        ds_config.update(custom_config)
+
+    # Lightning manages these keys — remove from DeepSpeed config to avoid MisconfigurationException
+    for key in ["gradient_accumulation_steps", "train_batch_size", "train_micro_batch_size_per_gpu"]:
+        ds_config.pop(key, None)
+
+    strategy = DeepSpeedStrategy(config=ds_config)
     return strategy
 
 
@@ -496,6 +619,8 @@ def main():
     
     # 训练策略参数
     parser.add_argument("--strategy", type=str, default="fsdp", choices=["fsdp", "deepspeed", "ddp"])
+    parser.add_argument("--deepspeed_config", type=str, default=None,
+                        help="Path to custom DeepSpeed config JSON. Default: ZeRO-2 config tuned for B200.")
     parser.add_argument("--devices", type=int, default=torch.cuda.device_count())
     parser.add_argument("--num_nodes", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -549,15 +674,23 @@ def main():
                         help="每张图片最小像素数")
     parser.add_argument("--num_inference_steps", type=int, default=10,
                         help="Flow matching 推理去噪步数")
+    parser.add_argument("--gripper_loss_weight", type=float, default=1.0,
+                        help="BCE loss weight for gripper dimension")
+    parser.add_argument("--action_loss_weight", type=float, default=1.0,
+                        help="Huber loss weight for continuous arm dimensions")
+    parser.add_argument("--gripper_dims", type=str, default="-1",
+                        help="Comma-separated gripper dim indices (supports negative)")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 数量")
+    parser.add_argument("--tolerance_frames", type=int, default=None,
+                        help="Video frame decode tolerance (frames), overrides default tolerance_s")
 
     # 归一化参数
     parser.add_argument("--norm_mode", type=str, default="default",
-                        choices=["default", "robovlm"],
-                        help="归一化模式: default(LoLA默认MEAN_STD), robovlm(min-max→[-1,1],全IDENTITY)")
+                        choices=["default", "robovlm", "zscore"],
+                        help="归一化模式: default(LoLA默认MEAN_STD), robovlm(min-max→[-1,1],全IDENTITY), zscore(arm=z-score,gripper=二值化{0,1})")
     parser.add_argument("--norm_min", type=float, default=-0.65,
                         help="RoboVLM 归一化下界")
     parser.add_argument("--norm_max", type=float, default=0.65,
@@ -578,12 +711,20 @@ def main():
     # 检查保存间隔参数
     if args.save_every_n_steps is not None and args.save_every_n_epochs is not None:
         raise ValueError("--save_every_n_steps and --save_every_n_epochs are mutually exclusive. Please specify only one.")
-    
+
+    # 检查 DeepSpeed 可用性
+    if args.strategy == "deepspeed" and not HAS_DEEPSPEED:
+        raise ImportError("DeepSpeed required for strategy='deepspeed'. Install: pip install deepspeed")
+
     # 设置策略
     if args.strategy == "fsdp":
         strategy = get_fsdp_strategy()
     elif args.strategy == "deepspeed":
-        strategy = get_deepspeed_strategy()
+        strategy = get_deepspeed_strategy(
+            learning_rate=args.learning_rate,
+            gradient_clip_val=1.0,
+            deepspeed_config_path=args.deepspeed_config,
+        )
     else:
         strategy = "auto"
     
@@ -625,14 +766,18 @@ def main():
         load_full_history=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
-        gradient_checkpointing=gradient_checkpointing,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
         vlm_extract_layers=tuple(args.vlm_extract_layers),
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
+        gripper_loss_weight=args.gripper_loss_weight,
+        action_loss_weight=args.action_loss_weight,
+        gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
     )
+    # draccus.ChoiceRegistry 不接受 gradient_checkpointing 作为构造参数
+    config.gradient_checkpointting = gradient_checkpointing
 
     # 归一化模式
     if args.norm_mode == "robovlm":
@@ -642,10 +787,22 @@ def main():
             "STATE": NormalizationMode.IDENTITY,
             "ACTION": NormalizationMode.IDENTITY,
         }
+    elif args.norm_mode == "zscore":
+        from lerobot.configs.types import NormalizationMode
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
 
     # 创建训练和验证数据集
     print("Creating datasets...")
-    norm_action = (args.norm_mode == "robovlm")
+    if args.norm_mode == "robovlm":
+        norm_action = True
+    elif args.norm_mode == "zscore":
+        norm_action = "zscore"
+    else:
+        norm_action = False
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
         config=config,
@@ -657,6 +814,9 @@ def main():
         norm_action=norm_action,
         norm_min=args.norm_min,
         norm_max=args.norm_max,
+        tolerance_frames=args.tolerance_frames,
+        gripper_dim_indices_abs=config.gripper_dim_indices_abs,
+        dataset_stats=dataset_metadata.stats,
     )
     print("Done.\n Train Data Example:")
     for key, value in train_dataset[0].items():
@@ -691,6 +851,9 @@ def main():
             norm_action=norm_action,
             norm_min=args.norm_min,
             norm_max=args.norm_max,
+            tolerance_frames=args.tolerance_frames,
+            gripper_dim_indices_abs=config.gripper_dim_indices_abs,
+            dataset_stats=dataset_metadata.stats,
         )
         val_batch_size = args.val_batch_size or args.batch_size
         val_loader = DataLoader(

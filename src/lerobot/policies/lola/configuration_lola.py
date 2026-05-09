@@ -47,10 +47,13 @@ class LoLAConfig(PreTrainedConfig):
     # ==========================
     # 3. DiT Architecture 
     # ==========================
-    dit_hidden_size: int = 1536                # DiT 核心维度
-    dit_num_heads: int = 12                    # 1536 / 12 = 128 (Head Dim)
-    dit_double_layers: int = 4                 # 双流层数 (4层约 188M)
-    dit_single_layers: int = 12                # 单流层数 (12层约 336M)
+    dit_hidden_size: int = 1024                # DiT 核心维度
+    dit_num_heads: int = 8                     # 1024 / 8 = 128 (Head Dim)
+    dit_double_layers: int = 4                 # 双流层数
+    dit_single_layers: int = 12                # 单流层数
+    dit_arm_ffn_mult: float = 4.0              # Arm 专家 FFN 扩展比 (6D rotation + 3D translation)
+    dit_grip_ffn_mult: float = 2.0             # Gripper 专家 FFN 扩展比 (binary open/close)
+    dit_ctx_ffn_mult: float = 4.0              # Context 共享 FFN 扩展比 (cross-modal interaction)
     
     # ==========================
     # 4. Flow Matching Settings
@@ -63,6 +66,8 @@ class LoLAConfig(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
     action_loss_weight: float = 1.0              # 动作空间重构损失权重
+    gripper_loss_weight: float = 1.0              # BCE loss weight for gripper dimension
+    gripper_dim_indices: tuple = (-1,)            # Gripper dim indices (supports negative, e.g. (-1,) for single-arm, (-1,-11) for dual-arm)
     
     # Training settings
     gradient_checkpointing: bool = True
@@ -118,8 +123,18 @@ class LoLAConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # Validate configuration
+        # Resolve gripper_dim_indices to absolute indices
+        resolved = []
+        for idx in self.gripper_dim_indices:
+            if idx < 0:
+                resolved.append(self.action_dim + idx)
+            else:
+                resolved.append(idx)
+        self.gripper_dim_indices_abs = tuple(sorted(resolved))
+        self.arm_dim = self.action_dim - len(self.gripper_dim_indices_abs)
+        self.gripper_dim = len(self.gripper_dim_indices_abs)
 
+        # Validate configuration
         if self.vlm_model_name not in ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-2B"]:
             raise ValueError(f"Invalid vlm_model_name: {self.vlm_model_name}")
 

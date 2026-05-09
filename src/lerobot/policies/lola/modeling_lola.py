@@ -14,10 +14,10 @@ from typing import Optional, Tuple, List, Dict, Any
 logger = logging.getLogger(__name__)
 
 from diffusers.models.transformers.transformer_flux2 import (
-    Flux2TransformerBlock,
-    Flux2SingleTransformerBlock,
     Flux2Modulation,
+    Flux2FeedForward,
     )
+from diffusers.models.embeddings import apply_rotary_emb
 
 
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -42,30 +42,58 @@ def create_sinusoidal_pos_embedding(time: torch.Tensor, dimension: int, min_peri
 # 1. Sub-Modules
 # ----------------------------------------------------------------------
 class LolaActionEncoder(nn.Module):
-    """Action Chunking: 将 Chunk Size x Action Dim 的物理动作压缩为 Action Expert Dim Token"""
+    """Dual-Token Action Chunking: 将手臂和夹爪完全解耦，分别映射为独立的 Token，
+    并注入模态编码以区分身份，最后在 Sequence 维度拼接。
+    输出长度为原来的 2 倍: [B, 2 * num_chunks, dit_hidden_size]
+    """
     def __init__(self, config: LoLAConfig):
         super().__init__()
         self.chunk_size = config.action_chunk_size
-        self.action_dim = config.action_dim
-        
-        # 使用 MLP 并加入 LayerNorm，稳定不同物理量纲带来的方差偏移
-        self.proj = nn.Sequential(
-            nn.Linear(self.chunk_size * self.action_dim, config.dit_hidden_size),
+        self.arm_dim = config.arm_dim
+        self.gripper_dim = config.gripper_dim
+        self.config = config
+
+        self.arm_proj = nn.Sequential(
+            nn.Linear(self.chunk_size * self.arm_dim, config.dit_hidden_size),
             nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
             nn.SiLU(),
             nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
         )
-        
-    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+
+        self.gripper_proj = nn.Sequential(
+            nn.Linear(self.chunk_size * self.gripper_dim, config.dit_hidden_size),
+            nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
+            nn.SiLU(),
+            nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
+        )
+
+        self.arm_modality_emb = nn.Parameter(torch.randn(1, 1, config.dit_hidden_size) * 0.02)
+        self.gripper_modality_emb = nn.Parameter(torch.randn(1, 1, config.dit_hidden_size) * 0.02)
+
+    def _pad_and_chunk(self, actions: torch.Tensor, dim_size: int) -> torch.Tensor:
         b, seq_len, d = actions.shape
         remainder = seq_len % self.chunk_size
         if remainder != 0:
             pad_len = self.chunk_size - remainder
             actions = F.pad(actions, (0, 0, 0, pad_len))
             seq_len += pad_len
-            
-        chunked = actions.view(b, seq_len // self.chunk_size, self.chunk_size * d)
-        return self.proj(chunked)
+        return actions.view(b, seq_len // self.chunk_size, self.chunk_size * dim_size)
+
+    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        gripper_indices = list(self.config.gripper_dim_indices_abs)
+        all_indices = list(range(actions.shape[-1]))
+        arm_indices = [i for i in all_indices if i not in gripper_indices]
+
+        arm_actions = actions[..., arm_indices]
+        gripper_actions = actions[..., gripper_indices]
+
+        arm_chunked = self._pad_and_chunk(arm_actions, self.arm_dim)
+        gripper_chunked = self._pad_and_chunk(gripper_actions, self.gripper_dim)
+
+        arm_tokens = self.arm_proj(arm_chunked) + self.arm_modality_emb
+        gripper_tokens = self.gripper_proj(gripper_chunked) + self.gripper_modality_emb
+
+        return torch.cat([arm_tokens, gripper_tokens], dim=1)
 
 class LolaVLMFeatureExtractor(nn.Module):
     """提取 Qwen3.5 特征层与全局空 Token"""
@@ -152,242 +180,567 @@ class LolaConditionEmbedder(nn.Module):
         return t_feat + c_feat # [B, 1536]
 
 # ----------------------------------------------------------------------
-# 2. Core LoLA DiT Modeling (800M Parameter Scale)
+# 2. Dual-Expert Transformer Blocks
+# ----------------------------------------------------------------------
+class LoLA5StreamDoubleBlock(nn.Module):
+    """5-Stream Double Block: ctx_vlm / ctx_arm / ctx_grip / target_arm / target_grip.
+    Context sub-streams share a common FFN for cross-modal feature interaction,
+    but have independent QKV projections per sub-stream.
+    Target streams have fully independent QKV + FFN (heterogeneous experts).
+    All 5 streams participate in joint attention.
+    """
+    def __init__(self, dim, num_attention_heads, attention_head_dim,
+                 arm_mlp_ratio=4.0, grip_mlp_ratio=2.0, ctx_mlp_ratio=4.0,
+                 eps=1e-6, bias=False):
+        super().__init__()
+        self.num_heads = num_attention_heads
+        self.head_dim = attention_head_dim
+        self.inner_dim = num_attention_heads * attention_head_dim
+
+        # --- Context sub-streams: independent QKV, shared FFN ---
+        for prefix in ['ctx_vlm', 'ctx_arm', 'ctx_grip']:
+            setattr(self, f'{prefix}_norm1', nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+            setattr(self, f'{prefix}_to_q', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_to_k', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_to_v', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_norm_q', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
+            setattr(self, f'{prefix}_norm_k', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
+            setattr(self, f'{prefix}_to_out', nn.Linear(self.inner_dim, dim, bias=bias))
+            setattr(self, f'{prefix}_norm2', nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+            setattr(self, f'{prefix}_modulation', Flux2Modulation(dim, mod_param_sets=2, bias=bias))
+
+        self.ctx_shared_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=ctx_mlp_ratio, bias=bias)
+
+        # --- Target arm expert ---
+        self.arm_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.arm_to_q = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_to_k = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_to_v = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.arm_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.arm_to_out = nn.Linear(self.inner_dim, dim, bias=bias)
+        self.arm_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.arm_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=arm_mlp_ratio, bias=bias)
+        self.arm_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=bias)
+
+        # --- Target gripper expert ---
+        self.grip_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.grip_to_q = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_to_k = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_to_v = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.grip_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.grip_to_out = nn.Linear(self.inner_dim, dim, bias=bias)
+        self.grip_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.grip_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=grip_mlp_ratio, bias=bias)
+        self.grip_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=bias)
+
+    def _ctx_qkv(self, prefix, hidden, mod):
+        """Compute QKV for a context sub-stream."""
+        (shift_msa, scale_msa, gate_msa), (shift_mlp, scale_mlp, gate_mlp) = Flux2Modulation.split(mod, 2)
+        normed = getattr(self, f'{prefix}_norm1')(hidden)
+        normed = (1 + scale_msa) * normed + shift_msa
+        q = getattr(self, f'{prefix}_to_q')(normed)
+        k = getattr(self, f'{prefix}_to_k')(normed)
+        v = getattr(self, f'{prefix}_to_v')(normed)
+        q = getattr(self, f'{prefix}_norm_q')(q.unflatten(-1, (self.num_heads, self.head_dim)))
+        k = getattr(self, f'{prefix}_norm_k')(k.unflatten(-1, (self.num_heads, self.head_dim)))
+        v = v.unflatten(-1, (self.num_heads, self.head_dim))
+        return q, k, v, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+    def forward(self, ctx_vlm_hidden, ctx_arm_hidden, ctx_grip_hidden,
+                arm_hidden, grip_hidden,
+                temb_mod_ctx_vlm, temb_mod_ctx_arm, temb_mod_ctx_grip,
+                temb_mod_arm, temb_mod_grip,
+                image_rotary_emb, joint_attention_kwargs=None):
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        ctx_vlm_len = ctx_vlm_hidden.shape[1]
+        ctx_arm_len = ctx_arm_hidden.shape[1]
+        ctx_grip_len = ctx_grip_hidden.shape[1]
+        arm_len = arm_hidden.shape[1]
+        grip_len = grip_hidden.shape[1]
+
+        # 1. Per-stream modulation + QKV for context sub-streams
+        vlm_q, vlm_k, vlm_v, vlm_gate_msa, vlm_shift_mlp, vlm_scale_mlp, vlm_gate_mlp = \
+            self._ctx_qkv('ctx_vlm', ctx_vlm_hidden, temb_mod_ctx_vlm)
+        arm_ctx_q, arm_ctx_k, arm_ctx_v, arm_ctx_gate_msa, arm_ctx_shift_mlp, arm_ctx_scale_mlp, arm_ctx_gate_mlp = \
+            self._ctx_qkv('ctx_arm', ctx_arm_hidden, temb_mod_ctx_arm)
+        grip_ctx_q, grip_ctx_k, grip_ctx_v, grip_ctx_gate_msa, grip_ctx_shift_mlp, grip_ctx_scale_mlp, grip_ctx_gate_mlp = \
+            self._ctx_qkv('ctx_grip', ctx_grip_hidden, temb_mod_ctx_grip)
+
+        # 2. Per-stream modulation + QKV for target streams
+        (arm_shift_msa, arm_scale_msa, arm_gate_msa), (arm_shift_mlp, arm_scale_mlp, arm_gate_mlp) = \
+            Flux2Modulation.split(temb_mod_arm, 2)
+        arm_norm = (1 + arm_scale_msa) * self.arm_norm1(arm_hidden) + arm_shift_msa
+        arm_q = self.arm_norm_q(self.arm_to_q(arm_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        arm_k = self.arm_norm_k(self.arm_to_k(arm_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        arm_v = self.arm_to_v(arm_norm).unflatten(-1, (self.num_heads, self.head_dim))
+
+        (grip_shift_msa, grip_scale_msa, grip_gate_msa), (grip_shift_mlp, grip_scale_mlp, grip_gate_mlp) = \
+            Flux2Modulation.split(temb_mod_grip, 2)
+        grip_norm = (1 + grip_scale_msa) * self.grip_norm1(grip_hidden) + grip_shift_msa
+        grip_q = self.grip_norm_q(self.grip_to_q(grip_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        grip_k = self.grip_norm_k(self.grip_to_k(grip_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        grip_v = self.grip_to_v(grip_norm).unflatten(-1, (self.num_heads, self.head_dim))
+
+        # 3. Concatenate Q/K/V: [ctx_vlm, ctx_grip, ctx_arm, target_grip, target_arm]
+        query = torch.cat([vlm_q, grip_ctx_q, arm_ctx_q, grip_q, arm_q], dim=1)
+        key = torch.cat([vlm_k, grip_ctx_k, arm_ctx_k, grip_k, arm_k], dim=1)
+        value = torch.cat([vlm_v, grip_ctx_v, arm_ctx_v, grip_v, arm_v], dim=1)
+
+        # 4. RoPE
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # 5. Joint attention
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        attn_mask = joint_attention_kwargs.get('attention_mask', None)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+        attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        attn_output = attn_output.transpose(1, 2).flatten(2, 3).to(query.dtype)
+
+        # 6. Split attention output back into 5 streams
+        pos = 0
+        vlm_attn = attn_output[:, pos:pos + ctx_vlm_len, :]; pos += ctx_vlm_len
+        grip_ctx_attn = attn_output[:, pos:pos + ctx_grip_len, :]; pos += ctx_grip_len
+        arm_ctx_attn = attn_output[:, pos:pos + ctx_arm_len, :]; pos += ctx_arm_len
+        grip_attn = attn_output[:, pos:pos + grip_len, :]; pos += grip_len
+        arm_attn = attn_output[:, pos:pos + arm_len, :]; pos += arm_len
+
+        # 7. Output projections + residual + gate (attention sub-block)
+        vlm_attn = self.ctx_vlm_to_out(vlm_attn)
+        arm_ctx_attn = self.ctx_arm_to_out(arm_ctx_attn)
+        grip_ctx_attn = self.ctx_grip_to_out(grip_ctx_attn)
+        arm_attn = self.arm_to_out(arm_attn)
+        grip_attn = self.grip_to_out(grip_attn)
+
+        ctx_vlm_hidden = ctx_vlm_hidden + vlm_gate_msa * vlm_attn
+        ctx_arm_hidden = ctx_arm_hidden + arm_ctx_gate_msa * arm_ctx_attn
+        ctx_grip_hidden = ctx_grip_hidden + grip_ctx_gate_msa * grip_ctx_attn
+        arm_hidden = arm_hidden + arm_gate_msa * arm_attn
+        grip_hidden = grip_hidden + grip_gate_msa * grip_attn
+
+        # 8. FFN sub-block
+        # Context sub-streams: per-stream norm + mod, then shared FFN
+        vlm_norm2 = self.ctx_vlm_norm2(ctx_vlm_hidden) * (1 + vlm_scale_mlp) + vlm_shift_mlp
+        arm_ctx_norm2 = self.ctx_arm_norm2(ctx_arm_hidden) * (1 + arm_ctx_scale_mlp) + arm_ctx_shift_mlp
+        grip_ctx_norm2 = self.ctx_grip_norm2(ctx_grip_hidden) * (1 + grip_ctx_scale_mlp) + grip_ctx_shift_mlp
+
+        ctx_merged_norm = torch.cat([vlm_norm2, grip_ctx_norm2, arm_ctx_norm2], dim=1)
+        ctx_ffn_out = self.ctx_shared_ff(ctx_merged_norm)
+        vlm_ffn = ctx_ffn_out[:, :ctx_vlm_len, :]
+        grip_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len:ctx_vlm_len + ctx_grip_len, :]
+        arm_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len + ctx_grip_len:, :]
+
+        ctx_vlm_hidden = ctx_vlm_hidden + vlm_gate_mlp * vlm_ffn
+        ctx_arm_hidden = ctx_arm_hidden + arm_ctx_gate_mlp * arm_ctx_ffn
+        ctx_grip_hidden = ctx_grip_hidden + grip_ctx_gate_mlp * grip_ctx_ffn
+
+        # Target streams: independent FFN
+        arm_norm2 = self.arm_norm2(arm_hidden) * (1 + arm_scale_mlp) + arm_shift_mlp
+        arm_hidden = arm_hidden + arm_gate_mlp * self.arm_ff(arm_norm2)
+        grip_norm2 = self.grip_norm2(grip_hidden) * (1 + grip_scale_mlp) + grip_shift_mlp
+        grip_hidden = grip_hidden + grip_gate_mlp * self.grip_ff(grip_norm2)
+
+        return ctx_vlm_hidden, ctx_arm_hidden, ctx_grip_hidden, arm_hidden, grip_hidden
+
+
+class LoLA5StreamSingleBlock(nn.Module):
+    """5-Stream Single Block: parallel pattern (attn + FFN combined with single gate).
+    Same 5-stream structure as DoubleBlock but with parallel ViT-22B style computation.
+    Context sub-streams share FFN, target streams have independent FFN.
+    """
+    def __init__(self, dim, num_attention_heads, attention_head_dim,
+                 arm_mlp_ratio=4.0, grip_mlp_ratio=2.0, ctx_mlp_ratio=4.0,
+                 eps=1e-6, bias=False):
+        super().__init__()
+        self.num_heads = num_attention_heads
+        self.head_dim = attention_head_dim
+        self.inner_dim = num_attention_heads * attention_head_dim
+
+        # --- Context sub-streams: independent QKV, shared FFN ---
+        for prefix in ['ctx_vlm', 'ctx_arm', 'ctx_grip']:
+            setattr(self, f'{prefix}_norm', nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+            setattr(self, f'{prefix}_to_q', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_to_k', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_to_v', nn.Linear(dim, self.inner_dim, bias=bias))
+            setattr(self, f'{prefix}_norm_q', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
+            setattr(self, f'{prefix}_norm_k', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
+            setattr(self, f'{prefix}_modulation', Flux2Modulation(dim, mod_param_sets=1, bias=bias))
+
+        self.ctx_shared_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=ctx_mlp_ratio, bias=bias)
+
+        # --- Target arm expert ---
+        self.arm_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.arm_to_q = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_to_k = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_to_v = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.arm_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.arm_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.arm_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=arm_mlp_ratio, bias=bias)
+        self.arm_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=bias)
+
+        # --- Target gripper expert ---
+        self.grip_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.grip_to_q = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_to_k = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_to_v = nn.Linear(dim, self.inner_dim, bias=bias)
+        self.grip_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.grip_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
+        self.grip_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=grip_mlp_ratio, bias=bias)
+        self.grip_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=bias)
+
+    def forward(self, ctx_vlm_hidden, ctx_arm_hidden, ctx_grip_hidden,
+                arm_hidden, grip_hidden,
+                temb_mod_ctx_vlm, temb_mod_ctx_arm, temb_mod_ctx_grip,
+                temb_mod_arm, temb_mod_grip,
+                image_rotary_emb, joint_attention_kwargs=None):
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        ctx_vlm_len = ctx_vlm_hidden.shape[1]
+        ctx_arm_len = ctx_arm_hidden.shape[1]
+        ctx_grip_len = ctx_grip_hidden.shape[1]
+        arm_len = arm_hidden.shape[1]
+        grip_len = grip_hidden.shape[1]
+
+        # 1. Per-stream modulation + norm + QKV for context sub-streams
+        ctx_norms = []
+        for prefix, hidden, temb_mod in [
+            ('ctx_vlm', ctx_vlm_hidden, temb_mod_ctx_vlm),
+            ('ctx_grip', ctx_grip_hidden, temb_mod_ctx_grip),
+            ('ctx_arm', ctx_arm_hidden, temb_mod_ctx_arm),
+        ]:
+            (shift, scale, gate) = Flux2Modulation.split(temb_mod, 1)[0]
+            norm = (1 + scale) * getattr(self, f'{prefix}_norm')(hidden) + shift
+            ctx_norms.append((norm, gate))
+
+        # 2. Per-stream modulation + norm + QKV for target streams
+        (arm_shift, arm_scale, arm_gate) = Flux2Modulation.split(temb_mod_arm, 1)[0]
+        arm_norm = (1 + arm_scale) * self.arm_norm(arm_hidden) + arm_shift
+
+        (grip_shift, grip_scale, grip_gate) = Flux2Modulation.split(temb_mod_grip, 1)[0]
+        grip_norm = (1 + grip_scale) * self.grip_norm(grip_hidden) + grip_shift
+
+        # 3. QKV projections for all 5 streams
+        qkv_list = []
+        for prefix, (norm, _) in zip(['ctx_vlm', 'ctx_grip', 'ctx_arm'], ctx_norms):
+            q = getattr(self, f'{prefix}_to_q')(norm)
+            k = getattr(self, f'{prefix}_to_k')(norm)
+            v = getattr(self, f'{prefix}_to_v')(norm)
+            q = getattr(self, f'{prefix}_norm_q')(q.unflatten(-1, (self.num_heads, self.head_dim)))
+            k = getattr(self, f'{prefix}_norm_k')(k.unflatten(-1, (self.num_heads, self.head_dim)))
+            v = v.unflatten(-1, (self.num_heads, self.head_dim))
+            qkv_list.append((q, k, v))
+
+        arm_q = self.arm_norm_q(self.arm_to_q(arm_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        arm_k = self.arm_norm_k(self.arm_to_k(arm_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        arm_v = self.arm_to_v(arm_norm).unflatten(-1, (self.num_heads, self.head_dim))
+        grip_q = self.grip_norm_q(self.grip_to_q(grip_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        grip_k = self.grip_norm_k(self.grip_to_k(grip_norm).unflatten(-1, (self.num_heads, self.head_dim)))
+        grip_v = self.grip_to_v(grip_norm).unflatten(-1, (self.num_heads, self.head_dim))
+
+        # 4. Concatenate Q/K/V: [ctx_vlm, ctx_grip, ctx_arm, target_grip, target_arm]
+        all_q = [qkv_list[0][0], qkv_list[1][0], qkv_list[2][0], grip_q, arm_q]
+        all_k = [qkv_list[0][1], qkv_list[1][1], qkv_list[2][1], grip_k, arm_k]
+        all_v = [qkv_list[0][2], qkv_list[1][2], qkv_list[2][2], grip_v, arm_v]
+        query = torch.cat(all_q, dim=1)
+        key = torch.cat(all_k, dim=1)
+        value = torch.cat(all_v, dim=1)
+
+        # 5. RoPE
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        # 6. Joint attention
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        attn_mask = joint_attention_kwargs.get('attention_mask', None)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+        attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        attn_output = attn_output.transpose(1, 2).flatten(2, 3).to(query.dtype)
+
+        # 7. Split attention output
+        pos = 0
+        vlm_attn = attn_output[:, pos:pos + ctx_vlm_len, :]; pos += ctx_vlm_len
+        grip_ctx_attn = attn_output[:, pos:pos + ctx_grip_len, :]; pos += ctx_grip_len
+        arm_ctx_attn = attn_output[:, pos:pos + ctx_arm_len, :]; pos += ctx_arm_len
+        grip_attn = attn_output[:, pos:pos + grip_len, :]; pos += grip_len
+        arm_attn = attn_output[:, pos:pos + arm_len, :]; pos += arm_len
+
+        # 8. Parallel pattern: attn + FFN combined with single gate
+        # Context: shared FFN on merged norms
+        ctx_merged_norm = torch.cat([ctx_norms[0][0], ctx_norms[1][0], ctx_norms[2][0]], dim=1)
+        ctx_ffn_out = self.ctx_shared_ff(ctx_merged_norm)
+        vlm_ffn = ctx_ffn_out[:, :ctx_vlm_len, :]
+        grip_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len:ctx_vlm_len + ctx_grip_len, :]
+        arm_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len + ctx_grip_len:, :]
+
+        vlm_combined = vlm_attn + vlm_ffn
+        grip_ctx_combined = grip_ctx_attn + grip_ctx_ffn
+        arm_ctx_combined = arm_ctx_attn + arm_ctx_ffn
+
+        # Target: independent FFN
+        arm_combined = arm_attn + self.arm_ff(arm_norm)
+        grip_combined = grip_attn + self.grip_ff(grip_norm)
+
+        # 9. Residual + gate per stream
+        ctx_vlm_hidden = ctx_vlm_hidden + ctx_norms[0][1] * vlm_combined
+        ctx_grip_hidden = ctx_grip_hidden + ctx_norms[1][1] * grip_ctx_combined
+        ctx_arm_hidden = ctx_arm_hidden + ctx_norms[2][1] * arm_ctx_combined
+        arm_hidden = arm_hidden + arm_gate * arm_combined
+        grip_hidden = grip_hidden + grip_gate * grip_combined
+
+        return ctx_vlm_hidden, ctx_arm_hidden, ctx_grip_hidden, arm_hidden, grip_hidden
+
+# ----------------------------------------------------------------------
+# 2. Core LoLA DiT Modeling (5-Stream Symmetric Architecture)
 # ----------------------------------------------------------------------
 class LoLADiT(nn.Module):
     def __init__(self, config: LoLAConfig):
         super().__init__()
         self.config = config
         self.cond_embedder = LolaConditionEmbedder(config)
-        
-        # FLUX.2 Modulation 层 
-        self.double_stream_modulation_img = Flux2Modulation(config.dit_hidden_size, mod_param_sets=2, bias=False)
-        self.double_stream_modulation_txt = Flux2Modulation(config.dit_hidden_size, mod_param_sets=2, bias=False)
-        self.single_stream_modulation = Flux2Modulation(config.dit_hidden_size, mod_param_sets=1, bias=False)
 
-        # FLUX.2 Transformer Blocks 实例化
+        # 5-Stream Modulation: ctx_vlm, ctx_arm, ctx_grip, target_arm, target_grip
+        dim = config.dit_hidden_size
+        # Double blocks: 2-set modulation
+        self.ctx_vlm_double_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=False)
+        self.ctx_arm_double_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=False)
+        self.ctx_grip_double_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=False)
+        self.arm_double_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=False)
+        self.grip_double_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=False)
+        # Single blocks: 1-set modulation
+        self.ctx_vlm_single_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=False)
+        self.ctx_arm_single_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=False)
+        self.ctx_grip_single_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=False)
+        self.arm_single_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=False)
+        self.grip_single_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=False)
+
+        # 5 Modality Embeddings
+        self.vlm_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.arm_ctx_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.grip_ctx_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.arm_target_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.grip_target_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
+        # 5-Stream Transformer Blocks
         attention_head_dim = config.dit_hidden_size // config.dit_num_heads
-        
+
         self.double_blocks = nn.ModuleList([
-            Flux2TransformerBlock(
+            LoLA5StreamDoubleBlock(
                 dim=config.dit_hidden_size,
                 num_attention_heads=config.dit_num_heads,
                 attention_head_dim=attention_head_dim,
+                arm_mlp_ratio=config.dit_arm_ffn_mult,
+                grip_mlp_ratio=config.dit_grip_ffn_mult,
+                ctx_mlp_ratio=config.dit_ctx_ffn_mult,
             )
             for _ in range(config.dit_double_layers)
         ])
-        
+
         self.single_blocks = nn.ModuleList([
-            Flux2SingleTransformerBlock(
+            LoLA5StreamSingleBlock(
                 dim=config.dit_hidden_size,
                 num_attention_heads=config.dit_num_heads,
                 attention_head_dim=attention_head_dim,
+                arm_mlp_ratio=config.dit_arm_ffn_mult,
+                grip_mlp_ratio=config.dit_grip_ffn_mult,
+                ctx_mlp_ratio=config.dit_ctx_ffn_mult,
             )
             for _ in range(config.dit_single_layers)
         ])
-        
-        self.action_out_proj = nn.Sequential(
+
+        # Dual output heads: arm regression + gripper classification
+        self.arm_out_proj = nn.Sequential(
             nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
             nn.Linear(config.dit_hidden_size, config.dit_hidden_size),
             nn.SiLU(),
-            nn.Linear(config.dit_hidden_size, config.action_dim * config.action_chunk_size)
+            nn.Linear(config.dit_hidden_size, config.arm_dim * config.action_chunk_size)
+        )
+        self.gripper_out_proj = nn.Sequential(
+            nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
+            nn.Linear(config.dit_hidden_size, config.dit_hidden_size),
+            nn.SiLU(),
+            nn.Linear(config.dit_hidden_size, config.gripper_dim * config.action_chunk_size)
         )
 
-    def _prepare_rope_emb(self, vlm_len: int, hist_len: int, target_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        生成多轴旋转位置编码 (Multi-axis RoPE)。
-        构建 4D 坐标系: (T, H, W, L)，支持长上下文与 2D 视觉 Patch 的扩展。
-        
-        注意: apply_rotary_emb 在 diffusers 中的实现:
-        - 输入 x 形状: [B, H, S, D]，D 是完整的 head_dim
-        - cos/sin 形状: [S, D]，也必须是完整的 head_dim
-        - 内部会将 x reshape 为 [B, H, S, D//2, 2]，然后 flatten 回 [B, H, S, D]
-        - 最终乘法在 flatten 后的完整 D 维度上进行
+        # Checkpointing function abstraction
+        self._checkpoint_fn = torch.utils.checkpoint.checkpoint
+        self._checkpoint_fn_kwargs = {"use_reentrant": False, "preserve_rng_state": False}
+
+    def _prepare_rope_emb(self, vlm_len, arm_hist_len, grip_hist_len,
+                          arm_target_len, grip_target_len, device, dtype):
+        """Multi-axis RoPE for 5-stream architecture.
+        Sequence order: [ctx_vlm(T=0), ctx_grip(T=1), ctx_arm(T=1), target_grip(T=2), target_arm(T=2)]
         """
         head_dim = self.config.dit_hidden_size // self.config.dit_num_heads
-        # apply_rotary_emb 期望 cos/sin 的维度是完整的 head_dim
         rope_dim = head_dim
-        # 将 rope_dim 分配给 4 个轴 (T, H, W, L)
         axes_dims = (rope_dim // 4, rope_dim // 4, rope_dim // 4, rope_dim // 4)
-        assert sum(axes_dims) == rope_dim, f"Axes dims sum must match rope_dim {rope_dim}"
-        
-        # 1. 显式构建 4D 坐标
-        # VLM Features (T=0, 未来需区分 2D 图像时可激活 H, W)
-        vlm_coords = torch.zeros((vlm_len, 4), dtype=torch.long, device=device)
-        vlm_coords[:, 0] = 0
-        vlm_coords[:, 3] = torch.arange(vlm_len, device=device)
-        
-        # History Actions (T=1, 仅限 1D，H=W=0)
-        hist_coords = torch.zeros((hist_len, 4), dtype=torch.long, device=device)
-        hist_coords[:, 0] = 1
-        hist_coords[:, 3] = torch.arange(hist_len, device=device)
-        
-        # Target Actions (T=2, 仅限 1D，H=W=0)
-        target_coords = torch.zeros((target_len, 4), dtype=torch.long, device=device)
-        target_coords[:, 0] = 2
-        target_coords[:, 3] = torch.arange(target_len, device=device)
-        
-        context_coords = torch.cat([vlm_coords, hist_coords], dim=0)
-        all_coords = torch.cat([context_coords, target_coords], dim=0)
-        
-        def compute_multiaxis_rope(coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            """根据 4D 坐标独立计算各个轴的旋转频率，并拼接到 Head 维度"""
+        assert sum(axes_dims) == rope_dim
+
+        def make_coords(length, t_axis):
+            coords = torch.zeros((length, 4), dtype=torch.long, device=device)
+            coords[:, 0] = t_axis
+            coords[:, 3] = torch.arange(length, device=device)
+            return coords
+
+        # 5 streams with T-axis differentiation
+        vlm_coords = make_coords(vlm_len, 0)
+        grip_hist_coords = make_coords(grip_hist_len, 1)
+        arm_hist_coords = make_coords(arm_hist_len, 1)
+        grip_target_coords = make_coords(grip_target_len, 2)
+        arm_target_coords = make_coords(arm_target_len, 2)
+
+        all_coords = torch.cat([vlm_coords, grip_hist_coords, arm_hist_coords,
+                                grip_target_coords, arm_target_coords], dim=0)
+
+        def compute_multiaxis_rope(coords):
             freqs_list = []
             for i, dim in enumerate(axes_dims):
                 pos = coords[:, i].float()
-                
                 inv_freq = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, device=device).float() / dim))
-                freqs = torch.outer(pos, inv_freq) # [Seq_Len, dim // 2]
-                freqs = freqs.repeat_interleave(2, dim=-1) # [Seq_Len, dim]
+                freqs = torch.outer(pos, inv_freq)
+                freqs = freqs.repeat_interleave(2, dim=-1)
                 freqs_list.append(freqs)
-            
-            # 将所有轴拼接到一起: [Seq_Len, rope_dim]
             emb = torch.cat(freqs_list, dim=-1)
-            
-            # apply_rotary_emb 期望的格式: (cos, sin)，维度为 [S, D]
-            # 注意：不要在这里 unsqueeze，apply_rotary_emb 会内部处理
-            cos = emb.cos().to(dtype)
-            sin = emb.sin().to(dtype)
-            return (cos, sin)
+            return (emb.cos().to(dtype), emb.sin().to(dtype))
 
-        context_rope = compute_multiaxis_rope(context_coords)
-        target_rope = compute_multiaxis_rope(target_coords)
-        all_rope = compute_multiaxis_rope(all_coords)
-        
-        return context_rope, target_rope, all_rope
+        return compute_multiaxis_rope(all_coords)
 
     def forward(self, target_actions, hist_actions, vlm_features, empty_emb, timestep,
                 hist_actions_mask=None, vlm_attention_mask=None, return_chunks: bool = False,
                 use_gradient_checkpointing: bool = False):
-        """
-        Args:
-            target_actions: [B, num_chunks, dit_hidden_size] - 加噪后的目标动作chunks
-            hist_actions: [B, hist_chunks, dit_hidden_size] - 历史动作chunks
-            vlm_features: [B, vlm_seq_len, dit_hidden_size] - VLM特征
-            empty_emb: [B, dit_hidden_size] - 空token嵌入
-            timestep: [B] - 时间步
-            hist_actions_mask: [B, hist_seq_len] - 历史动作的mask，1表示有效，0表示padding
-            return_chunks: 如果为True，返回chunk特征而非解码后的动作
-        """
+        b = target_actions.shape[0]
+
+        # Split target_actions into arm (first half) and gripper (second half)
+        num_target_chunks = target_actions.shape[1] // 2
+        arm_target = target_actions[:, :num_target_chunks, :]
+        grip_target = target_actions[:, num_target_chunks:, :]
+
+        # Split hist_actions into arm and gripper halves
+        num_hist_chunks = hist_actions.shape[1] // 2
+        arm_hist = hist_actions[:, :num_hist_chunks, :]
+        grip_hist = hist_actions[:, num_hist_chunks:, :]
+
+        # Add modality embeddings
+        vlm_features = vlm_features + self.vlm_modality_emb
+        arm_hist = arm_hist + self.arm_ctx_modality_emb
+        grip_hist = grip_hist + self.grip_ctx_modality_emb
+        arm_target = arm_target + self.arm_target_modality_emb
+        grip_target = grip_target + self.grip_target_modality_emb
+
         temb = self.cond_embedder(timestep, empty_emb)
 
-        temb_mod_img = self.double_stream_modulation_img(temb)
-        temb_mod_txt = self.double_stream_modulation_txt(temb)
-        temb_mod_single = self.single_stream_modulation(temb)
+        # Per-stream modulation for double-stream blocks
+        temb_mod_ctx_vlm_d = self.ctx_vlm_double_modulation(temb)
+        temb_mod_ctx_arm_d = self.ctx_arm_double_modulation(temb)
+        temb_mod_ctx_grip_d = self.ctx_grip_double_modulation(temb)
+        temb_mod_arm_d = self.arm_double_modulation(temb)
+        temb_mod_grip_d = self.grip_double_modulation(temb)
 
-        # print(f"vlm features: {vlm_features.shape}, hist actions: {hist_actions.shape}, target actions: {target_actions.shape}")
-        context_features = torch.cat([vlm_features, hist_actions], dim=1)
+        # Per-stream modulation for single-stream blocks
+        temb_mod_ctx_vlm_s = self.ctx_vlm_single_modulation(temb)
+        temb_mod_ctx_arm_s = self.ctx_arm_single_modulation(temb)
+        temb_mod_ctx_grip_s = self.ctx_grip_single_modulation(temb)
+        temb_mod_arm_s = self.arm_single_modulation(temb)
+        temb_mod_grip_s = self.grip_single_modulation(temb)
 
-        # 构建 attention_mask（如果提供了 mask 信息）
-        # 注意：Flux2Attention 内部会拼接 encoder_hidden_states 和 hidden_states
-        # 所以 mask 需要覆盖完整序列
+        # Build attention mask
+        # Sequence order: [ctx_vlm, ctx_grip, ctx_arm, target_grip, target_arm]
         joint_attention_kwargs = {}
         if hist_actions_mask is not None or vlm_attention_mask is not None:
             vlm_len = vlm_features.shape[1]
-            hist_len = hist_actions.shape[1]
-            target_len = target_actions.shape[1]
+            arm_hist_len = arm_hist.shape[1]
+            grip_hist_len = grip_hist.shape[1]
+            arm_target_len = arm_target.shape[1]
+            grip_target_len = grip_target.shape[1]
 
-            # vlm_attention_mask: [B, vlm_seq_len+1] (original VLM mask including empty token)
-            # vlm_features excludes the empty token ([:, :-1, :]), so mask must also exclude it
             if vlm_attention_mask is not None:
-                vlm_mask = vlm_attention_mask[:, :-1].bool()  # [B, vlm_len]
+                vlm_mask = vlm_attention_mask[:, :-1].bool()
             else:
-                vlm_mask = torch.ones(
-                    vlm_features.shape[0], vlm_len,
-                    dtype=torch.bool,
-                    device=target_actions.device
-                )
+                vlm_mask = torch.ones(b, vlm_len, dtype=torch.bool, device=target_actions.device)
 
             if hist_actions_mask is not None:
+                # Split hist mask into arm/grip halves
                 hist_mask_bool = hist_actions_mask.bool()
+                arm_hist_mask = hist_mask_bool[:, :num_hist_chunks]
+                grip_hist_mask = hist_mask_bool[:, num_hist_chunks:]
             else:
-                hist_mask_bool = torch.ones(
-                    hist_actions.shape[0], hist_len,
-                    dtype=torch.bool,
-                    device=target_actions.device
-                )
+                arm_hist_mask = torch.ones(b, arm_hist_len, dtype=torch.bool, device=target_actions.device)
+                grip_hist_mask = torch.ones(b, grip_hist_len, dtype=torch.bool, device=target_actions.device)
 
-            target_mask = torch.ones(
-                target_actions.shape[0], target_len,
-                dtype=torch.bool,
-                device=target_actions.device
+            grip_target_mask = torch.ones(b, grip_target_len, dtype=torch.bool, device=target_actions.device)
+            arm_target_mask = torch.ones(b, arm_target_len, dtype=torch.bool, device=target_actions.device)
+
+            full_mask = torch.cat([vlm_mask, grip_hist_mask, arm_hist_mask,
+                                   grip_target_mask, arm_target_mask], dim=1)
+            joint_attention_kwargs['attention_mask'] = ~full_mask
+
+        # RoPE
+        all_rope = self._prepare_rope_emb(
+            vlm_len=vlm_features.shape[1],
+            arm_hist_len=arm_hist.shape[1],
+            grip_hist_len=grip_hist.shape[1],
+            arm_target_len=arm_target.shape[1],
+            grip_target_len=grip_target.shape[1],
+            device=target_actions.device,
+            dtype=target_actions.dtype,
+        )
+
+        # Double-stream blocks
+        for block in self.double_blocks:
+            vlm_features, arm_hist, grip_hist, arm_target, grip_target = block(
+                ctx_vlm_hidden=vlm_features,
+                ctx_arm_hidden=arm_hist,
+                ctx_grip_hidden=grip_hist,
+                arm_hidden=arm_target,
+                grip_hidden=grip_target,
+                temb_mod_ctx_vlm=temb_mod_ctx_vlm_d,
+                temb_mod_ctx_arm=temb_mod_ctx_arm_d,
+                temb_mod_ctx_grip=temb_mod_ctx_grip_d,
+                temb_mod_arm=temb_mod_arm_d,
+                temb_mod_grip=temb_mod_grip_d,
+                image_rotary_emb=all_rope,
+                joint_attention_kwargs=joint_attention_kwargs,
             )
 
-            # 拼接: [B, full_seq_len]
-            # True 表示该位置有效，False 表示 padding
-            full_mask = torch.cat([vlm_mask, hist_mask_bool, target_mask], dim=1)
-
-            # scaled_dot_product_attention 的 boolean mask:
-            # True 表示该位置应该被 MASK OUT（不参与 attention）
-            # False 表示该位置有效（参与 attention）
-            attn_mask = ~full_mask
-
-            joint_attention_kwargs['attention_mask'] = attn_mask
-
-        # 获取多模态 RoPE 特征 - 修复：使用 .shape[1] 获取序列长度
-        context_rope, target_rope, all_rope = self._prepare_rope_emb(
-            vlm_len=vlm_features.shape[1],
-            hist_len=hist_actions.shape[1],
-            target_len=target_actions.shape[1],
-            device=target_actions.device,
-            dtype=target_actions.dtype
-        )
-        
-        for block in self.double_blocks:
-            if use_gradient_checkpointing:
-                context_features, target_actions = torch.utils.checkpoint.checkpoint(
-                    block,
-                    hidden_states=target_actions,
-                    encoder_hidden_states=context_features,
-                    temb_mod_img=temb_mod_img,
-                    temb_mod_txt=temb_mod_txt,
-                    image_rotary_emb=all_rope,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                context_features, target_actions = block(
-                    hidden_states=target_actions,
-                    encoder_hidden_states=context_features,
-                    temb_mod_img=temb_mod_img,
-                    temb_mod_txt=temb_mod_txt,
-                    image_rotary_emb=all_rope,  # 使用 all_rope 因为 attention 中会拼接 encoder 和 target
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
-
+        # Single-stream blocks
         for block in self.single_blocks:
-            if use_gradient_checkpointing:
-                context_features, target_actions = torch.utils.checkpoint.checkpoint(
-                    block,
-                    hidden_states=target_actions,
-                    encoder_hidden_states=context_features,
-                    temb_mod=temb_mod_single,
-                    image_rotary_emb=all_rope,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    split_hidden_states=True,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                context_features, target_actions = block(
-                    hidden_states=target_actions,
-                    encoder_hidden_states=context_features,
-                    temb_mod=temb_mod_single,
-                    image_rotary_emb=all_rope,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                    split_hidden_states=True
-                )
-            
-        # 根据 return_chunks 决定返回 chunk 特征还是解码后的动作
+            vlm_features, arm_hist, grip_hist, arm_target, grip_target = block(
+                ctx_vlm_hidden=vlm_features,
+                ctx_arm_hidden=arm_hist,
+                ctx_grip_hidden=grip_hist,
+                arm_hidden=arm_target,
+                grip_hidden=grip_target,
+                temb_mod_ctx_vlm=temb_mod_ctx_vlm_s,
+                temb_mod_ctx_arm=temb_mod_ctx_arm_s,
+                temb_mod_ctx_grip=temb_mod_ctx_grip_s,
+                temb_mod_arm=temb_mod_arm_s,
+                temb_mod_grip=temb_mod_grip_s,
+                image_rotary_emb=all_rope,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        # Output: only target streams
         if return_chunks:
-            # 返回 chunk 特征，用于训练时的 v-loss 计算
-            return target_actions  # [B, num_chunks, dit_hidden_size]
+            return torch.cat([arm_target, grip_target], dim=1)  # [arm, grip] format
         else:
-            # 解码为具体动作
-            out_actions = self.action_out_proj(target_actions)
-            b, num_chunks, _ = out_actions.shape
-            out_actions = out_actions.view(b, num_chunks * self.config.action_chunk_size, self.config.action_dim)
+            arm_actions = self.arm_out_proj(arm_target)
+            grip_logits = self.gripper_out_proj(grip_target)
+            arm_actions = arm_actions.view(b, num_target_chunks * self.config.action_chunk_size, self.config.arm_dim)
+            grip_logits = grip_logits.view(b, num_target_chunks * self.config.action_chunk_size, self.config.gripper_dim)
+
+            out_actions = torch.zeros(b, num_target_chunks * self.config.action_chunk_size, self.config.action_dim,
+                                      device=target_actions.device, dtype=target_actions.dtype)
+            arm_indices = [i for i in range(self.config.action_dim) if i not in list(self.config.gripper_dim_indices_abs)]
+            out_actions[:, :, arm_indices] = arm_actions
+            out_actions[:, :, list(self.config.gripper_dim_indices_abs)] = grip_logits
             return out_actions
 
 # ----------------------------------------------------------------------
@@ -402,6 +755,8 @@ class LoLAPytorch(nn.Module):
         self.action_encoder = LolaActionEncoder(config)
         self.dit = LoLADiT(config)
         self.gradient_checkpointing_enabled = False
+        self._checkpoint_fn = torch.utils.checkpoint.checkpoint
+        self._checkpoint_fn_kwargs = {"use_reentrant": False, "preserve_rng_state": False}
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -413,12 +768,18 @@ class LoLAPytorch(nn.Module):
         self.gradient_checkpointing_enabled = False
         logger.info("Disabled gradient checkpointing for LoLAPytorch model")
 
+    def set_deepspeed_checkpointing(self):
+        """Switch to DeepSpeed activation checkpointing. Called by trainer during DeepSpeed setup."""
+        import deepspeed
+        self._checkpoint_fn = deepspeed.checkpointing.non_reentrant_checkpoint
+        self._checkpoint_fn_kwargs = {}
+        self.dit._checkpoint_fn = self._checkpoint_fn
+        self.dit._checkpoint_fn_kwargs = self._checkpoint_fn_kwargs
+
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
-            return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
-            )
+            return self._checkpoint_fn(func, *args, **kwargs, **self._checkpoint_fn_kwargs)
         return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
@@ -460,6 +821,8 @@ class LoLAPytorch(nn.Module):
             hist_actions_mask_reshaped = hist_actions_mask.view(b, num_chunks, chunk_size)
             # 一个 chunk 有效如果其中任何一个 action 有效
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()  # [B, num_chunks]
+            # Dual-Token: double the mask for arm+gripper token pairs
+            hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)  # [B, 2*num_chunks]
 
         # 确保 dtype 一致性 (DeepSpeed BF16 训练时需要)
         target_dtype = vlm_features.dtype
@@ -494,104 +857,92 @@ class LoLAPytorch(nn.Module):
             use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
         )
         
-        # 4. 从预测的 x_0 推导预测的流速 v
-        # Flow Matching 公式: x_t = t * noise + (1 - t) * x_0
-        # 因此: v = noise - x_0
-        # 或者等价地: v = (x_t - x_0) / t  (当 x_t 已知时)
-        # 
-        # 使用 (x_t - pred_x0) / t 形式，隐式引入 1/t^2 的 SNR 权重
-        # 这使得模型在 t->0 时受到更严厉的惩罚，提升高精度抓取成功率
-        t_expand_clamped = t_expand.clamp(min=1e-5)  # 避免 t 接近 0 时除零崩溃
+        # 4. v-loss: unchanged, operates on all doubled tokens in hidden space
+        t_expand_clamped = t_expand.clamp(min=1e-5)
         v_pred = (x_t - pred_x0_chunks) / t_expand_clamped
-        
-        # 5. 使用 v-loss 进行监督 (chunk 空间)
         v_loss = F.mse_loss(v_pred, u_t, reduction="none")
-        
-        # 6. 【关键修复】动作空间重构损失 - 确保 action_out_proj 被训练
-        # 将预测的 chunk 特征解码到动作空间
-        pred_actions = self.dit.action_out_proj(pred_x0_chunks)
-        num_chunks = pred_x0_chunks.shape[1]
-        pred_actions = pred_actions.view(b, num_chunks * self.config.action_chunk_size, self.config.action_dim)
-        
-        # 处理 target_actions 以匹配输出长度
-        # target_actions: [B, action_seq_len, action_dim]
-        target_action_len = target_actions.shape[1]
-        pred_action_len = pred_actions.shape[1]
-        
-        if target_action_len >= pred_action_len:
-            # 截取目标动作的前 pred_action_len 步
-            target_actions_matched = target_actions[:, :pred_action_len, :]
-        else:
-            # 如果目标动作较短，对预测动作进行截取
-            pred_actions = pred_actions[:, :target_action_len, :]
-            target_actions_matched = target_actions
-        
-        # 计算动作空间的重构损失
-        action_loss = F.mse_loss(pred_actions, target_actions_matched, reduction="none")
-        
-        # 7. 组合损失
-        # action_loss_weight 控制 action_out_proj 训练的强度
-        action_loss_weight = getattr(self.config, 'action_loss_weight', 1.0)
         v_loss_mean = v_loss.mean()
-        action_loss_mean = action_loss.mean()
-        total_loss = v_loss_mean + action_loss_weight * action_loss_mean
+
+        # 5. Split chunk features into arm and gripper
+        num_chunks = pred_x0_chunks.shape[1] // 2
+        pred_x0_arm = pred_x0_chunks[:, :num_chunks, :]
+        pred_x0_gripper = pred_x0_chunks[:, num_chunks:, :]
+
+        # 6. Arm: decode via arm_out_proj, compute Huber loss
+        pred_arm = self.dit.arm_out_proj(pred_x0_arm)
+        pred_arm = pred_arm.view(b, num_chunks * self.config.action_chunk_size, self.config.arm_dim)
+
+        # 7. Gripper: decode via gripper_out_proj, compute BCE loss
+        pred_gripper_logits = self.dit.gripper_out_proj(pred_x0_gripper)
+        pred_gripper_logits = pred_gripper_logits.view(b, num_chunks * self.config.action_chunk_size, self.config.gripper_dim)
+
+        # Match target lengths
+        min_len = min(target_actions.shape[1], pred_arm.shape[1])
+        arm_indices = [i for i in range(self.config.action_dim) if i not in list(self.config.gripper_dim_indices_abs)]
+        gripper_indices = list(self.config.gripper_dim_indices_abs)
+
+        target_arm = target_actions[:, :min_len, arm_indices]
+        target_gripper = target_actions[:, :min_len, gripper_indices]
+        pred_arm_matched = pred_arm[:, :min_len, :]
+        pred_gripper_logits_matched = pred_gripper_logits[:, :min_len, :]
+
+        # Arm: Huber loss (Smooth L1, robust to outliers)
+        arm_loss = F.huber_loss(pred_arm_matched, target_arm, reduction="none")
+        arm_loss_mean = arm_loss.mean()
+        arm_loss_per_dim = arm_loss.mean(dim=(0, 1))
+
+        # Gripper: BCE loss (binary classification, {-1,1} -> {0,1})
+        target_gripper_01 = (target_gripper > 0).float()
+        gripper_loss = F.binary_cross_entropy_with_logits(pred_gripper_logits_matched, target_gripper_01)
+
+        # 8. Combine losses
+        action_loss_weight = getattr(self.config, 'action_loss_weight', 1.0)
+        gripper_loss_weight = getattr(self.config, 'gripper_loss_weight', 1.0)
+        total_loss = v_loss_mean + action_loss_weight * arm_loss_mean + gripper_loss_weight * gripper_loss
 
         return {
             "total_loss": total_loss,
             "v_loss": v_loss_mean,
-            "action_loss": action_loss_mean,
+            "arm_loss": arm_loss_mean,
+            "gripper_loss": gripper_loss,
+            "arm_loss_per_dim": arm_loss_per_dim,
         }
 
     @torch.no_grad()
     def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None):
-        """
-        推理阶段：欧拉积分去噪
-
-        根据README，模型采用x-pred预测，在推理阶段可以完美消除欧拉积分在最后微小时间步的截断误差。
-        Flow Matching ODE: dx/dt = v(x, t) = x_0 - noise
-        欧拉积分: x_{t+dt} = x_t + dt * v(x_t, t)
-        """
+        """推理阶段：欧拉积分去噪 (Dual-Token 版本)"""
         b = hist_actions.shape[0]
         device = hist_actions.device
 
-        # 修复：vlm_bridge.forward 只接受一个参数
         vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
         hist_chunks = self.action_encoder(hist_actions)
 
-        # 处理 hist_actions_mask（如果提供）
+        # Process hist_actions_mask and double it for dual-token
         hist_chunks_mask = None
         if hist_actions_mask is not None:
             chunk_size = self.config.action_chunk_size
             seq_len = hist_actions_mask.shape[1]
-
-            # Pad seq_len 到 chunk_size 的整数倍
             remainder = seq_len % chunk_size
             if remainder != 0:
                 pad_len = chunk_size - remainder
                 hist_actions_mask = F.pad(hist_actions_mask, (0, pad_len), value=0)
                 seq_len = hist_actions_mask.shape[1]
-
-            # Reshape 并聚合：[B, num_chunks, chunk_size] -> [B, num_chunks]
             num_chunks = seq_len // chunk_size
             hist_actions_mask_reshaped = hist_actions_mask.view(b, num_chunks, chunk_size)
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()
+            # Double mask for arm+gripper token pairs
+            hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)
 
-        # 纯噪声起点 (此处假设预测长度与 target 相同，例如 5 个 Chunk 即 50 steps)
-        # 具体需要预测多少长度可以在外部通过参数传入，此处固定为预测配置中约定的块数
+        # Noise shape doubled for arm+gripper tokens
         predict_chunks_len = self.config.pred_chunk_size // self.config.action_chunk_size
-        noise_shape = (b, predict_chunks_len, self.config.dit_hidden_size)
+        noise_shape = (b, predict_chunks_len * 2, self.config.dit_hidden_size)
         x_t = torch.randn(noise_shape, device=device, dtype=empty_emb.dtype)
 
         dt = -1.0 / self.config.num_inference_steps
         time = torch.tensor(1.0, device=device, dtype=torch.float32)
 
-        # Euler 步进
-        # 在 x-pred 设置下，我们需要先预测 x_0，然后计算 v = x_0 - x_t (等价于 noise - x_0 的反向)
-        # 但更高效的做法是：直接使用预测的 x_0 来计算下一步
         while time >= -dt / 2:
             expanded_time = time.expand(b)
-
-            # DiT 预测干净的 x_0 (x-pred)，返回 chunk 特征
             pred_x0_chunks = self.dit(
                 target_actions=x_t,
                 hist_actions=hist_chunks,
@@ -600,29 +951,34 @@ class LoLAPytorch(nn.Module):
                 timestep=expanded_time,
                 hist_actions_mask=hist_chunks_mask,
                 return_chunks=True,
-                use_gradient_checkpointing=False,  # No checkpointing during inference
+                use_gradient_checkpointing=False,
             )
 
-            # 计算流速: v = noise - x_0，但噪声未知
-            # 使用 Flow Matching 的另一种形式: v = (x_t - x_0) / t 当 t > 0
-            # 但在推理时我们不需要显式计算 v，可以直接用 x-pred 的性质
-
-            # 标准欧拉积分: x_{t+dt} = x_t + dt * v
-            # 其中 v = x_0 - x_t (从 x_t = t*noise + (1-t)*x_0 推导)
-            # 因此: x_{t+dt} = x_t + dt * (pred_x0 - x_t)
-            # 这等价于向预测的干净样本移动
             t_expand = time.clamp(min=1e-5)
-            # v = (pred_x0 - x_t) / t 不正确
-            # 正确的推导: 从 x_t = t*noise + (1-t)*x_0
-            # dx/dt = noise - x_0 = v
-            # 所以 v_pred = (x_t - pred_x0) / t (当 t -> 0 时 pred_x0 -> x_0)
             v_pred = (x_t - pred_x0_chunks) / t_expand
-            
             x_t = x_t + dt * v_pred
             time = time + dt
-            
-        # 返回解码到具体维度的物理 Action [B, Predict_Steps, Action_Dim]
-        return self.dit.action_out_proj(pred_x0_chunks).view(b, -1, self.config.action_dim)
+
+        # Dual-head decode + gripper discretization
+        num_chunks = pred_x0_chunks.shape[1] // 2
+        pred_x0_arm = pred_x0_chunks[:, :num_chunks, :]
+        pred_x0_gripper = pred_x0_chunks[:, num_chunks:, :]
+
+        # Arm: continuous regression
+        pred_arm = self.dit.arm_out_proj(pred_x0_arm).view(b, -1, self.config.arm_dim)
+
+        # Gripper: sigmoid threshold -> {-1, 1}
+        pred_gripper_logits = self.dit.gripper_out_proj(pred_x0_gripper).view(b, -1, self.config.gripper_dim)
+        pred_gripper_probs = torch.sigmoid(pred_gripper_logits)
+        pred_gripper_binary = (pred_gripper_probs > 0.5).float()
+        pred_gripper = (pred_gripper_binary - 0.5) * 2.0
+
+        # Reassemble into original action_dim ordering
+        actions = torch.zeros(b, pred_arm.shape[1], self.config.action_dim, device=device, dtype=pred_arm.dtype)
+        arm_indices = [i for i in range(self.config.action_dim) if i not in list(self.config.gripper_dim_indices_abs)]
+        actions[:, :, arm_indices] = pred_arm
+        actions[:, :, list(self.config.gripper_dim_indices_abs)] = pred_gripper
+        return actions
 
 class LoLAPolicy(PreTrainedPolicy):
     """适配 LeRobot 的 Policy API"""
@@ -1115,7 +1471,7 @@ class LoLAPolicy(PreTrainedPolicy):
     # =========================================================
     # 训练和推理接口
     # =========================================================
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, dict]:
+    def forward(self, batch: Dict[str, torch.Tensor], compute_per_dim: bool = False) -> Tuple[torch.Tensor, dict]:
         """训练过程的前向传播，计算 Flow Matching Loss"""
         hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
         target_actions = self.prepare_target_actions(batch)
@@ -1145,8 +1501,11 @@ class LoLAPolicy(PreTrainedPolicy):
         loss_dict = {
             "loss": loss.item(),
             "v_loss": losses["v_loss"].item(),
-            "action_loss": losses["action_loss"].item(),
+            "arm_loss": losses["arm_loss"].item(),
+            "gripper_loss": losses["gripper_loss"].item(),
         }
+        if compute_per_dim:
+            loss_dict["arm_loss_per_dim"] = losses["arm_loss_per_dim"].detach()
         return loss, loss_dict
 
     @torch.no_grad()
