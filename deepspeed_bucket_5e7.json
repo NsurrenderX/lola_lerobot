@@ -1,0 +1,6 @@
+{
+    "zero_optimization": {
+        "reduce_bucket_size": 5e7,
+        "allgather_bucket_size": 5e7
+    }
+}

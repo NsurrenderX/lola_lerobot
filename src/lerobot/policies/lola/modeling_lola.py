@@ -675,12 +675,22 @@ class LoLADiT(nn.Module):
                 arm_hist_mask = torch.ones(b, arm_hist_len, dtype=torch.bool, device=target_actions.device)
                 grip_hist_mask = torch.ones(b, grip_hist_len, dtype=torch.bool, device=target_actions.device)
 
+            # Randomly drop valid history action tokens during training to prevent overfitting
+            if self.training and self.config.hist_action_token_drop_rate > 0.0:
+                drop_rate = self.config.hist_action_token_drop_rate
+                arm_keep = torch.rand(b, arm_hist_len, device=target_actions.device) >= drop_rate
+                grip_keep = torch.rand(b, grip_hist_len, device=target_actions.device) >= drop_rate
+                arm_hist_mask = arm_hist_mask & arm_keep
+                grip_hist_mask = grip_hist_mask & grip_keep
+
             grip_target_mask = torch.ones(b, grip_target_len, dtype=torch.bool, device=target_actions.device)
             arm_target_mask = torch.ones(b, arm_target_len, dtype=torch.bool, device=target_actions.device)
 
             full_mask = torch.cat([vlm_mask, grip_hist_mask, arm_hist_mask,
                                    grip_target_mask, arm_target_mask], dim=1)
-            joint_attention_kwargs['attention_mask'] = ~full_mask
+            # SDPA boolean mask convention: True = attend, False = ignore
+            # full_mask: True = valid token, so pass directly (no inversion)
+            joint_attention_kwargs['attention_mask'] = full_mask
 
         # RoPE
         all_rope = self._prepare_rope_emb(
@@ -970,14 +980,14 @@ class LoLAPytorch(nn.Module):
         # Gripper: sigmoid threshold -> {-1, 1}
         pred_gripper_logits = self.dit.gripper_out_proj(pred_x0_gripper).view(b, -1, self.config.gripper_dim)
         pred_gripper_probs = torch.sigmoid(pred_gripper_logits)
-        pred_gripper_binary = (pred_gripper_probs > 0.5).float()
+        pred_gripper_binary = (pred_gripper_probs > self.config.gripper_threshold).float()
         pred_gripper = (pred_gripper_binary - 0.5) * 2.0
 
         # Reassemble into original action_dim ordering
         actions = torch.zeros(b, pred_arm.shape[1], self.config.action_dim, device=device, dtype=pred_arm.dtype)
         arm_indices = [i for i in range(self.config.action_dim) if i not in list(self.config.gripper_dim_indices_abs)]
         actions[:, :, arm_indices] = pred_arm
-        actions[:, :, list(self.config.gripper_dim_indices_abs)] = pred_gripper
+        actions[:, :, list(self.config.gripper_dim_indices_abs)] = pred_gripper.to(actions.dtype)
         return actions
 
 class LoLAPolicy(PreTrainedPolicy):

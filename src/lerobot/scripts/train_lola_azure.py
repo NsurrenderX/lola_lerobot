@@ -334,6 +334,90 @@ class InterconnectMonitor:
             self.available = False
 
 
+def compute_vlm_max_length(
+    dataset_metadata,
+    vlm_path: str,
+    min_image_pixels: int = 65536,
+    max_image_pixels: int = 230400,
+) -> int:
+    """Auto-compute vlm_max_length from dataset info for static VLM padding.
+
+    Computes: visual_tokens + structural_tokens + max_task_text_tokens + 1 (empty)
+
+    Args:
+        dataset_metadata: LeRobotDatasetMetadata with camera_keys, features, tasks info.
+        vlm_path: Path to Qwen3.5 model for tokenization.
+        min_image_pixels: min_pixels for Qwen smart_resize.
+        max_image_pixels: max_pixels for Qwen smart_resize.
+
+    Returns:
+        vlm_max_length: fixed tokenizer max_length for static padding.
+    """
+    import math
+    from transformers import AutoProcessor
+
+    # 1. Compute visual tokens per camera using Qwen smart_resize
+    merge_size = 2
+    patch_size = 16
+    factor = merge_size * patch_size  # 32
+
+    visual_tokens_total = 0
+    num_images = 0
+    for cam_key in dataset_metadata.camera_keys:
+        feat = dataset_metadata.features.get(cam_key, {})
+        info = feat.get("info", {})
+        h = info.get("video.height", feat.get("shape", (256, 256, 3))[0])
+        w = info.get("video.width", feat.get("shape", (256, 256, 3))[1])
+
+        # Qwen2.5-VL smart_resize
+        h_bar = max(1, math.ceil(h / factor))
+        w_bar = max(1, math.ceil(w / factor))
+
+        if h_bar * w_bar * factor * factor > max_image_pixels:
+            ratio = (h_bar * w_bar * factor * factor) / max_image_pixels
+            h_bar = max(1, math.floor(h_bar / math.sqrt(ratio)))
+            w_bar = max(1, math.floor(w_bar / math.sqrt(ratio)))
+        elif h_bar * w_bar * factor * factor < min_image_pixels:
+            ratio = min_image_pixels / (h_bar * w_bar * factor * factor)
+            h_bar = max(1, math.ceil(h_bar * math.sqrt(ratio)))
+            w_bar = max(1, math.ceil(w_bar * math.sqrt(ratio)))
+            while h_bar * w_bar * factor * factor < min_image_pixels:
+                if h_bar <= w_bar:
+                    h_bar += 1
+                else:
+                    w_bar += 1
+
+        tokens = h_bar * w_bar // (merge_size ** 2)
+        visual_tokens_total += tokens
+        num_images += 1
+
+    # 2. Compute structural tokens from chat template
+    # For Qwen3.5 with N images:
+    # <|im_start|>user\n (3) + N*(<|vision_start|><|vision_end|>) (2*N) +
+    # <|im_end|>\n (2) + <|im_start|>assistant\n (3) + ৬\n (2) = 10 + 2*N
+    structural_tokens = 10 + 2 * num_images
+
+    # 3. Compute max task text tokens
+    max_task_tokens = 0
+    if dataset_metadata.total_tasks > 0:
+        import pandas as pd
+        tasks_path = dataset_metadata.root / "meta" / "tasks.parquet"
+        if tasks_path.exists():
+            df = pd.read_parquet(tasks_path)
+            processor = AutoProcessor.from_pretrained(vlm_path, local_files_only=True)
+            tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+            for task in df.index:
+                token_ids = tokenizer.encode(str(task))
+                max_task_tokens = max(max_task_tokens, len(token_ids))
+
+    # 4. Total: visual + structural + text + 1 (empty token from LolaEmptyTokenProcessor)
+    vlm_max_length = visual_tokens_total + structural_tokens + max_task_tokens + 1
+    _log(f"Auto-computed vlm_max_length={vlm_max_length} "
+         f"(visual={visual_tokens_total}, structural={structural_tokens}, "
+         f"max_text={max_task_tokens}, empty=1)")
+    return vlm_max_length
+
+
 def get_deepspeed_config(
     learning_rate: float = 2.5e-5,
     weight_decay: float = 0.01,
@@ -341,6 +425,8 @@ def get_deepspeed_config(
     train_vlm: bool = False,
     batch_size: int = 4,
     world_size: int = 1,
+    reduce_bucket_size: float = 5e7,
+    allgather_bucket_size: float = 5e7,
 ):
     """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
 
@@ -348,7 +434,7 @@ def get_deepspeed_config(
     - No CPU offload: 183GB per B200 sufficient for 2B-10B models
     - overlap_comm + reduce_scatter: efficient on NVLink-connected systems
     - contiguous_gradients + round_robin_gradients: memory efficiency
-    - Bucket sizes 5e8: large buckets reduce communication rounds on NVLink
+    - Bucket sizes 5e7: finer granularity improves compute/comm overlap on NVLink
     - partition_activations=False: not needed at 4-5B scale on 183GB GPUs; enable for 10B+
     - Optimizer in config: DeepSpeed creates AdamW, ensuring proper ZeRO-2 state partitioning
     """
@@ -356,8 +442,8 @@ def get_deepspeed_config(
         "bf16": {"enabled": True},
         "zero_optimization": {
             "stage": 2,
-            "allgather_bucket_size": 5e8,
-            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": allgather_bucket_size,
+            "reduce_bucket_size": reduce_bucket_size,
             "overlap_comm": True,
             "reduce_scatter": True,
             "contiguous_gradients": True,
@@ -481,39 +567,50 @@ class _ZScoreActionDataset:
         return item
 
 
-def collate_fn(batch):
-    """自定义 collate 函数。"""
-    result = {}
+def make_collate_fn(static_max_len: int | None = None):
+    """Create a collate function with optional static padding length.
+
+    If static_max_len is provided, hist_actions_full and hist_actions_mask
+    are always padded to this fixed length, producing constant-size tensors
+    every step. This eliminates CUDA memory fragmentation and stabilizes
+    DeepSpeed ZeRO-2 reduce-scatter timing.
+
+    If static_max_len is None, falls back to dynamic per-batch padding.
+    """
     variable_length_keys = {"hist_actions_full", "hist_actions_mask"}
 
-    for key in batch[0].keys():
-        values = [item[key] for item in batch]
+    def collate_fn(batch):
+        result = {}
+        for key in batch[0].keys():
+            values = [item[key] for item in batch]
 
-        if key == "task":
-            result[key] = values
-        elif key.startswith("observation.images."):
-            # 相机图像保持为 list，不做 torch.stack
-            # LolaImageProcessor batch mode 需要 list 格式来检测 batch 维度
-            result[key] = values
-        elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
-            max_len = max(v.shape[0] for v in values)
-            padded_values = []
-            for v in values:
-                if v.shape[0] < max_len:
-                    pad_len = max_len - v.shape[0]
-                    if key == "hist_actions_full":
-                        padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
-                    else:
-                        padding = torch.zeros(pad_len, dtype=v.dtype)
-                    v = torch.cat([padding, v], dim=0)
-                padded_values.append(v)
-            result[key] = torch.stack(padded_values)
-        elif isinstance(values[0], torch.Tensor):
-            result[key] = torch.stack(values)
-        else:
-            result[key] = values
+            if key == "task":
+                result[key] = values
+            elif key.startswith("observation.images."):
+                result[key] = values
+            elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
+                max_len = static_max_len if static_max_len is not None else max(v.shape[0] for v in values)
+                padded_values = []
+                for v in values:
+                    if v.shape[0] < max_len:
+                        pad_len = max_len - v.shape[0]
+                        if key == "hist_actions_full":
+                            padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
+                        else:
+                            padding = torch.zeros(pad_len, dtype=v.dtype)
+                        v = torch.cat([padding, v], dim=0)  # left padding
+                    elif v.shape[0] > max_len:
+                        v = v[-max_len:]  # truncate from left (keep most recent)
+                    padded_values.append(v)
+                result[key] = torch.stack(padded_values)
+            elif isinstance(values[0], torch.Tensor):
+                result[key] = torch.stack(values)
+            else:
+                result[key] = values
 
-    return result
+        return result
+
+    return collate_fn
 
 
 # ----------------------------------------------------------------------
@@ -546,6 +643,8 @@ class LoLATrainer:
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
         deepspeed_config_path: str | None = None,
+        deepspeed_reduce_bucket_size: float = 5e7,
+        deepspeed_allgather_bucket_size: float = 5e7,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -565,6 +664,8 @@ class LoLATrainer:
         self.log_every_n_steps = log_every_n_steps
         self.current_epoch = 0
         self.deepspeed_config_path = deepspeed_config_path
+        self.deepspeed_reduce_bucket_size = deepspeed_reduce_bucket_size
+        self.deepspeed_allgather_bucket_size = deepspeed_allgather_bucket_size
 
         # Wandb 配置
         self.wandb_project = wandb_project
@@ -706,6 +807,8 @@ class LoLATrainer:
             train_vlm=self.train_vlm,
             batch_size=self.batch_size,
             world_size=self.world_size,
+            reduce_bucket_size=self.deepspeed_reduce_bucket_size,
+            allgather_bucket_size=self.deepspeed_allgather_bucket_size,
         )
         if self.deepspeed_config_path is not None:
             import json
@@ -1297,6 +1400,8 @@ def main():
                         help="Huber loss weight for continuous arm dimensions")
     parser.add_argument("--gripper_dims", type=str, default="-1",
                         help="Comma-separated gripper dim indices (supports negative)")
+    parser.add_argument("--hist_action_token_drop_rate", type=float, default=0.0,
+                        help="Probability of dropping each valid history action token during training (0.0 = no dropout)")
 
     # Wandb 参数
     parser.add_argument("--wandb_project", type=str, default="lola-azure", help="Wandb project name")
@@ -1308,9 +1413,23 @@ def main():
     # DeepSpeed 参数
     parser.add_argument("--deepspeed_config", type=str, default=None,
                         help="Path to custom DeepSpeed config JSON. Default: ZeRO-2 config tuned for B200.")
+    parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
+                        help="DeepSpeed ZeRO-2 reduce bucket size (default: 5e7 for B200 NVLink)")
+    parser.add_argument("--deepspeed_allgather_bucket_size", type=float, default=5e7,
+                        help="DeepSpeed ZeRO-2 allgather bucket size (default: 5e7 for B200 NVLink)")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
+
+    # Static padding parameters
+    parser.add_argument("--static_collate_padding", action="store_true", default=True,
+                        help="Use static max_history_length padding in collate (default: enabled)")
+    parser.add_argument("--no_static_collate_padding", action="store_true",
+                        help="Disable static padding, use dynamic per-batch padding")
+    parser.add_argument("--static_vlm_padding", action="store_true",
+                        help="Pad VLM tokens to fixed max_length for consistent tensor shapes")
+    parser.add_argument("--vlm_max_length", type=int, default=None,
+                        help="Override tokenizer max_length for static VLM padding; auto-compute if None")
 
     # 归一化参数
     parser.add_argument("--norm_mode", type=str, default="default",
@@ -1373,6 +1492,15 @@ def main():
     _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
     _log(f"Action dim: {action_dim}")
 
+    # Auto-compute vlm_max_length if static VLM padding is enabled but no override given
+    if args.static_vlm_padding and args.vlm_max_length is None:
+        args.vlm_max_length = compute_vlm_max_length(
+            dataset_metadata,
+            vlm_path=args.vlm_path,
+            min_image_pixels=args.min_image_pixels,
+            max_image_pixels=args.max_image_pixels,
+        )
+
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
     config = LoLAConfig(
@@ -1398,6 +1526,9 @@ def main():
         gripper_loss_weight=args.gripper_loss_weight,
         action_loss_weight=args.action_loss_weight,
         gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
+        hist_action_token_drop_rate=args.hist_action_token_drop_rate,
+        static_vlm_padding=args.static_vlm_padding,
+        vlm_max_length=args.vlm_max_length,
     )
 
     # 归一化模式
@@ -1452,13 +1583,20 @@ def main():
         )
         shuffle = False  # sampler 已处理 shuffle
 
+    # Static padding for consistent tensor shapes across steps
+    use_static_padding = not args.no_static_collate_padding and args.load_full_history
+    static_max_len = args.max_history_length if use_static_padding else None
+    if static_max_len is not None:
+        _log(f"Using static collate padding to max_history_length={static_max_len}")
+    collate = make_collate_fn(static_max_len=static_max_len)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         shuffle=shuffle if sampler is None else False,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate,
         pin_memory=True,
         drop_last=True,  # 分布式训练建议 drop_last
     )
@@ -1485,6 +1623,8 @@ def main():
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
         deepspeed_config_path=args.deepspeed_config,
+        deepspeed_reduce_bucket_size=args.deepspeed_reduce_bucket_size,
+        deepspeed_allgather_bucket_size=args.deepspeed_allgather_bucket_size,
     )
 
     # 禁用 wandb

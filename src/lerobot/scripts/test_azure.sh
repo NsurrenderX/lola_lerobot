@@ -81,6 +81,7 @@ NUM_INFERENCE_STEPS=10
 GRIPPER_DIMS="-1"
 ACTION_LOSS_WEIGHT=1.0
 GRIPPER_LOSS_WEIGHT=1.0
+HIST_ACTION_TOKEN_DROP_RATE=0.0
 
 # 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
 NORM_MODE="zscore"
@@ -98,6 +99,13 @@ NUM_WORKERS=8
 
 # DeepSpeed 参数
 DEEPSPEED_CONFIG=""
+DEEPSPEED_REDUCE_BUCKET_SIZE=5e7
+DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
+
+# Static padding 参数
+STATIC_COLLATE_PADDING=true
+STATIC_VLM_PADDING=false
+VLM_MAX_LENGTH=""
 
 # Resume 参数
 RESUME=""
@@ -270,6 +278,10 @@ while [[ $# -gt 0 ]]; do
             ACTION_LOSS_WEIGHT="$2"
             shift 2
             ;;
+        --hist_action_token_drop_rate)
+            HIST_ACTION_TOKEN_DROP_RATE="$2"
+            shift 2
+            ;;
 
         # 归一化参数
         --norm_mode)
@@ -310,6 +322,26 @@ while [[ $# -gt 0 ]]; do
             ;;
         --deepspeed_config)
             DEEPSPEED_CONFIG="$2"
+            shift 2
+            ;;
+        --deepspeed_reduce_bucket_size)
+            DEEPSPEED_REDUCE_BUCKET_SIZE="$2"
+            shift 2
+            ;;
+        --deepspeed_allgather_bucket_size)
+            DEEPSPEED_ALLGATHER_BUCKET_SIZE="$2"
+            shift 2
+            ;;
+        --no_static_collate_padding)
+            STATIC_COLLATE_PADDING=false
+            shift
+            ;;
+        --static_vlm_padding)
+            STATIC_VLM_PADDING=true
+            shift
+            ;;
+        --vlm_max_length)
+            VLM_MAX_LENGTH="$2"
             shift 2
             ;;
 
@@ -373,10 +405,13 @@ if [ "$NNODES" -eq 1 ]; then
         --gripper_dims ${GRIPPER_DIMS} \
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
+        --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
         --num_workers ${NUM_WORKERS} \
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
         --norm_max ${NORM_MAX} \
+        --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
+        --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
         --wandb_project ${WANDB_PROJECT}"
 else
     # 多节点：使用完整的分布式参数
@@ -405,10 +440,13 @@ else
         --gripper_dims ${GRIPPER_DIMS} \
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
+        --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
         --num_workers ${NUM_WORKERS} \
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
         --norm_max ${NORM_MAX} \
+        --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
+        --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
         --wandb_project ${WANDB_PROJECT}"
 fi
 
@@ -471,6 +509,17 @@ fi
 # DeepSpeed 参数
 if [ -n "$DEEPSPEED_CONFIG" ]; then
     cmd="${cmd} --deepspeed_config ${DEEPSPEED_CONFIG}"
+fi
+
+# Static padding 参数
+if [ "$STATIC_COLLATE_PADDING" = false ]; then
+    cmd="${cmd} --no_static_collate_padding"
+fi
+if [ "$STATIC_VLM_PADDING" = true ]; then
+    cmd="${cmd} --static_vlm_padding"
+fi
+if [ -n "$VLM_MAX_LENGTH" ]; then
+    cmd="${cmd} --vlm_max_length ${VLM_MAX_LENGTH}"
 fi
 
 echo "Running: $cmd"

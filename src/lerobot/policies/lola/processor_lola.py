@@ -339,6 +339,8 @@ class LolaQwenProcessor(ObservationProcessorStep):
         task_key: str = "task",
         max_image_pixels: int = 230400,
         min_image_pixels: int = 65536,
+        static_vlm_padding: bool = False,
+        vlm_max_length: int | None = None,
         **kwargs
     ):
         """
@@ -351,11 +353,17 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 Controls the maximum number of visual tokens per image.
             min_image_pixels: Minimum pixels per image for Qwen3.5 smart_resize.
                 65536 → minimum 64 visual tokens per image (256x256).
+            static_vlm_padding: Pad VLM tokens to fixed vlm_max_length instead of
+                dynamic per-batch longest. Eliminates shape variance across steps.
+            vlm_max_length: Override tokenizer max_length for static padding.
+                If None and static_vlm_padding=True, auto-compute from dataset tasks.
         """
         super().__init__(**kwargs)
         self.processor_name = processor_name
         self.max_length = max_length
         self.task_key = task_key
+        self.static_vlm_padding = static_vlm_padding
+        self.vlm_max_length = vlm_max_length
 
         if not _transformers_available:
             raise ImportError(
@@ -417,7 +425,8 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 add_generation_prompt=True,
                 return_dict=True,
                 return_tensors="pt",
-                padding=True,
+                padding="max_length" if self.static_vlm_padding else True,
+                max_length=self.vlm_max_length if self.static_vlm_padding else None,
             )
         else:
             # Single-item mode (inference)
@@ -428,12 +437,15 @@ class LolaQwenProcessor(ObservationProcessorStep):
             content.append({"type": "text", "text": task if isinstance(task, str) else str(task)})
             messages = [[{"role": "user", "content": content}]]
 
+            self.qwen_processor.tokenizer.padding_side = 'left'
             inputs = self.qwen_processor.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
                 return_tensors="pt",
+                padding="max_length" if self.static_vlm_padding else True,
+                max_length=self.vlm_max_length if self.static_vlm_padding else None,
             )
 
         # Extract outputs
@@ -551,6 +563,8 @@ def make_lola_pre_post_processors(
             max_length=max_length,
             max_image_pixels=config.max_image_pixels,
             min_image_pixels=config.min_image_pixels,
+            static_vlm_padding=config.static_vlm_padding,
+            vlm_max_length=config.vlm_max_length,
         ),
         LolaEmptyTokenProcessor(empty_token_id=config.empty_token_id),  # Append empty token for LoLA
         AddBatchDimensionProcessorStep(),

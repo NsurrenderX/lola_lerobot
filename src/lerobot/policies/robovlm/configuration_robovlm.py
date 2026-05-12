@@ -34,6 +34,11 @@ class RoboVLMConfig(PreTrainedConfig):
     fwd_pred_next_n: int = 10
     action_dim: int = 7
     history_type: str = "post"
+    # Extra frames loaded around the action window for tolerance-based evaluation.
+    # dataset_tolerance_frames extends the action delta_indices by this many frames
+    # on both sides (past and future). The model's prediction window stays the same
+    # (fwd_pred_next_n); only the dataset's action chunks become wider.
+    dataset_tolerance_frames: int = 0
 
     # ==========================
     # 5. State Settings

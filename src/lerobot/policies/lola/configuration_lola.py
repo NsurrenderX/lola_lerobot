@@ -68,6 +68,8 @@ class LoLAConfig(PreTrainedConfig):
     action_loss_weight: float = 1.0              # 动作空间重构损失权重
     gripper_loss_weight: float = 1.0              # BCE loss weight for gripper dimension
     gripper_dim_indices: tuple = (-1,)            # Gripper dim indices (supports negative, e.g. (-1,) for single-arm, (-1,-11) for dual-arm)
+    gripper_threshold: float = 0.5                # Threshold for discretizing gripper predictions at inference
+    hist_action_token_drop_rate: float = 0.0      # Probability of dropping each valid history action token during training (0.0 = no dropout)
     
     # Training settings
     gradient_checkpointing: bool = True
@@ -91,6 +93,10 @@ class LoLAConfig(PreTrainedConfig):
     # Image resolution limits for VLM visual token balancing
     max_image_pixels: int = 230400  # Enforces max visual tokens per image (230400 → max_h≈360p for 720p → 220 tokens)
     min_image_pixels: int = 65536   # Enforces min visual tokens per image (65536 → min 64 tokens, 256x256)
+
+    # Static VLM padding for consistent tensor shapes across training steps
+    static_vlm_padding: bool = False  # Pad VLM tokens to fixed max_length instead of dynamic per-batch
+    vlm_max_length: int | None = None  # Override tokenizer max_length; auto-computed if None when static_vlm_padding=True
 
     default_image_resolution: tuple[int, int] = (256, 256)  # see openpi `preprocessing_pytorch.py`
 

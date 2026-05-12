@@ -39,6 +39,7 @@ RoboVLM 模型验证脚本 - 在验证集上评估模型质量
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -54,19 +55,23 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from lerobot.configs.types import FeatureType
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.robovlm_dataset import RoboVLMDataset, unnoramalize_action
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.robovlm import RoboVLMConfig, RoboVLMPolicy
 
 
 def validate_forward_loss(policy, val_loader, device, action_dim=None,
-                          gripper_dim_indices=None, compute_per_dim=False):
+                          gripper_dim_indices=None, compute_per_dim=False,
+                          original_fwd=10, tolerance_frames=0):
     """在验证集上计算 forward loss（arm loss, gripper loss, gripper accuracy）
 
     可选: 每维度 arm loss 分解（需模型支持 compute_per_dim 参数）。
     支持多卡 DDP: 使用 all_reduce 聚合所有 rank 的结果。
     """
     policy.model.eval()
+    tol = tolerance_frames
+    fwd = original_fwd
 
     gripper_dim_indices = gripper_dim_indices or []
     continuous_dim_indices = [i for i in range(action_dim) if i not in gripper_dim_indices]
@@ -85,6 +90,14 @@ def validate_forward_loss(policy, val_loader, device, action_dim=None,
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+            # 数据集 action_chunck 形状为 [B, ws, fwd+2*tol, 7],
+            # 每个 chunk 包含 [tol past, fwd center, tol future].
+            # policy forward 只需要中心部分 [:, :, tol:fwd+tol, :]
+            if tol > 0 and batch["action_chunck"].shape[2] > fwd:
+                batch = dict(batch)  # shallow copy
+                batch["action_chunck"] = batch["action_chunck"][:, :, tol:tol + fwd, :]
+                batch["chunck_mask"] = batch["chunck_mask"][:, :, tol:tol + fwd]
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 loss, loss_dict = policy(batch, compute_per_dim=need_per_dim)
@@ -147,15 +160,104 @@ def validate_forward_loss(policy, val_loader, device, action_dim=None,
     return results
 
 
+def _compute_gripper_confusion_strict(pred_gripper, gt_gripper, gripper_threshold):
+    """严格模式：逐帧对比，每个时刻的 pred 和 gt 必须完全匹配。"""
+    pred_binary = (pred_gripper > gripper_threshold).reshape(-1).float()
+    gt_binary = (gt_gripper > gripper_threshold).reshape(-1).float()
+    tp = (pred_binary * gt_binary).sum().double().cpu()
+    fp = ((1 - gt_binary) * pred_binary).sum().double().cpu()
+    fn = (gt_binary * (1 - pred_binary)).sum().double().cpu()
+    tn = ((1 - gt_binary) * (1 - pred_binary)).sum().double().cpu()
+    return tp, fp, fn, tn
+
+
+def _compute_gripper_confusion_lenient(pred_gripper, gt_extended_gripper, gripper_threshold,
+                                         tolerance_frames, gt_mask=None):
+    """宽松模式：对于 pred 与 gt 不匹配的帧，在扩展窗口 ±tolerance_frames 范围内搜索有效 gt 标签。
+
+    pred_gripper:   [B, fwd_pred_next_n]              — 预测夹爪值（中心窗口）
+    gt_extended_gripper: [B, fwd + 2*tol]             — 扩展 gt 窗口
+                     中心部分 (indices [tol:tol+fwd]) 与 pred 对齐
+    tolerance_frames: 搜索半径（帧数）
+    gt_mask:         [B, fwd + 2*tol]                  — 有效性掩码 (True=有效帧, None 表示全部有效)
+
+    在稳定区域（远离翻转点），±tol 内只有一种 gt 状态 → 不宽恕。
+    在翻转边界附近，±tol 内两种状态共存 → 0.2s 级时序偏差被宽恕。
+    """
+    B, fwd = pred_gripper.shape
+    offset = tolerance_frames  # pred 在 gt_extended 中的起始偏移
+
+    pred_binary = (pred_gripper > gripper_threshold)             # [B, fwd] bool
+    gt_binary_ext = (gt_extended_gripper > gripper_threshold)    # [B, ext_len] bool
+
+    # 中心窗口的 gt（与 pred 对齐）
+    gt_center = gt_binary_ext[:, offset:offset + fwd]            # [B, fwd] bool
+
+    # 严格模式初步判定
+    match = pred_binary == gt_center                              # [B, fwd] bool
+
+    # 对不匹配的帧进行容忍搜索
+    if tolerance_frames > 0 and not match.all():
+        # 构建有效帧的标签掩码：只在有效帧中搜索
+        if gt_mask is not None:
+            valid_mask = gt_mask.bool()                           # [B, ext_len]
+            valid_positive = (gt_binary_ext & valid_mask).float().unsqueeze(1)
+            valid_negative = (~gt_binary_ext & valid_mask).float().unsqueeze(1)
+        else:
+            valid_positive = gt_binary_ext.float().unsqueeze(1)
+            valid_negative = (~gt_binary_ext).float().unsqueeze(1)
+
+        kernel_size = 2 * tolerance_frames + 1
+        # Replication padding + max_pool1d 做膨胀
+        # 填充后 ext_len+2*tol，输出 (ext_len+2*tol)-(2*tol+1)+1 = ext_len
+        padded_pos = F.pad(valid_positive, (tolerance_frames, tolerance_frames), mode='replicate')
+        padded_neg = F.pad(valid_negative, (tolerance_frames, tolerance_frames), mode='replicate')
+        dilated_pos = F.max_pool1d(padded_pos, kernel_size, stride=1).squeeze(1)  # [B, ext_len]
+        dilated_neg = F.max_pool1d(padded_neg, kernel_size, stride=1).squeeze(1)  # [B, ext_len]
+
+        # 提取中心窗口的膨胀结果（对应 pred 各帧）
+        dilated_pos_center = dilated_pos[:, offset:offset + fwd]   # [B, fwd]
+        dilated_neg_center = dilated_neg[:, offset:offset + fwd]   # [B, fwd]
+
+        # pred 预测的标签在 ±tol 内有有效 gt 验证 → 不算 fp/fn
+        lenient_match_pos = pred_binary & (dilated_pos_center > 0)
+        lenient_match_neg = (~pred_binary) & (dilated_neg_center > 0)
+        lenient_match = lenient_match_pos | lenient_match_neg
+
+        match = match | lenient_match
+
+    # 根据最终匹配结果计算混淆矩阵（基于中心窗口）
+    pred_flat = pred_binary.reshape(-1).float()
+    gt_flat = gt_center.reshape(-1).float()
+    match_flat = match.reshape(-1)
+
+    tp = (pred_flat * gt_flat * match_flat.float()).sum().double().cpu()
+    tn = ((1 - pred_flat) * (1 - gt_flat) * match_flat.float()).sum().double().cpu()
+    fp = ((pred_flat * (1 - gt_flat)) * (~match_flat).float()).sum().double().cpu()
+    fn = (((1 - pred_flat) * gt_flat) * (~match_flat).float()).sum().double().cpu()
+
+    return tp, fp, fn, tn
+
+
 def validate_inference(policy, val_loader, device, max_samples=100,
                        action_dim=None, gripper_dim_indices=None,
-                       gripper_threshold=0.0, compute_per_dim=False):
+                       gripper_threshold=0.0, compute_per_dim=False,
+                       tolerance_frames=0, original_fwd=10, window_size=8):
     """运行推理管线，对比预测动作与真实动作。
 
     支持每维度 MSE/L1 和夹爪分类指标（accuracy, precision, recall, F1）。
+    夹爪分类同时返回严格模式和宽松模式（±tolerance_frames 容忍窗口）的结果。
+
+    数据集 action_chunck 形状为 [B, ws, fwd+2*tol, 7], 每个 chunk 包含:
+      - [0, tol):        过去容差帧
+      - [tol, tol+fwd):  中心帧（与 pred 对齐）
+      - [tol+fwd, fwd+2*tol): 未来容差帧
+
     支持多卡 DDP: 使用 all_reduce 聚合所有 rank 的结果。
     """
     policy.model.eval()
+    fwd = original_fwd
+    tol = tolerance_frames
 
     gripper_dim_indices = gripper_dim_indices or []
     num_gripper_dims = len(gripper_dim_indices)
@@ -170,14 +272,21 @@ def validate_inference(policy, val_loader, device, max_samples=100,
     per_dim_mse_sum = torch.zeros(action_dim, dtype=torch.float64) if need_per_dim else None
     per_dim_l1_sum = torch.zeros(action_dim, dtype=torch.float64) if need_per_dim else None
 
-    gripper_tp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
-    gripper_fp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
-    gripper_fn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
-    gripper_tn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    # 严格模式混淆矩阵
+    strict_tp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    strict_fp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    strict_fn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    strict_tn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    # 宽松模式混淆矩阵
+    lenient_tp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    lenient_fp = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    lenient_fn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
+    lenient_tn = torch.zeros(num_gripper_dims, dtype=torch.float64) if num_gripper_dims > 0 else None
     gripper_total = 0
 
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    print(f"[Rank {local_rank}] Running inference validation...")
+    print(f"[Rank {local_rank}] Running inference validation (tolerance_frames={tol}, "
+          f"original_fwd={fwd})...")
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             if sample_count >= max_samples:
@@ -185,23 +294,24 @@ def validate_inference(policy, val_loader, device, max_samples=100,
 
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            # Ground truth: last timestep's action chunk
-            gt_actions = batch["action_chunck"][:, -1, :, :].clone()  # [B, fwd, 7]
-
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 pred_actions = policy.predict_action_chunk(batch)  # [B, fwd, 7]
 
-            # Unnormalize ground truth to match prediction space
-            gt_actions = unnoramalize_action(gt_actions, policy.config.norm_min, policy.config.norm_max)
-            # Binarize gripper dim in gt to match prediction
-            gt_actions[..., -1] = (gt_actions[..., -1] > 0).float() * 2 - 1
+            # ---- 从最后 chunk 直接提取扩展 gt 窗口 ----
+            # action_chunck[:, -1, :, :] 已包含 [tol past, fwd center, tol future]
+            gt_extended = batch["action_chunck"][:, -1, :, :].clone()   # [B, fwd+2*tol, 7]
+            gt_ext_mask = batch["chunck_mask"][:, -1, :]                 # [B, fwd+2*tol]
 
-            # Match lengths
-            min_len = min(pred_actions.shape[1], gt_actions.shape[1])
+            # Unnormalize + binarize gripper on extended window
+            gt_extended = unnoramalize_action(gt_extended, policy.config.norm_min, policy.config.norm_max)
+            gt_extended[..., -1] = (gt_extended[..., -1] > 0).float() * 2 - 1
+
+            # MSE/L1 比较仅用中心部分 [tol : tol+fwd]
+            gt_center = gt_extended[:, tol:tol + fwd, :]  # [B, fwd, 7]
+            min_len = min(pred_actions.shape[1], fwd)
             pred_matched = pred_actions[:, :min_len, :]
-            gt_matched = gt_actions[:, :min_len, :].to(pred_actions.device)
+            gt_matched = gt_center[:, :min_len, :].to(pred_matched.device)
 
-            # 总体 MSE/L1（向后兼容）
             mse = F.mse_loss(pred_matched, gt_matched, reduction="mean")
             l1 = F.l1_loss(pred_matched, gt_matched, reduction="mean")
             mse_sum += mse.item()
@@ -219,22 +329,26 @@ def validate_inference(policy, val_loader, device, max_samples=100,
             # 夹爪分类指标
             if num_gripper_dims > 0:
                 for g_idx, g_dim in enumerate(gripper_dim_indices):
-                    pred_gripper = pred_matched[:, :, g_dim]  # [B, min_len]
-                    gt_gripper = gt_matched[:, :, g_dim]       # [B, min_len]
+                    pred_gripper = pred_matched[:, :, g_dim]          # [B, min_len]
+                    gt_center_gripper = gt_matched[:, :, g_dim]       # [B, min_len]
+                    gt_ext_gripper = gt_extended[:, :, g_dim]         # [B, fwd+2*tol]
 
-                    # pred 和 gt 的夹爪值都已经在 {-1, 1} 空间，threshold=0 将其分为两类
-                    pred_binary = (pred_gripper > gripper_threshold).reshape(-1).float()
-                    gt_binary = (gt_gripper > gripper_threshold).reshape(-1).float()
+                    # 严格模式：中心窗口逐帧对比
+                    tp, fp, fn, tn = _compute_gripper_confusion_strict(
+                        pred_gripper, gt_center_gripper, gripper_threshold)
+                    strict_tp[g_idx] += tp
+                    strict_fp[g_idx] += fp
+                    strict_fn[g_idx] += fn
+                    strict_tn[g_idx] += tn
 
-                    tp = (pred_binary * gt_binary).sum().double().cpu()
-                    fp = ((1 - gt_binary) * pred_binary).sum().double().cpu()
-                    fn = (gt_binary * (1 - pred_binary)).sum().double().cpu()
-                    tn = ((1 - gt_binary) * (1 - pred_binary)).sum().double().cpu()
-
-                    gripper_tp[g_idx] += tp
-                    gripper_fp[g_idx] += fp
-                    gripper_fn[g_idx] += fn
-                    gripper_tn[g_idx] += tn
+                    # 宽松模式：扩展窗口 ±tol 搜索
+                    tp, fp, fn, tn = _compute_gripper_confusion_lenient(
+                        pred_gripper, gt_ext_gripper, gripper_threshold,
+                        tolerance_frames=tol, gt_mask=gt_ext_mask)
+                    lenient_tp[g_idx] += tp
+                    lenient_fp[g_idx] += fp
+                    lenient_fn[g_idx] += fn
+                    lenient_tn[g_idx] += tn
 
                 gripper_total += pred_matched.shape[0] * pred_matched.shape[1]
 
@@ -246,7 +360,8 @@ def validate_inference(policy, val_loader, device, max_samples=100,
     if is_distributed:
         header_size = 4  # mse_sum, l1_sum, n_batches, sample_count
         per_dim_size = action_dim * 2 if need_per_dim else 0
-        gripper_size = num_gripper_dims * 4 + 1 if num_gripper_dims > 0 else 0
+        # strict + lenient 各 4 组 (tp/fp/fn/tn) + gripper_total
+        gripper_size = num_gripper_dims * 8 + 1 if num_gripper_dims > 0 else 0
         total_size = header_size + per_dim_size + gripper_size
 
         stats_tensor = torch.zeros(total_size, dtype=torch.float64, device=device)
@@ -263,13 +378,23 @@ def validate_inference(policy, val_loader, device, max_samples=100,
             offset += action_dim
 
         if num_gripper_dims > 0:
-            stats_tensor[offset:offset + num_gripper_dims] = gripper_tp.to(device)
+            # strict
+            stats_tensor[offset:offset + num_gripper_dims] = strict_tp.to(device)
             offset += num_gripper_dims
-            stats_tensor[offset:offset + num_gripper_dims] = gripper_fp.to(device)
+            stats_tensor[offset:offset + num_gripper_dims] = strict_fp.to(device)
             offset += num_gripper_dims
-            stats_tensor[offset:offset + num_gripper_dims] = gripper_fn.to(device)
+            stats_tensor[offset:offset + num_gripper_dims] = strict_fn.to(device)
             offset += num_gripper_dims
-            stats_tensor[offset:offset + num_gripper_dims] = gripper_tn.to(device)
+            stats_tensor[offset:offset + num_gripper_dims] = strict_tn.to(device)
+            offset += num_gripper_dims
+            # lenient
+            stats_tensor[offset:offset + num_gripper_dims] = lenient_tp.to(device)
+            offset += num_gripper_dims
+            stats_tensor[offset:offset + num_gripper_dims] = lenient_fp.to(device)
+            offset += num_gripper_dims
+            stats_tensor[offset:offset + num_gripper_dims] = lenient_fn.to(device)
+            offset += num_gripper_dims
+            stats_tensor[offset:offset + num_gripper_dims] = lenient_tn.to(device)
             offset += num_gripper_dims
             stats_tensor[offset] = gripper_total
 
@@ -288,13 +413,21 @@ def validate_inference(policy, val_loader, device, max_samples=100,
             offset += action_dim
 
         if num_gripper_dims > 0:
-            gripper_tp = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            strict_tp = stats_tensor[offset:offset + num_gripper_dims].cpu()
             offset += num_gripper_dims
-            gripper_fp = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            strict_fp = stats_tensor[offset:offset + num_gripper_dims].cpu()
             offset += num_gripper_dims
-            gripper_fn = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            strict_fn = stats_tensor[offset:offset + num_gripper_dims].cpu()
             offset += num_gripper_dims
-            gripper_tn = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            strict_tn = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            offset += num_gripper_dims
+            lenient_tp = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            offset += num_gripper_dims
+            lenient_fp = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            offset += num_gripper_dims
+            lenient_fn = stats_tensor[offset:offset + num_gripper_dims].cpu()
+            offset += num_gripper_dims
+            lenient_tn = stats_tensor[offset:offset + num_gripper_dims].cpu()
             offset += num_gripper_dims
             gripper_total = stats_tensor[offset].item()
 
@@ -323,22 +456,32 @@ def validate_inference(policy, val_loader, device, max_samples=100,
 
     # 夹爪分类指标
     if num_gripper_dims > 0 and gripper_total > 0:
-        for g_idx, g_dim in enumerate(gripper_dim_indices):
-            tp = gripper_tp[g_idx].item()
-            fp = gripper_fp[g_idx].item()
-            fn = gripper_fn[g_idx].item()
-            tn = gripper_tn[g_idx].item()
-            total = tp + fp + fn + tn
-
-            accuracy = (tp + tn) / total if total > 0 else 0.0
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        def _gripper_metrics(tp_v, fp_v, fn_v, tn_v):
+            total = tp_v + fp_v + fn_v + tn_v
+            accuracy = (tp_v + tn_v) / total if total > 0 else 0.0
+            precision = tp_v / (tp_v + fp_v) if (tp_v + fp_v) > 0 else 0.0
+            recall = tp_v / (tp_v + fn_v) if (tp_v + fn_v) > 0 else 0.0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+            return accuracy, precision, recall, f1
 
-            results[f"val_gripper_dim_{g_dim}_accuracy"] = accuracy
-            results[f"val_gripper_dim_{g_dim}_precision"] = precision
-            results[f"val_gripper_dim_{g_dim}_recall"] = recall
-            results[f"val_gripper_dim_{g_dim}_f1"] = f1
+        for g_idx, g_dim in enumerate(gripper_dim_indices):
+            # 严格模式
+            acc, prec, rec, f1 = _gripper_metrics(
+                strict_tp[g_idx].item(), strict_fp[g_idx].item(),
+                strict_fn[g_idx].item(), strict_tn[g_idx].item())
+            results[f"val_gripper_dim_{g_dim}_strict_accuracy"] = acc
+            results[f"val_gripper_dim_{g_dim}_strict_precision"] = prec
+            results[f"val_gripper_dim_{g_dim}_strict_recall"] = rec
+            results[f"val_gripper_dim_{g_dim}_strict_f1"] = f1
+
+            # 宽松模式
+            acc, prec, rec, f1 = _gripper_metrics(
+                lenient_tp[g_idx].item(), lenient_fp[g_idx].item(),
+                lenient_fn[g_idx].item(), lenient_tn[g_idx].item())
+            results[f"val_gripper_dim_{g_dim}_lenient_accuracy"] = acc
+            results[f"val_gripper_dim_{g_dim}_lenient_precision"] = prec
+            results[f"val_gripper_dim_{g_dim}_lenient_recall"] = rec
+            results[f"val_gripper_dim_{g_dim}_lenient_f1"] = f1
 
     return results
 
@@ -387,6 +530,11 @@ def main():
     parser.add_argument("--gripper_threshold", type=float, default=0.0,
                         help="Threshold for discretizing gripper predictions. "
                              "0.0 for {-1,1} range, 0.5 for {0,1} range")
+    parser.add_argument("--gripper_tolerance_s", type=float, default=0.1,
+                        help="Tolerance window in seconds for lenient gripper matching. "
+                             "If pred and gt disagree at time t, but gt has the matching "
+                             "label within ±tolerance_s, it is not counted as an error. "
+                             "Set to 0 to disable lenient mode.")
     parser.add_argument("--per_dim_metrics", action="store_true", default=False,
                         help="Compute per-dimension MSE/L1 for all action dims")
 
@@ -399,6 +547,10 @@ def main():
     if args.val_dataset_repo_id is None and args.val_dataset_root is None:
         raise ValueError("Either --val_dataset_repo_id or --val_dataset_root must be provided.")
 
+    # set random seed
+    seed = 42
+    torch.manual_seed(seed)
+    
     # 解析布尔参数
     use_state = args.use_state
     use_hand_rgb = args.use_hand_rgb and not args.no_use_hand_rgb
@@ -469,6 +621,17 @@ def main():
     # 获取 tokenizer
     tokenizer = policy.model.tokenizer
 
+    # 先加载 metadata 获取 fps, 用于计算 tolerance_frames
+    pre_meta = LeRobotDatasetMetadata(args.val_dataset_repo_id, root=args.val_dataset_root)
+    fps = pre_meta.fps
+    tolerance_frames = max(0, round(args.gripper_tolerance_s * fps))
+    print(f"[Rank {local_rank}] fps={fps}, gripper_tolerance_s={args.gripper_tolerance_s}, "
+          f"tolerance_frames={tolerance_frames}")
+
+    # 设置 dataset_tolerance_frames 以加载额外 past/future 容差帧
+    # 模型的 fwd_pred_next_n 不变，仅数据集加载范围扩展
+    config.dataset_tolerance_frames = tolerance_frames
+
     # 创建验证数据集
     print(f"[Rank {local_rank}] Creating validation dataset from {args.val_dataset_repo_id or args.val_dataset_root}...")
     val_dataset = RoboVLMDataset(
@@ -514,7 +677,7 @@ def main():
             val_dataset,
             num_replicas=dist.get_world_size(),
             rank=dist.get_rank(),
-            shuffle=False,
+            shuffle=True,
         )
 
     val_loader = DataLoader(
@@ -537,6 +700,8 @@ def main():
             action_dim=action_dim,
             gripper_dim_indices=gripper_dim_indices,
             compute_per_dim=compute_per_dim,
+            original_fwd=config.fwd_pred_next_n,
+            tolerance_frames=tolerance_frames,
         )
         all_metrics.update(forward_metrics)
 
@@ -548,27 +713,33 @@ def main():
             gripper_dim_indices=gripper_dim_indices,
             gripper_threshold=args.gripper_threshold,
             compute_per_dim=compute_per_dim,
+            tolerance_frames=tolerance_frames,
+            original_fwd=config.fwd_pred_next_n,
+            window_size=config.window_size,
         )
         all_metrics.update(inference_metrics)
 
     elapsed = time.time() - start_time
 
-    # 输出结果（所有 rank 都打印，方便观察）
-    print("=" * 60)
-    print(f"[Rank {local_rank}] RoboVLM Validation Results")
-    print("=" * 60)
-    print(f"Dataset: {args.val_dataset_repo_id or args.val_dataset_root}")
-    print(f"Checkpoint: {args.checkpoint_path or 'N/A'}")
-    print(f"Mode: {args.mode}")
-    print(f"Validation samples: {len(val_dataset)}")
-    print("-" * 60)
-    for name, value in all_metrics.items():
-        print(f"  {name}: {value:.6f}")
-    print(f"  Elapsed time: {elapsed:.1f}s")
-    print("=" * 60)
+    # 输出结果（仅 rank 0 打印，避免多卡信息混杂）
+    is_main = not is_distributed or dist.get_rank() == 0
+    if is_main:
+        lines = []
+        lines.append("=" * 60)
+        lines.append("RoboVLM Validation Results")
+        lines.append("=" * 60)
+        lines.append(f"Dataset: {args.val_dataset_repo_id or args.val_dataset_root}")
+        lines.append(f"Checkpoint: {args.checkpoint_path or 'N/A'}")
+        lines.append(f"Mode: {args.mode}")
+        lines.append(f"Validation samples: {len(val_dataset)}")
+        lines.append("-" * 60)
+        for name, value in all_metrics.items():
+            lines.append(f"  {name}: {value:.6f}")
+        lines.append(f"  Elapsed time: {elapsed:.1f}s")
+        lines.append("=" * 60)
+        print("\n".join(lines))
 
     # 保存结果（仅主进程保存）
-    is_main = not is_distributed or dist.get_rank() == 0
     if args.output_file and is_main:
         output_dir = os.path.dirname(args.output_file)
         if output_dir and not os.path.exists(output_dir):
@@ -581,6 +752,7 @@ def main():
             "action_dim": action_dim,
             "gripper_dim_indices": gripper_dim_indices,
             "gripper_threshold": args.gripper_threshold,
+            "gripper_tolerance_s": args.gripper_tolerance_s,
             "metrics": {k: float(v) for k, v in all_metrics.items()},
             "elapsed_s": elapsed,
         }

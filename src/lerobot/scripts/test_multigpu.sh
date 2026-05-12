@@ -42,6 +42,7 @@ NUM_INFERENCE_STEPS=10
 GRIPPER_DIMS="-1"
 ACTION_LOSS_WEIGHT=1.0
 GRIPPER_LOSS_WEIGHT=1.0
+HIST_ACTION_TOKEN_DROP_RATE=0.2
 CKPT_DIR="/data_16T/deepseek/checkpoints/lola"
 
 # 历史 action 加载参数
@@ -54,6 +55,13 @@ NUM_WORKERS=8
 
 # DeepSpeed 参数
 DEEPSPEED_CONFIG=""
+DEEPSPEED_REDUCE_BUCKET_SIZE=5e7
+DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
+
+# Static padding 参数
+STATIC_COLLATE_PADDING=true
+STATIC_VLM_PADDING=false
+VLM_MAX_LENGTH=""
 
 # 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
 NORM_MODE="zscore"
@@ -86,10 +94,13 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --gripper_dims ${GRIPPER_DIMS} \
     --action_loss_weight ${ACTION_LOSS_WEIGHT} \
     --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
+    --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
     --ckpt_dir ${CKPT_DIR} \
     --norm_mode ${NORM_MODE} \
     --norm_min ${NORM_MIN} \
-    --norm_max ${NORM_MAX}"
+    --norm_max ${NORM_MAX} \
+    --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
+    --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE}"
 
 # 训练终止条件参数（二选一）
 if [ -n "$MAX_STEPS" ]; then
@@ -122,6 +133,17 @@ fi
 # DeepSpeed 参数
 if [ -n "$DEEPSPEED_CONFIG" ]; then
     cmd="${cmd} --deepspeed_config ${DEEPSPEED_CONFIG}"
+fi
+
+# Static padding 参数
+if [ "$STATIC_COLLATE_PADDING" = false ]; then
+    cmd="${cmd} --no_static_collate_padding"
+fi
+if [ "$STATIC_VLM_PADDING" = true ]; then
+    cmd="${cmd} --static_vlm_padding"
+fi
+if [ -n "$VLM_MAX_LENGTH" ]; then
+    cmd="${cmd} --vlm_max_length ${VLM_MAX_LENGTH}"
 fi
 
 echo "Running: $cmd"

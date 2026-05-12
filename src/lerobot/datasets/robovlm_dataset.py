@@ -136,10 +136,14 @@ class RoboVLMDataset(Dataset):
         #   so we need T = window_size + fwd_pred_next_n to get window_size chunks after [:-1]
         #   After [:-1]: T-1 = window_size + fwd_pred_next_n - 1
         #   .unfold produces (T-1) - fwd_pred_next_n + 1 = window_size chunks
+        # When dataset_tolerance_frames > 0, extend action deltas by tol on each side:
+        #   This loads tol extra past + tol extra future frames, so each chunk
+        #   contains [tol past, fwd center, tol future] = fwd+2*tol frames.
         obs_delta_indices = list(range(-self.window_size + 1, 1))
         obs_delta_ts = [i / fps for i in obs_delta_indices]
 
-        action_delta_indices = list(range(-self.window_size + 1, self.fwd_pred_next_n + 1))
+        tol = self.config.dataset_tolerance_frames
+        action_delta_indices = list(range(-self.window_size + 1 - tol, self.fwd_pred_next_n + 1 + tol))
         action_delta_ts = [i / fps for i in action_delta_indices]
 
         delta_timestamps = {}
@@ -226,13 +230,12 @@ class RoboVLMDataset(Dataset):
                 hand_rgb = hand_images
 
         # --- Actions ---
-        # [window_size + fwd_pred_next_n, action_dim]
-        # Note: we load window_size + fwd_pred_next_n frames (one more than before)
-        # because the original collater does [:, :-1] trimming before unfold
+        # [window_size + fwd_pred_next_n + 2*tol, action_dim]
+        tol = self.config.dataset_tolerance_frames
         actions = item["action"][:, :self.config.action_dim].clone()
 
-        # Trim to window_size + fwd_pred_next_n if we got more
-        needed_len = self.window_size + self.fwd_pred_next_n
+        # Trim to window_size + fwd_pred_next_n + 2*tol if we got more
+        needed_len = self.window_size + self.fwd_pred_next_n + 2 * tol
         if actions.shape[0] > needed_len:
             actions = actions[:needed_len]
 
@@ -251,18 +254,19 @@ class RoboVLMDataset(Dataset):
         actions[..., -1] = ((actions[..., -1] + 1) // 2).float()
 
         # Create action chunks via .unfold()
-        # actions: [T, 7] where T = window_size + fwd_pred_next_n - 1
-        # .unfold(0, fwd_pred_next_n, 1) -> [T - fwd + 1, 7, fwd] = [window_size, 7, fwd]
-        # .permute(0, 2, 1) -> [window_size, fwd, 7]
+        # When dataset_tolerance_frames > 0, chunk width = fwd_pred_next_n + 2*tol
+        # Each chunk contains [tol past, fwd center, tol future] frames.
+        # The center portion (indices [tol : fwd+tol]) aligns with the model prediction.
+        chunk_width = self.fwd_pred_next_n + 2 * tol
         T_len = actions.shape[0]
-        if T_len >= self.fwd_pred_next_n:
-            action_chunck = actions.unfold(0, self.fwd_pred_next_n, 1).permute(0, 2, 1)
-            # action_chunck: [window_size, fwd_pred_next_n, 7]
+        if T_len >= chunk_width:
+            action_chunck = actions.unfold(0, chunk_width, 1).permute(0, 2, 1)
+            # action_chunck: [num_chunks, chunk_width, 7]
         else:
             # Fallback: pad if not enough frames
             padded = torch.zeros(needed_len, actions.shape[-1], dtype=actions.dtype)
             padded[:T_len] = actions
-            action_chunck = padded.unfold(0, self.fwd_pred_next_n, 1).permute(0, 2, 1)
+            action_chunck = padded.unfold(0, chunk_width, 1).permute(0, 2, 1)
 
         # Trim to window_size chunks
         action_chunck = action_chunck[:self.window_size]
@@ -282,16 +286,16 @@ class RoboVLMDataset(Dataset):
                 action_is_pad = action_is_pad[:-1]
 
             # unfold same as actions
-            if action_is_pad.shape[0] >= self.fwd_pred_next_n:
-                chunk_mask = action_is_pad.unfold(0, self.fwd_pred_next_n, 1)
-                # chunk_mask: [window_size, fwd_pred_next_n] — True where padded
+            if action_is_pad.shape[0] >= chunk_width:
+                chunk_mask = action_is_pad.unfold(0, chunk_width, 1)
+                # chunk_mask: [num_chunks, chunk_width] — True where padded
             else:
-                chunk_mask = torch.ones(self.window_size, self.fwd_pred_next_n, dtype=torch.bool)
+                chunk_mask = torch.ones(self.window_size, chunk_width, dtype=torch.bool)
             chunk_mask = chunk_mask[:self.window_size]
             # Invert: original chunck_mask is True for VALID, not padded
             chunk_mask = ~chunk_mask
         else:
-            chunk_mask = torch.ones(self.window_size, self.fwd_pred_next_n, dtype=torch.bool)
+            chunk_mask = torch.ones(self.window_size, chunk_width, dtype=torch.bool)
 
         # --- Text tokenization ---
         task = item.get("task", "")

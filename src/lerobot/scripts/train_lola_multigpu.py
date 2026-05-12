@@ -424,67 +424,50 @@ class _ZScoreActionDataset:
         return item
 
 
-def collate_fn(batch):
+def make_collate_fn(static_max_len: int | None = None):
+    """Create a collate function with optional static padding length.
+
+    If static_max_len is provided, hist_actions_full and hist_actions_mask
+    are always padded to this fixed length, producing constant-size tensors
+    every step. This eliminates CUDA memory fragmentation and stabilizes
+    DeepSpeed ZeRO-2 reduce-scatter timing.
+
+    If static_max_len is None, falls back to dynamic per-batch padding.
     """
-    自定义 collate 函数，处理 LeRobotDataset 返回的数据。
-
-    LeRobotDataset 返回的键包括：
-    - observation.state: 状态数据
-    - observation.images.*: 图像数据
-    - action: 动作数据
-    - task: 任务描述字符串
-    - episode_index, frame_index, timestamp 等元数据
-    - hist_actions_full: 历史动作（LoLADataset，变长）
-    - hist_actions_mask: 历史动作mask（LoLADataset，变长）
-    - hist_actions_length: 历史动作实际长度（LoLADataset）
-
-    对于变长序列（hist_actions_full, hist_actions_mask），会 pad 到 batch 内最大长度，
-    类似 flash attention 的处理方式。
-    """
-    result = {}
-
-    # 变长序列的 key，需要特殊处理
     variable_length_keys = {"hist_actions_full", "hist_actions_mask"}
 
-    for key in batch[0].keys():
-        values = [item[key] for item in batch]
+    def collate_fn(batch):
+        result = {}
+        for key in batch[0].keys():
+            values = [item[key] for item in batch]
 
-        if key == "task":
-            # 任务描述保持为字符串列表
-            result[key] = values
-        elif key.startswith("observation.images."):
-            # 相机图像保持为 list，不做 torch.stack
-            # LolaImageProcessor batch mode 需要 list 格式来检测 batch 维度
-            result[key] = values
-        elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
-            # 变长序列：pad 到 batch 内最大长度
-            # 找到最大长度
-            max_len = max(v.shape[0] for v in values)
+            if key == "task":
+                result[key] = values
+            elif key.startswith("observation.images."):
+                result[key] = values
+            elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
+                max_len = static_max_len if static_max_len is not None else max(v.shape[0] for v in values)
+                padded_values = []
+                for v in values:
+                    if v.shape[0] < max_len:
+                        pad_len = max_len - v.shape[0]
+                        if key == "hist_actions_full":
+                            padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
+                        else:
+                            padding = torch.zeros(pad_len, dtype=v.dtype)
+                        v = torch.cat([padding, v], dim=0)  # left padding
+                    elif v.shape[0] > max_len:
+                        v = v[-max_len:]  # truncate from left (keep most recent)
+                    padded_values.append(v)
+                result[key] = torch.stack(padded_values)
+            elif isinstance(values[0], torch.Tensor):
+                result[key] = torch.stack(values)
+            else:
+                result[key] = values
 
-            # Pad 每个序列到最大长度（左侧 padding）
-            padded_values = []
-            for v in values:
-                if v.shape[0] < max_len:
-                    pad_len = max_len - v.shape[0]
-                    if key == "hist_actions_full":
-                        # action: [seq_len, action_dim] -> pad 到 [max_len, action_dim]
-                        padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
-                    else:  # hist_actions_mask
-                        # mask: [seq_len] -> pad 到 [max_len]
-                        padding = torch.zeros(pad_len, dtype=v.dtype)
-                    # 左侧 padding
-                    v = torch.cat([padding, v], dim=0)
-                padded_values.append(v)
+        return result
 
-            result[key] = torch.stack(padded_values)
-        elif isinstance(values[0], torch.Tensor):
-            # 固定长度张量数据堆叠
-            result[key] = torch.stack(values)
-        else:
-            # 其他类型保持列表
-            result[key] = values
-
-    return result
+    return collate_fn
 
 
 # ----------------------------------------------------------------------
@@ -494,14 +477,16 @@ def get_deepspeed_config(
     learning_rate: float = 2.5e-5,
     weight_decay: float = 0.01,
     gradient_clip_val: float = 1.0,
+    reduce_bucket_size: float = 5e7,
+    allgather_bucket_size: float = 5e7,
 ):
     """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each)."""
     return {
         "bf16": {"enabled": True},
         "zero_optimization": {
             "stage": 2,
-            "allgather_bucket_size": 5e8,
-            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": allgather_bucket_size,
+            "reduce_bucket_size": reduce_bucket_size,
             "overlap_comm": True,
             "reduce_scatter": True,
             "contiguous_gradients": True,
@@ -528,6 +513,73 @@ def get_deepspeed_config(
             "synchronize_checkpoint_boundary": False,
         },
     }
+
+
+def compute_vlm_max_length(
+    dataset_metadata,
+    vlm_path: str,
+    min_image_pixels: int = 65536,
+    max_image_pixels: int = 230400,
+) -> int:
+    """Auto-compute vlm_max_length from dataset info for static VLM padding.
+
+    Computes: visual_tokens + structural_tokens + max_task_text_tokens + 1 (empty)
+    """
+    import math
+    from transformers import AutoProcessor
+
+    merge_size = 2
+    patch_size = 16
+    factor = merge_size * patch_size
+
+    visual_tokens_total = 0
+    num_images = 0
+    for cam_key in dataset_metadata.camera_keys:
+        feat = dataset_metadata.features.get(cam_key, {})
+        info = feat.get("info", {})
+        h = info.get("video.height", feat.get("shape", (256, 256, 3))[0])
+        w = info.get("video.width", feat.get("shape", (256, 256, 3))[1])
+
+        h_bar = max(1, math.ceil(h / factor))
+        w_bar = max(1, math.ceil(w / factor))
+
+        if h_bar * w_bar * factor * factor > max_image_pixels:
+            ratio = (h_bar * w_bar * factor * factor) / max_image_pixels
+            h_bar = max(1, math.floor(h_bar / math.sqrt(ratio)))
+            w_bar = max(1, math.floor(w_bar / math.sqrt(ratio)))
+        elif h_bar * w_bar * factor * factor < min_image_pixels:
+            ratio = min_image_pixels / (h_bar * w_bar * factor * factor)
+            h_bar = max(1, math.ceil(h_bar * math.sqrt(ratio)))
+            w_bar = max(1, math.ceil(w_bar * math.sqrt(ratio)))
+            while h_bar * w_bar * factor * factor < min_image_pixels:
+                if h_bar <= w_bar:
+                    h_bar += 1
+                else:
+                    w_bar += 1
+
+        tokens = h_bar * w_bar // (merge_size ** 2)
+        visual_tokens_total += tokens
+        num_images += 1
+
+    structural_tokens = 10 + 2 * num_images
+
+    max_task_tokens = 0
+    if dataset_metadata.total_tasks > 0:
+        import pandas as pd
+        tasks_path = dataset_metadata.root / "meta" / "tasks.parquet"
+        if tasks_path.exists():
+            df = pd.read_parquet(tasks_path)
+            processor = AutoProcessor.from_pretrained(vlm_path, local_files_only=True)
+            tokenizer = processor.tokenizer if hasattr(processor, 'tokenizer') else processor
+            for task in df.index:
+                token_ids = tokenizer.encode(str(task))
+                max_task_tokens = max(max_task_tokens, len(token_ids))
+
+    vlm_max_length = visual_tokens_total + structural_tokens + max_task_tokens + 1
+    print(f"Auto-computed vlm_max_length={vlm_max_length} "
+          f"(visual={visual_tokens_total}, structural={structural_tokens}, "
+          f"max_text={max_task_tokens}, empty=1)")
+    return vlm_max_length
 
 
 # ----------------------------------------------------------------------
@@ -572,11 +624,14 @@ def get_fsdp_strategy():
     return strategy
 
 
-def get_deepspeed_strategy(learning_rate=2.5e-5, gradient_clip_val=1.0, deepspeed_config_path=None):
+def get_deepspeed_strategy(learning_rate=2.5e-5, gradient_clip_val=1.0, deepspeed_config_path=None,
+                           reduce_bucket_size=5e7, allgather_bucket_size=5e7):
     """获取 DeepSpeed ZeRO-2 策略配置，针对 B200 GPU 调优"""
     ds_config = get_deepspeed_config(
         learning_rate=learning_rate,
         gradient_clip_val=gradient_clip_val,
+        reduce_bucket_size=reduce_bucket_size,
+        allgather_bucket_size=allgather_bucket_size,
     )
     if deepspeed_config_path is not None:
         import json
@@ -680,6 +735,8 @@ def main():
                         help="Huber loss weight for continuous arm dimensions")
     parser.add_argument("--gripper_dims", type=str, default="-1",
                         help="Comma-separated gripper dim indices (supports negative)")
+    parser.add_argument("--hist_action_token_drop_rate", type=float, default=0.0,
+                        help="Probability of dropping each valid history action token during training (0.0 = no dropout)")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4,
@@ -695,6 +752,22 @@ def main():
                         help="RoboVLM 归一化下界")
     parser.add_argument("--norm_max", type=float, default=0.65,
                         help="RoboVLM 归一化上界")
+
+    # DeepSpeed 参数
+    parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
+                        help="DeepSpeed ZeRO-2 reduce bucket size (default: 5e7 for B200 NVLink)")
+    parser.add_argument("--deepspeed_allgather_bucket_size", type=float, default=5e7,
+                        help="DeepSpeed ZeRO-2 allgather bucket size (default: 5e7 for B200 NVLink)")
+
+    # Static padding parameters
+    parser.add_argument("--static_collate_padding", action="store_true", default=True,
+                        help="Use static max_history_length padding in collate (default: enabled)")
+    parser.add_argument("--no_static_collate_padding", action="store_true",
+                        help="Disable static padding, use dynamic per-batch padding")
+    parser.add_argument("--static_vlm_padding", action="store_true",
+                        help="Pad VLM tokens to fixed max_length for consistent tensor shapes")
+    parser.add_argument("--vlm_max_length", type=int, default=None,
+                        help="Override tokenizer max_length for static VLM padding; auto-compute if None")
 
     args = parser.parse_args()
 
@@ -724,6 +797,8 @@ def main():
             learning_rate=args.learning_rate,
             gradient_clip_val=1.0,
             deepspeed_config_path=args.deepspeed_config,
+            reduce_bucket_size=args.deepspeed_reduce_bucket_size,
+            allgather_bucket_size=args.deepspeed_allgather_bucket_size,
         )
     else:
         strategy = "auto"
@@ -750,7 +825,16 @@ def main():
     print(f"  - FPS: {dataset_metadata.fps}")
     print(f"  - Action dim: {action_dim}")
     print(f"  - Features: {list(features.keys())}")
-    
+
+    # Auto-compute vlm_max_length if static VLM padding is enabled but no override given
+    if args.static_vlm_padding and args.vlm_max_length is None:
+        args.vlm_max_length = compute_vlm_max_length(
+            dataset_metadata,
+            vlm_path=args.vlm_path,
+            min_image_pixels=args.min_image_pixels,
+            max_image_pixels=args.max_image_pixels,
+        )
+
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
     config = LoLAConfig(
@@ -775,6 +859,9 @@ def main():
         gripper_loss_weight=args.gripper_loss_weight,
         action_loss_weight=args.action_loss_weight,
         gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
+        hist_action_token_drop_rate=args.hist_action_token_drop_rate,
+        static_vlm_padding=args.static_vlm_padding,
+        vlm_max_length=args.vlm_max_length,
     )
     # draccus.ChoiceRegistry 不接受 gradient_checkpointing 作为构造参数
     config.gradient_checkpointting = gradient_checkpointing
@@ -828,12 +915,18 @@ def main():
     print(f"\nTotal training samples: {len(train_dataset)}")
 
     # 创建 DataLoader
+    use_static_padding = not args.no_static_collate_padding and args.load_full_history
+    static_max_len = args.max_history_length if use_static_padding else None
+    if static_max_len is not None:
+        print(f"Using static collate padding to max_history_length={static_max_len}")
+    collate = make_collate_fn(static_max_len=static_max_len)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate,
         pin_memory=True,
     )
 
@@ -861,11 +954,11 @@ def main():
             batch_size=val_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            collate_fn=collate_fn,
+            collate_fn=collate,
             pin_memory=True,
         )
         print(f"Total validation samples: {len(val_dataset)}")
-    
+
     # 创建模型
     model = LoLALightningModule(
         config=config,
