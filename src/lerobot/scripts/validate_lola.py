@@ -338,7 +338,8 @@ def validate_forward_loss(policy, preprocessor, val_loader, device,
 
 def validate_inference(policy, preprocessor, val_loader, device, max_samples=100,
                        action_dim=None, gripper_dim_indices=None, gripper_threshold=0.0,
-                       compute_per_dim=False, norm_mode="default", dataset_stats=None):
+                       compute_per_dim=False, norm_mode="default", dataset_stats=None,
+                       num_act_exec=None):
     """运行推理去噪管线，对比预测动作与真实动作。
 
     支持每维度 MSE/L1 指标和夹爪分类指标（accuracy, precision, recall, F1）。
@@ -393,6 +394,8 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
         pred_len = predicted_actions.shape[1]
         gt_len = ground_truth_actions.shape[1]
         min_len = min(pred_len, gt_len)
+        if num_act_exec is not None:
+            min_len = min(min_len, num_act_exec)
 
         pred_matched = predicted_actions[:, :min_len, :]
         gt_matched = ground_truth_actions[:, :min_len, :].to(device)
@@ -624,6 +627,9 @@ def main():
                         help="Validation mode")
     parser.add_argument("--num_inference_samples", type=int, default=100,
                         help="Max number of samples for inference validation")
+    parser.add_argument("--num_act_exec", type=int, default=None,
+                        help="Number of action steps to compare in inference validation. "
+                             "Only the first num_act_exec actions are used for loss and gripper metrics")
 
     # DataLoader 参数
     parser.add_argument("--batch_size", type=int, default=4)
@@ -947,6 +953,7 @@ def main():
             compute_per_dim=compute_per_dim,
             norm_mode=args.norm_mode,
             dataset_stats=dataset_metadata.stats,
+            num_act_exec=args.num_act_exec,
         )
         all_metrics.update(inference_metrics)
 
@@ -967,7 +974,7 @@ def main():
                 print(f"  {name}: {value:.6f}")
             print(f"  Elapsed time: {elapsed:.1f}s")
             print("=" * 60)
-            dist.barrier()
+        dist.barrier()
 
     # 保存结果（仅主进程保存）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
