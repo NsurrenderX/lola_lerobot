@@ -838,6 +838,19 @@ class LoLATrainer:
             dist_init_required=False,
         )
 
+        # Dummy Cuda Memory Allocation to avoid mem segmentation
+        torch.cuda.empty_cache()
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        _log(f"Free GPU memory: {free_mem / 1024 ** 2:.2f}MB / {total_mem / 1024 ** 2:.2f}MB")
+
+        allocate_ratio = 0.9
+        dummy_size = int(allocate_ratio * free_mem)
+        dummy_tensor = torch.empty(dummy_size, dtype=torch.int8, device="cuda")
+
+        del dummy_tensor
+        _log(f"Allocated {allocate_ratio * 100:.0f}% of GPU memory for dummy tensor")
+
+        # Initialize the model engine
         self.model = model_engine
         self.model_engine = model_engine
         self.optimizer = optimizer
