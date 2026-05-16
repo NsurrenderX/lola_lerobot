@@ -971,34 +971,16 @@ class LoLATrainer:
         self.model.train()
 
         # 创建 checkpoint 目录
+        # Rank 0 generates timestamp and broadcasts to all ranks to ensure consistency
         time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.world_size > 1:
+            time_str_list = [time_str]
+            dist.broadcast_object_list(time_str_list, src=0)
+            time_str = time_str_list[0]
         ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-{time_str}")
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             _log(f"Checkpoint directory: {ckpt_dir}")
-
-        # 初始化 Wandb
-        if self.use_wandb:
-            wandb_run_name = self.wandb_name or f"lola-{self.strategy}-{time_str}"
-            wandb.init(
-                project=self.wandb_project,
-                name=wandb_run_name,
-                entity=self.wandb_entity,
-                id=self.wandb_id,
-                resume="allow" if self.wandb_id else None,
-                config={
-                    "learning_rate": self.learning_rate,
-                    "weight_decay": self.weight_decay,
-                    "max_steps": self.total_steps,
-                    "max_epochs": self.max_epochs,
-                    "batch_size": train_loader.batch_size,
-                    "strategy": self.strategy,
-                    "world_size": self.world_size,
-                    "train_vlm": self.train_vlm,
-                    "gradient_clip_val": self.gradient_clip_val,
-                },
-            )
-            _log(f"Wandb initialized: {wandb_run_name}")
 
         _log(f"Starting training from step {start_step}, epoch {start_epoch}")
 
@@ -1473,6 +1455,35 @@ def main():
     if args.strategy == "deepspeed" and not HAS_DEEPSPEED:
         raise ImportError("DeepSpeed required for strategy='deepspeed'. Install: pip install deepspeed")
 
+    # 提前初始化 Wandb（在数据加载/模型设置之前，以便记录所有日志）
+    use_wandb = HAS_WANDB and not args.disable_wandb and dist_info["world_rank"] == 0
+    if use_wandb:
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if dist_info["world_size"] > 1:
+            time_str_list = [time_str]
+            dist.broadcast_object_list(time_str_list, src=0)
+            time_str = time_str_list[0]
+        wandb_run_name = args.wandb_name or f"lola-{args.strategy}-{time_str}"
+        wandb.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            entity=args.wandb_entity,
+            id=args.wandb_id,
+            resume="allow" if args.wandb_id else None,
+            config={
+                "learning_rate": args.learning_rate,
+                "weight_decay": 0.0,
+                "max_steps": args.max_steps,
+                "max_epochs": args.max_epochs,
+                "batch_size": args.batch_size,
+                "strategy": args.strategy,
+                "world_size": dist_info["world_size"],
+                "train_vlm": args.train_vlm,
+                "gradient_clip_val": args.gradient_clip_val,
+            },
+        )
+        _log(f"Wandb initialized: {wandb_run_name}")
+
     # 打印配置
     if dist_info["world_rank"] == 0:
         _log("=" * 60)
@@ -1640,9 +1651,8 @@ def main():
         deepspeed_allgather_bucket_size=args.deepspeed_allgather_bucket_size,
     )
 
-    # 禁用 wandb
-    if args.disable_wandb:
-        trainer.use_wandb = False
+    # Wandb 已在 main() 开头提前初始化，同步 trainer 的 use_wandb 标记
+    trainer.use_wandb = use_wandb
 
     # 设置模型
     trainer.setup_model()
