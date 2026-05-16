@@ -1457,12 +1457,15 @@ def main():
 
     # 提前初始化 Wandb（在数据加载/模型设置之前，以便记录所有日志）
     use_wandb = HAS_WANDB and not args.disable_wandb and dist_info["world_rank"] == 0
+
+    # broadcast 是集体操作，必须所有 rank 同时参与，不能放在 if use_wandb 里
+    time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if dist_info["world_size"] > 1:
+        time_str_list = [time_str]
+        dist.broadcast_object_list(time_str_list, src=0)
+        time_str = time_str_list[0]
+
     if use_wandb:
-        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if dist_info["world_size"] > 1:
-            time_str_list = [time_str]
-            dist.broadcast_object_list(time_str_list, src=0)
-            time_str = time_str_list[0]
         wandb_run_name = args.wandb_name or f"lola-{args.strategy}-{time_str}"
         wandb.init(
             project=args.wandb_project,
@@ -1483,6 +1486,10 @@ def main():
             },
         )
         _log(f"Wandb initialized: {wandb_run_name}")
+
+    # 所有 rank 等待 rank 0 完成 wandb 初始化后再继续
+    if dist_info["world_size"] > 1:
+        dist.barrier()
 
     # 打印配置
     if dist_info["world_rank"] == 0:
