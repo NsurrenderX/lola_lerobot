@@ -427,28 +427,35 @@ def get_deepspeed_config(
     world_size: int = 1,
     reduce_bucket_size: float = 5e7,
     allgather_bucket_size: float = 5e7,
+    zero_stage: int = 2,
 ):
-    """Generate default DeepSpeed ZeRO-2 config for B200 GPUs (~183GB each).
+    """Generate default DeepSpeed ZeRO config for B200 GPUs (~183GB each).
 
     Key design decisions:
     - No CPU offload: 183GB per B200 sufficient for 2B-10B models
-    - overlap_comm + reduce_scatter: efficient on NVLink-connected systems
-    - contiguous_gradients + round_robin_gradients: memory efficiency
+    - overlap_comm + reduce_scatter: efficient on NVLink-connected systems (ZeRO-2)
+    - contiguous_gradients + round_robin_gradients: memory efficiency (ZeRO-2)
     - Bucket sizes 5e7: finer granularity improves compute/comm overlap on NVLink
     - partition_activations=False: not needed at 4-5B scale on 183GB GPUs; enable for 10B+
-    - Optimizer in config: DeepSpeed creates AdamW, ensuring proper ZeRO-2 state partitioning
+    - Optimizer in config: DeepSpeed creates AdamW, ensuring proper ZeRO state partitioning
+    - ZeRO-1: optimizer state partitioning only — faster comm, less memory saving than ZeRO-2
     """
-    return {
-        "bf16": {"enabled": True},
-        "zero_optimization": {
-            "stage": 2,
-            "allgather_bucket_size": allgather_bucket_size,
-            "reduce_bucket_size": reduce_bucket_size,
+    zero_optimization = {
+        "stage": zero_stage,
+        "allgather_bucket_size": allgather_bucket_size,
+        "reduce_bucket_size": reduce_bucket_size,
+    }
+    if zero_stage >= 2:
+        zero_optimization.update({
             "overlap_comm": False,
             "reduce_scatter": True,
             "contiguous_gradients": False,
             "round_robin_gradients": True,
-        },
+        })
+
+    return {
+        "bf16": {"enabled": True},
+        "zero_optimization": zero_optimization,
         "gradient_accumulation_steps": 1,
         "gradient_clipping": gradient_clip_val,
         "train_batch_size": batch_size * world_size,
@@ -645,6 +652,7 @@ class LoLATrainer:
         deepspeed_config_path: str | None = None,
         deepspeed_reduce_bucket_size: float = 5e7,
         deepspeed_allgather_bucket_size: float = 5e7,
+        deepspeed_zero_stage: int = 2,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -666,6 +674,7 @@ class LoLATrainer:
         self.deepspeed_config_path = deepspeed_config_path
         self.deepspeed_reduce_bucket_size = deepspeed_reduce_bucket_size
         self.deepspeed_allgather_bucket_size = deepspeed_allgather_bucket_size
+        self.deepspeed_zero_stage = deepspeed_zero_stage
 
         # Wandb 配置
         self.wandb_project = wandb_project
@@ -798,7 +807,7 @@ class LoLATrainer:
             raise ImportError("DeepSpeed required for strategy='deepspeed'. pip install deepspeed")
 
         import deepspeed
-        _log("Setting up DeepSpeed ZeRO-2...")
+        _log(f"Setting up DeepSpeed ZeRO-{self.deepspeed_zero_stage}...")
 
         ds_config = get_deepspeed_config(
             learning_rate=self.learning_rate,
@@ -809,6 +818,7 @@ class LoLATrainer:
             world_size=self.world_size,
             reduce_bucket_size=self.deepspeed_reduce_bucket_size,
             allgather_bucket_size=self.deepspeed_allgather_bucket_size,
+            zero_stage=self.deepspeed_zero_stage,
         )
         if self.deepspeed_config_path is not None:
             import json
@@ -839,16 +849,16 @@ class LoLATrainer:
         )
 
         # Dummy Cuda Memory Allocation to avoid mem segmentation
-        torch.cuda.empty_cache()
-        free_mem, total_mem = torch.cuda.mem_get_info()
-        _log(f"Free GPU memory: {free_mem / 1024 ** 2:.2f}MB / {total_mem / 1024 ** 2:.2f}MB")
+        # torch.cuda.empty_cache()
+        # free_mem, total_mem = torch.cuda.mem_get_info()
+        # _log(f"Free GPU memory: {free_mem / 1024 ** 2:.2f}MB / {total_mem / 1024 ** 2:.2f}MB")
 
-        allocate_ratio = 0.9
-        dummy_size = int(allocate_ratio * free_mem)
-        dummy_tensor = torch.empty(dummy_size, dtype=torch.int8, device="cuda")
+        # allocate_ratio = 0.9
+        # dummy_size = int(allocate_ratio * free_mem)
+        # dummy_tensor = torch.empty(dummy_size, dtype=torch.int8, device="cuda")
 
-        del dummy_tensor
-        _log(f"Allocated {allocate_ratio * 100:.0f}% of GPU memory for dummy tensor")
+        # del dummy_tensor
+        # _log(f"Allocated {allocate_ratio * 100:.0f}% of GPU memory for dummy tensor")
 
         # Initialize the model engine
         self.model = model_engine
@@ -859,7 +869,7 @@ class LoLATrainer:
         self._configure_deepspeed_checkpointing()
 
         trainable_count = sum(p.numel() for p in trainable_params)
-        _log(f"DeepSpeed ZeRO-2 initialized: {trainable_count:,} trainable params")
+        _log(f"DeepSpeed ZeRO-{self.deepspeed_zero_stage} initialized: {trainable_count:,} trainable params")
 
     def _configure_deepspeed_checkpointing(self):
         """Replace PyTorch checkpointing with DeepSpeed's in LoLA model."""
@@ -1407,11 +1417,13 @@ def main():
 
     # DeepSpeed 参数
     parser.add_argument("--deepspeed_config", type=str, default=None,
-                        help="Path to custom DeepSpeed config JSON. Default: ZeRO-2 config tuned for B200.")
+                        help="Path to custom DeepSpeed config JSON. Default: ZeRO config tuned for B200.")
+    parser.add_argument("--deepspeed_zero_stage", type=int, default=2, choices=[1, 2],
+                        help="DeepSpeed ZeRO stage: 1 (optimizer partitioning) or 2 (optimizer+gradient partitioning). Default: 2")
     parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
-                        help="DeepSpeed ZeRO-2 reduce bucket size (default: 5e7 for B200 NVLink)")
+                        help="DeepSpeed ZeRO reduce bucket size (default: 5e7 for B200 NVLink)")
     parser.add_argument("--deepspeed_allgather_bucket_size", type=float, default=5e7,
-                        help="DeepSpeed ZeRO-2 allgather bucket size (default: 5e7 for B200 NVLink)")
+                        help="DeepSpeed ZeRO allgather bucket size (default: 5e7 for B200 NVLink)")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
@@ -1656,6 +1668,7 @@ def main():
         deepspeed_config_path=args.deepspeed_config,
         deepspeed_reduce_bucket_size=args.deepspeed_reduce_bucket_size,
         deepspeed_allgather_bucket_size=args.deepspeed_allgather_bucket_size,
+        deepspeed_zero_stage=args.deepspeed_zero_stage,
     )
 
     # Wandb 已在 main() 开头提前初始化，同步 trainer 的 use_wandb 标记

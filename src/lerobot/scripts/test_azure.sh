@@ -99,6 +99,7 @@ NUM_WORKERS=8
 
 # DeepSpeed 参数
 DEEPSPEED_CONFIG=""
+DEEPSPEED_ZERO_STAGE=2
 DEEPSPEED_REDUCE_BUCKET_SIZE=5e7
 DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
 
@@ -324,6 +325,10 @@ while [[ $# -gt 0 ]]; do
             DEEPSPEED_CONFIG="$2"
             shift 2
             ;;
+        --deepspeed_zero_stage)
+            DEEPSPEED_ZERO_STAGE="$2"
+            shift 2
+            ;;
         --deepspeed_reduce_bucket_size)
             DEEPSPEED_REDUCE_BUCKET_SIZE="$2"
             shift 2
@@ -376,6 +381,7 @@ echo "  - Norm mode: ${NORM_MODE}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - DeepSpeed config: ${DEEPSPEED_CONFIG:-default}"
+echo "  - DeepSpeed ZeRO stage: ${DEEPSPEED_ZERO_STAGE}"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -412,6 +418,7 @@ if [ "$NNODES" -eq 1 ]; then
         --norm_max ${NORM_MAX} \
         --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
         --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
+        --deepspeed_zero_stage ${DEEPSPEED_ZERO_STAGE} \
         --wandb_project ${WANDB_PROJECT}"
 else
     # 多节点：使用完整的分布式参数
@@ -447,6 +454,7 @@ else
         --norm_max ${NORM_MAX} \
         --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
         --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
+        --deepspeed_zero_stage ${DEEPSPEED_ZERO_STAGE} \
         --wandb_project ${WANDB_PROJECT}"
 fi
 
