@@ -74,6 +74,8 @@ class LoLADataset(LeRobotDataset):
         norm_min: float = -0.65,
         norm_max: float = 0.65,
         gripper_dim_indices_abs: tuple[int, ...] | None = None,
+        history_type: str = "action",
+        state_dim: int | None = None,
     ):
         """
         Args:
@@ -113,6 +115,7 @@ class LoLADataset(LeRobotDataset):
         self.norm_min = norm_min
         self.norm_max = norm_max
         self.gripper_dim_indices_abs = gripper_dim_indices_abs
+        self.history_type = history_type
 
         # Z-score normalization stats (computed from dataset metadata)
         self._action_mean = None
@@ -128,6 +131,26 @@ class LoLADataset(LeRobotDataset):
                 raise ValueError("z-score normalization requires 'action' stats in dataset metadata")
             if self.gripper_dim_indices_abs is None:
                 raise ValueError("z-score normalization requires gripper_dim_indices_abs to separate arm/gripper dims")
+
+        # State dimension and normalization stats
+        if state_dim is not None:
+            self.state_dim = state_dim
+        elif "observation.state" in self.features:
+            self.state_dim = self.features["observation.state"]["shape"][0]
+        else:
+            self.state_dim = self.action_dim  # fallback
+
+        self._state_mean = None
+        self._state_std = None
+        if self.norm_action == "zscore" and self.history_type == "state":
+            if "observation.state" in self.meta.stats:
+                import numpy as np
+                _s_mean = self.meta.stats["observation.state"]["mean"]
+                _s_std = self.meta.stats["observation.state"]["std"]
+                self._state_mean = torch.tensor(_s_mean, dtype=torch.float32) if isinstance(_s_mean, np.ndarray) else _s_mean.float()
+                self._state_std = torch.tensor(_s_std, dtype=torch.float32) if isinstance(_s_std, np.ndarray) else _s_std.float()
+            else:
+                raise ValueError("z-score normalization with history_type='state' requires 'observation.state' stats in dataset metadata")
 
         # 获取action维度
         if "action" in self.features:
@@ -209,13 +232,24 @@ class LoLADataset(LeRobotDataset):
             start_idx = ep_start
             actual_history_length = history_length
 
-        # 加载历史action
+        # 加载历史数据
         history_indices = list(range(start_idx, idx + 1))
-        hist_actions_dict = self._query_hf_dataset({"action": history_indices})
-        hist_actions = hist_actions_dict["action"]  # [actual_length, action_dim]
 
-        # 创建mask：标识真实action
-        hist_actions_mask = torch.ones(actual_history_length, dtype=torch.bool)
+        if self.history_type == "state":
+            # 加载历史状态
+            hist_data_dict = self._query_hf_dataset({"observation.state": history_indices})
+            hist_data = hist_data_dict["observation.state"]  # [actual_length, state_dim]
+            hist_dim = self.state_dim
+            hist_key_prefix = "hist_states"
+        else:
+            # 加载历史action
+            hist_data_dict = self._query_hf_dataset({"action": history_indices})
+            hist_data = hist_data_dict["action"]  # [actual_length, action_dim]
+            hist_dim = self.action_dim
+            hist_key_prefix = "hist_actions"
+
+        # 创建mask：标识真实数据
+        hist_mask = torch.ones(actual_history_length, dtype=torch.bool)
 
         # 计算补齐后的长度（action_chunk_size的整数倍）
         # 向上取整到最近的 action_chunk_size 倍数
@@ -229,8 +263,8 @@ class LoLADataset(LeRobotDataset):
             if actual_history_length > padded_length:
                 # 从开头截断（保留最近的动作）
                 truncate_length = actual_history_length - padded_length
-                hist_actions = hist_actions[truncate_length:]
-                hist_actions_mask = hist_actions_mask[truncate_length:]
+                hist_data = hist_data[truncate_length:]
+                hist_mask = hist_mask[truncate_length:]
                 actual_history_length = padded_length
 
         # Padding到 action_chunk_size 的整数倍
@@ -238,24 +272,24 @@ class LoLADataset(LeRobotDataset):
             pad_length = padded_length - actual_history_length
 
             # 创建padding张量
-            padding_actions = torch.zeros(pad_length, self.action_dim, dtype=hist_actions.dtype)
+            padding_data = torch.zeros(pad_length, hist_dim, dtype=hist_data.dtype)
             padding_mask = torch.zeros(pad_length, dtype=torch.bool)
 
             if self.history_padding_side == "left":
                 # 左侧padding：padding在前面
-                hist_actions = torch.cat([padding_actions, hist_actions], dim=0)
-                hist_actions_mask = torch.cat([padding_mask, hist_actions_mask], dim=0)
+                hist_data = torch.cat([padding_data, hist_data], dim=0)
+                hist_mask = torch.cat([padding_mask, hist_mask], dim=0)
             else:
                 # 右侧padding：padding在后面
-                hist_actions = torch.cat([hist_actions, padding_actions], dim=0)
-                hist_actions_mask = torch.cat([hist_actions_mask, padding_mask], dim=0)
+                hist_data = torch.cat([hist_data, padding_data], dim=0)
+                hist_mask = torch.cat([hist_mask, padding_mask], dim=0)
 
         # 添加到item
-        item["hist_actions_full"] = hist_actions  # [padded_length, action_dim]
-        item["hist_actions_mask"] = hist_actions_mask  # [padded_length]
-        item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
+        item[f"{hist_key_prefix}_full"] = hist_data  # [padded_length, dim]
+        item[f"{hist_key_prefix}_mask"] = hist_mask  # [padded_length]
+        item[f"{hist_key_prefix}_length"] = torch.tensor(actual_history_length, dtype=torch.long)
 
-        # Action normalization
+        # Normalization
         if self.norm_action in (True, "minmax", "robovlm"):
             # RoboVLM-style: min-max → [-1, 1], preserve gripper as-is
             from lerobot.datasets.robovlm_dataset import normalize_action
@@ -263,8 +297,10 @@ class LoLADataset(LeRobotDataset):
                 item["action"] = normalize_action(item["action"], self.norm_min, self.norm_max)
             if "hist_actions_full" in item:
                 item["hist_actions_full"] = normalize_action(item["hist_actions_full"], self.norm_min, self.norm_max)
+            if "hist_states_full" in item:
+                item["hist_states_full"] = normalize_action(item["hist_states_full"], self.norm_min, self.norm_max)
         elif self.norm_action == "zscore":
-            # Z-score arm dims + binarize gripper dims for BCE
+            # Z-score arm dims + binarize gripper dims for BCE (actions)
             from lerobot.datasets.robovlm_dataset import normalize_action_zscore
             if "action" in item:
                 item["action"] = normalize_action_zscore(
@@ -275,6 +311,11 @@ class LoLADataset(LeRobotDataset):
                 item["hist_actions_full"] = normalize_action_zscore(
                     item["hist_actions_full"], self._action_mean, self._action_std,
                     self.gripper_dim_indices_abs,
+                )
+            # State normalization: z-score all dims uniformly (gripper is continuous width, not binary)
+            if "hist_states_full" in item and self._state_mean is not None:
+                item["hist_states_full"] = (
+                    (item["hist_states_full"] - self._state_mean) / (self._state_std + 1e-8)
                 )
 
         return item

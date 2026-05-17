@@ -68,6 +68,9 @@ N_OBS_STEPS=1
 LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
+HISTORY_TYPE="action"
+STATE_DIM=""
+STATE_ENCODER_MODE="unified"
 
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
@@ -231,6 +234,20 @@ while [[ $# -gt 0 ]]; do
             ;;
         --history_padding_side)
             HISTORY_PADDING_SIDE="$2"
+            shift 2
+            ;;
+
+        # 历史类型参数
+        --history_type)
+            HISTORY_TYPE="$2"
+            shift 2
+            ;;
+        --state_dim)
+            STATE_DIM="$2"
+            shift 2
+            ;;
+        --state_encoder_mode)
+            STATE_ENCODER_MODE="$2"
             shift 2
             ;;
 
@@ -483,6 +500,12 @@ fi
 # 历史action参数
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
+fi
+
+# 历史类型参数
+cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ -n "$STATE_DIM" ]; then
+    cmd="${cmd} --state_dim ${STATE_DIM}"
 fi
 
 # 训练 VLM 参数

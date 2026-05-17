@@ -95,6 +95,92 @@ class LolaActionEncoder(nn.Module):
 
         return torch.cat([arm_tokens, gripper_tokens], dim=1)
 
+
+class LolaStateEncoder(nn.Module):
+    """State History Encoder: encodes historical state sequences into dual-token format
+    compatible with the 5-stream DiT architecture.
+
+    Supports two modes:
+    - "unified": all state dims go through a single MLP, output is 2 * dit_hidden_size,
+      then split into arm/grip context tokens with separate modality embeddings.
+    - "separated": arm and gripper state dims are split, each goes through its own MLP,
+      producing independent tokens. The last dimension(s) of the state are treated as
+      gripper dims (same convention as action gripper_dim_indices, but resolved relative
+      to state_dim).
+
+    Output shape: [B, 2 * num_chunks, dit_hidden_size] (same as LolaActionEncoder)
+    """
+    def __init__(self, config: LoLAConfig):
+        super().__init__()
+        self.chunk_size = config.action_chunk_size
+        self.state_dim = config.state_dim
+        self.config = config
+        self.mode = config.state_encoder_mode
+
+        if self.mode == "unified":
+            self.state_proj = nn.Sequential(
+                nn.Linear(self.chunk_size * self.state_dim, 2 * config.dit_hidden_size),
+                nn.LayerNorm(2 * config.dit_hidden_size, eps=1e-6),
+                nn.SiLU(),
+                nn.Linear(2 * config.dit_hidden_size, 2 * config.dit_hidden_size)
+            )
+        else:  # "separated"
+            # Resolve gripper indices relative to state_dim
+            # Same negative-index convention as action gripper_dim_indices
+            num_gripper = len(config.gripper_dim_indices_abs)
+            self.state_gripper_indices = tuple(range(self.state_dim - num_gripper, self.state_dim))
+            self.state_arm_dim = self.state_dim - num_gripper
+            self.state_gripper_dim = num_gripper
+
+            self.arm_state_proj = nn.Sequential(
+                nn.Linear(self.chunk_size * self.state_arm_dim, config.dit_hidden_size),
+                nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
+                nn.SiLU(),
+                nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
+            )
+            self.grip_state_proj = nn.Sequential(
+                nn.Linear(self.chunk_size * self.state_gripper_dim, config.dit_hidden_size),
+                nn.LayerNorm(config.dit_hidden_size, eps=1e-6),
+                nn.SiLU(),
+                nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
+            )
+
+        self.arm_ctx_state_emb = nn.Parameter(torch.randn(1, 1, config.dit_hidden_size) * 0.02)
+        self.grip_ctx_state_emb = nn.Parameter(torch.randn(1, 1, config.dit_hidden_size) * 0.02)
+
+    def _pad_and_chunk(self, states: torch.Tensor, dim_size: int) -> torch.Tensor:
+        b, seq_len, d = states.shape
+        remainder = seq_len % self.chunk_size
+        if remainder != 0:
+            pad_len = self.chunk_size - remainder
+            states = F.pad(states, (0, 0, 0, pad_len))
+            seq_len += pad_len
+        return states.view(b, seq_len // self.chunk_size, self.chunk_size * dim_size)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        if self.mode == "unified":
+            state_chunked = self._pad_and_chunk(states, self.state_dim)
+            projected = self.state_proj(state_chunked)  # [B, num_chunks, 2 * hidden]
+            hidden = self.config.dit_hidden_size
+            arm_tokens = projected[..., :hidden] + self.arm_ctx_state_emb
+            grip_tokens = projected[..., hidden:] + self.grip_ctx_state_emb
+        else:  # "separated"
+            gripper_indices = list(self.state_gripper_indices)
+            all_indices = list(range(states.shape[-1]))
+            arm_indices = [i for i in all_indices if i not in gripper_indices]
+
+            arm_states = states[..., arm_indices]
+            grip_states = states[..., gripper_indices]
+
+            arm_chunked = self._pad_and_chunk(arm_states, self.state_arm_dim)
+            grip_chunked = self._pad_and_chunk(grip_states, self.state_gripper_dim)
+
+            arm_tokens = self.arm_state_proj(arm_chunked) + self.arm_ctx_state_emb
+            grip_tokens = self.grip_state_proj(grip_chunked) + self.grip_ctx_state_emb
+
+        return torch.cat([arm_tokens, grip_tokens], dim=1)  # [B, 2*num_chunks, dit_hidden_size]
+
+
 class LolaVLMFeatureExtractor(nn.Module):
     """提取 Qwen3.5 特征层与全局空 Token"""
     def __init__(self, config: LoLAConfig):
@@ -763,6 +849,7 @@ class LoLAPytorch(nn.Module):
         self.config = config
         self.vlm_bridge = LolaVLMFeatureExtractor(config)
         self.action_encoder = LolaActionEncoder(config)
+        self.state_encoder = LolaStateEncoder(config) if config.history_type == "state" else None
         self.dit = LoLADiT(config)
         self.gradient_checkpointing_enabled = False
         self._checkpoint_fn = torch.utils.checkpoint.checkpoint
@@ -806,7 +893,7 @@ class LoLAPytorch(nn.Module):
 
         # 1. 获取基础特征
         vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
-        hist_chunks = self.action_encoder(hist_actions)
+        hist_chunks = self.state_encoder(hist_actions) if self.state_encoder is not None else self.action_encoder(hist_actions)
         target_chunks = self.action_encoder(target_actions)
 
         # 处理 hist_actions_mask（如果提供）
@@ -925,9 +1012,7 @@ class LoLAPytorch(nn.Module):
         device = hist_actions.device
 
         vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
-        hist_chunks = self.action_encoder(hist_actions)
-
-        # Process hist_actions_mask and double it for dual-token
+        hist_chunks = self.state_encoder(hist_actions) if self.state_encoder is not None else self.action_encoder(hist_actions)
         hist_chunks_mask = None
         if hist_actions_mask is not None:
             chunk_size = self.config.action_chunk_size
@@ -1160,59 +1245,84 @@ class LoLAPolicy(PreTrainedPolicy):
         4. 全零占位：fallback
 
         Returns:
-            hist_actions: [B, SeqLen, ActionDim] 历史动作
-            hist_actions_mask: [B, SeqLen] 历史动作mask (1=有效, 0=padding), None表示全部有效
+            hist_actions: [B, SeqLen, Dim] 历史输入 (action or state)
+            hist_actions_mask: [B, SeqLen] 历史输入mask (1=有效, 0=padding), None表示全部有效
         """
-        # 优先使用 LoLADataset 提供的完整历史action
-        if "hist_actions_full" in batch:
-            hist_actions = batch["hist_actions_full"]
-            # 确保是3D张量 [B, SeqLen, ActionDim]
-            if hist_actions.ndim == 2:
-                hist_actions = hist_actions.unsqueeze(0)
+        if self.config.history_type == "state":
+            # State history mode
+            if "hist_states_full" in batch:
+                hist_input = batch["hist_states_full"]
+                if hist_input.ndim == 2:
+                    hist_input = hist_input.unsqueeze(0)
+                hist_mask = batch.get("hist_states_mask", None)
+                if hist_mask is not None:
+                    hist_mask = hist_mask.float()
+                else:
+                    hist_mask = torch.ones(
+                        hist_input.shape[0], hist_input.shape[1],
+                        dtype=torch.float32, device=hist_input.device
+                    )
+                return hist_input, hist_mask
 
-            # 提取对应的 mask
-            hist_actions_mask = batch.get("hist_actions_mask", None)
-            if hist_actions_mask is not None:
-                # 转换为 float (1.0=有效, 0.0=padding)
-                hist_actions_mask = hist_actions_mask.float()
+            elif "observation.state" in batch:
+                hist_input = batch["observation.state"]
+                if hist_input.ndim == 2:
+                    hist_input = hist_input.unsqueeze(1)
+                return hist_input, None
+
             else:
-                # 如果没有 mask，创建全 1 的 mask
-                hist_actions_mask = torch.ones(
-                    hist_actions.shape[0], hist_actions.shape[1],
-                    dtype=torch.float32, device=hist_actions.device
-                )
-
-            return hist_actions, hist_actions_mask
-
-        elif "hist_actions" in batch:
-            # 支持直接提供的历史动作
-            hist_actions = batch["hist_actions"]
-            if hist_actions.ndim == 2:
-                hist_actions = hist_actions.unsqueeze(1)
-            # 没有 mask，返回 None 表示全部有效
-            return hist_actions, None
-
-        elif "observation.state" in batch:
-            hist_actions = batch["observation.state"]
-            # 保证满足 [B, SeqLen, ActionDim]
-            if hist_actions.ndim == 2:
-                hist_actions = hist_actions.unsqueeze(1)
-            # 没有 mask，返回 None 表示全部有效
-            return hist_actions, None
+                if "action" in batch:
+                    b = batch["action"].shape[0]
+                elif "target_actions" in batch:
+                    b = batch["target_actions"].shape[0]
+                elif "input_ids" in batch:
+                    b = batch["input_ids"].shape[0]
+                else:
+                    raise KeyError("Cannot determine batch size: no 'action', 'target_actions', or 'input_ids' in batch")
+                hist_input = torch.zeros((b, self.config.action_chunk_size, self.config.state_dim), device=self.device, dtype=self.dtype)
+                return hist_input, None
 
         else:
-            # Fallback：如果没有历史动作，使用当前 batch 中对应设备的全零张量占位
-            # 优先使用 "action" 键，如果没有则尝试其他键获取 batch size
-            if "action" in batch:
-                b = batch["action"].shape[0]
-            elif "target_actions" in batch:
-                b = batch["target_actions"].shape[0]
-            elif "input_ids" in batch:
-                b = batch["input_ids"].shape[0]
+            # Action history mode (default)
+            if "hist_actions_full" in batch:
+                hist_input = batch["hist_actions_full"]
+                if hist_input.ndim == 2:
+                    hist_input = hist_input.unsqueeze(0)
+
+                hist_mask = batch.get("hist_actions_mask", None)
+                if hist_mask is not None:
+                    hist_mask = hist_mask.float()
+                else:
+                    hist_mask = torch.ones(
+                        hist_input.shape[0], hist_input.shape[1],
+                        dtype=torch.float32, device=hist_input.device
+                    )
+
+                return hist_input, hist_mask
+
+            elif "hist_actions" in batch:
+                hist_input = batch["hist_actions"]
+                if hist_input.ndim == 2:
+                    hist_input = hist_input.unsqueeze(1)
+                return hist_input, None
+
+            elif "observation.state" in batch:
+                hist_input = batch["observation.state"]
+                if hist_input.ndim == 2:
+                    hist_input = hist_input.unsqueeze(1)
+                return hist_input, None
+
             else:
-                raise KeyError("Cannot determine batch size: no 'action', 'target_actions', or 'input_ids' in batch")
-            hist_actions = torch.zeros((b, self.config.action_chunk_size, self.config.action_dim), device=self.device, dtype=self.dtype)
-            return hist_actions, None
+                if "action" in batch:
+                    b = batch["action"].shape[0]
+                elif "target_actions" in batch:
+                    b = batch["target_actions"].shape[0]
+                elif "input_ids" in batch:
+                    b = batch["input_ids"].shape[0]
+                else:
+                    raise KeyError("Cannot determine batch size: no 'action', 'target_actions', or 'input_ids' in batch")
+                hist_input = torch.zeros((b, self.config.action_chunk_size, self.config.action_dim), device=self.device, dtype=self.dtype)
+                return hist_input, None
 
     def prepare_target_actions(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """从 batch 中提取目标动作"""

@@ -49,6 +49,9 @@ CKPT_DIR="/data_16T/deepseek/checkpoints/lola"
 LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
+HISTORY_TYPE="state"
+STATE_DIM="7"
+STATE_ENCODER_MODE="unified"
 
 # DataLoader 参数
 NUM_WORKERS=8
@@ -119,6 +122,10 @@ fi
 
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history"
+fi
+cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ -n "$STATE_DIM" ]; then
+    cmd="${cmd} --state_dim ${STATE_DIM}"
 fi
 if [ "$TRAIN_VLM" = true ]; then
     cmd="${cmd} --train_vlm --vlm_lr ${VLM_LR}"

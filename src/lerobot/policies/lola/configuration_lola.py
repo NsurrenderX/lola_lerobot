@@ -89,6 +89,10 @@ class LoLAConfig(PreTrainedConfig):
     load_full_history: bool = False  # Whether to load full episode history actions
     max_history_length: int = 100  # Maximum history length for padding/truncation
     history_padding_side: str = "left"  # Padding side: "left" or "right"
+    history_type: str = "action"  # History context type: "action" or "state"
+    state_dim: int = 20  # Dimension of observation.state (set from dataset features)
+    state_encoder_mode: str = "unified"  # State encoder mode: "unified" or "separated"
+    max_state_dim: int = 32  # Maximum state dimension for padding
 
     # Image resolution limits for VLM visual token balancing
     max_image_pixels: int = 230400  # Enforces max visual tokens per image (230400 → max_h≈360p for 720p → 220 tokens)
@@ -146,6 +150,12 @@ class LoLAConfig(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.history_type not in ("action", "state"):
+            raise ValueError(f"Invalid history_type: {self.history_type}, must be 'action' or 'state'")
+
+        if self.state_encoder_mode not in ("unified", "separated"):
+            raise ValueError(f"Invalid state_encoder_mode: {self.state_encoder_mode}, must be 'unified' or 'separated'")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

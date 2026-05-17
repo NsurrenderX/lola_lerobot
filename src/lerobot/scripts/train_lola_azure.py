@@ -497,6 +497,8 @@ def create_lola_dataset(
     norm_max: float = 0.65,
     gripper_dim_indices_abs: tuple[int, ...] | None = None,
     dataset_stats: dict | None = None,
+    history_type: str = "action",
+    state_dim: int | None = None,
 ) -> LeRobotDataset | LoLADataset:
     """创建 LoLA 训练用的数据集。"""
     dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
@@ -526,6 +528,8 @@ def create_lola_dataset(
             norm_min=norm_min,
             norm_max=norm_max,
             gripper_dim_indices_abs=gripper_dim_indices_abs,
+            history_type=history_type,
+            state_dim=state_dim,
         )
     else:
         dataset = LeRobotDataset(
@@ -584,7 +588,7 @@ def make_collate_fn(static_max_len: int | None = None):
 
     If static_max_len is None, falls back to dynamic per-batch padding.
     """
-    variable_length_keys = {"hist_actions_full", "hist_actions_mask"}
+    variable_length_keys = {"hist_actions_full", "hist_actions_mask", "hist_states_full", "hist_states_mask"}
 
     def collate_fn(batch):
         result = {}
@@ -601,7 +605,7 @@ def make_collate_fn(static_max_len: int | None = None):
                 for v in values:
                     if v.shape[0] < max_len:
                         pad_len = max_len - v.shape[0]
-                        if key == "hist_actions_full":
+                        if key in {"hist_actions_full", "hist_states_full"}:
                             padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
                         else:
                             padding = torch.zeros(pad_len, dtype=v.dtype)
@@ -653,10 +657,14 @@ class LoLATrainer:
         deepspeed_reduce_bucket_size: float = 5e7,
         deepspeed_allgather_bucket_size: float = 5e7,
         deepspeed_zero_stage: int = 2,
+        training_args: dict | None = None,
+        dataset_metadata: dict | None = None,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
         self.dist_info = dist_info
+        self.training_args = training_args
+        self.dataset_metadata = dataset_metadata
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_ratio = warmup_ratio
@@ -991,6 +999,38 @@ class LoLATrainer:
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             _log(f"Checkpoint directory: {ckpt_dir}")
+
+            # Save all training configurations as JSON
+            import json
+            import dataclasses
+            from pathlib import Path
+
+            def _make_serializable(obj):
+                if isinstance(obj, (torch.dtype, torch.device)):
+                    return str(obj)
+                elif isinstance(obj, Path):
+                    return str(obj)
+                elif isinstance(obj, tuple):
+                    return list(obj)
+                elif isinstance(obj, dict):
+                    return {k: _make_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_make_serializable(v) for v in obj]
+                elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+                    return _make_serializable(dataclasses.asdict(obj))
+                return obj
+
+            full_config = _make_serializable({
+                "lola_config": self.config,
+                "distributed": self.dist_info,
+                "training_args": self.training_args,
+                "dataset_metadata": self.dataset_metadata,
+            })
+
+            config_path = os.path.join(ckpt_dir, "training_config.json")
+            with open(config_path, "w") as f:
+                json.dump(full_config, f, indent=2, default=str)
+            _log(f"Training config saved to {config_path}")
 
         _log(f"Starting training from step {start_step}, epoch {start_epoch}")
 
@@ -1379,6 +1419,12 @@ def main():
     parser.add_argument("--load_full_history", action="store_true")
     parser.add_argument("--max_history_length", type=int, default=100)
     parser.add_argument("--history_padding_side", type=str, default="left", choices=["left", "right"])
+    parser.add_argument("--history_type", type=str, default="action", choices=["action", "state"],
+                        help="History type: 'action' uses historical actions, 'state' uses historical observation states")
+    parser.add_argument("--state_dim", type=int, default=None,
+                        help="State dimension (auto-detected from dataset if not provided)")
+    parser.add_argument("--state_encoder_mode", type=str, default="unified", choices=["unified", "separated"],
+                        help="State encoder mode: 'unified' (single MLP → 2*hidden, split) or 'separated' (arm/grip separate MLPs)")
 
     # LoLA 模型配置参数
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
@@ -1532,6 +1578,13 @@ def main():
     else:
         action_dim = args.action_dim
 
+    if "observation.state" in features:
+        state_dim = features["observation.state"].shape[0]
+    elif args.state_dim is not None:
+        state_dim = args.state_dim
+    else:
+        state_dim = action_dim  # fallback
+
     _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
     _log(f"Action dim: {action_dim}")
 
@@ -1559,6 +1612,9 @@ def main():
         load_full_history=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
+        history_type=args.history_type,
+        state_dim=state_dim,
+        state_encoder_mode=args.state_encoder_mode,
         gradient_checkpointing=gradient_checkpointing,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
@@ -1611,6 +1667,8 @@ def main():
         norm_max=args.norm_max,
         gripper_dim_indices_abs=config.gripper_dim_indices_abs,
         dataset_stats=dataset_metadata.stats,
+        history_type=args.history_type,
+        state_dim=state_dim,
     )
     _log(f"Dataset size: {len(train_dataset)}")
 
@@ -1669,6 +1727,14 @@ def main():
         deepspeed_reduce_bucket_size=args.deepspeed_reduce_bucket_size,
         deepspeed_allgather_bucket_size=args.deepspeed_allgather_bucket_size,
         deepspeed_zero_stage=args.deepspeed_zero_stage,
+        # Config saving
+        training_args=vars(args),
+        dataset_metadata={
+            "total_episodes": dataset_metadata.total_episodes,
+            "total_frames": dataset_metadata.total_frames,
+            "fps": dataset_metadata.fps,
+            "features": {k: {"shape": list(v.shape), "type": str(v.type)} for k, v in features.items()},
+        },
     )
 
     # Wandb 已在 main() 开头提前初始化，同步 trainer 的 use_wandb 标记
