@@ -1149,6 +1149,15 @@ class LoLATrainer:
                 update_s = time.monotonic() - step_start
                 batch_per_s = 1.0 / update_s if update_s > 0 else 0
 
+                # ── CUDA Memory Clear and possible GC ─────────────────
+                if self.global_step % 1000 == 0:
+                    gc_start = time.monotonic()
+                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    gc_s = time.monotonic() - gc_start
+                    _log(f"[Step {self.global_step}/{self.total_steps}] GC took {gc_s:.3f}s")
+
                 # ── Logging (enhanced wandb metrics) ──────────────────
                 if self.global_step % self.log_every_n_steps == 0:
                     lr = self.scheduler.get_last_lr()[0]
