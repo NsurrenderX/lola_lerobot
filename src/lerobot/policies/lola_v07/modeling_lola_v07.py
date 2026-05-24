@@ -509,13 +509,14 @@ class LoLAV07Pytorch(nn.Module):
         action_loss_weight = getattr(self.config, 'action_loss_weight', 10.0)
         gripper_loss_weight = getattr(self.config, 'gripper_loss_weight', 1.0)
         total_loss = v_loss + action_loss_weight * arm_loss_mean + gripper_loss_weight * gripper_loss
+        total_loss = total_loss.to(target_dtype)
 
         return {
             "total_loss": total_loss,
-            "v_loss": v_loss,
-            "arm_loss": arm_loss_mean,
-            "gripper_loss": gripper_loss,
-            "arm_loss_per_dim": arm_loss_per_dim,
+            "v_loss": v_loss.float(),
+            "arm_loss": arm_loss_mean.float(),
+            "gripper_loss": gripper_loss.float(),
+            "arm_loss_per_dim": arm_loss_per_dim.float(),
         }
 
     @torch.no_grad()
