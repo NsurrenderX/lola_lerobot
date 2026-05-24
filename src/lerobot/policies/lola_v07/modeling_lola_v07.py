@@ -496,8 +496,8 @@ class LoLAV07Pytorch(nn.Module):
         arm_indices = [i for i in range(self.config.action_dim) if i not in list(self.config.gripper_dim_indices_abs)]
         gripper_indices = list(self.config.gripper_dim_indices_abs)
 
-        target_arm = target_actions[:, :min_len, arm_indices]
-        target_gripper = target_actions[:, :min_len, gripper_indices]
+        target_arm = target_actions[:, :min_len, arm_indices].to(target_dtype)
+        target_gripper = target_actions[:, :min_len, gripper_indices].to(target_dtype)
         pred_arm_matched = pred_arm[:, :min_len, :]
         pred_gripper_logits_matched = pred_gripper_logits[:, :min_len, :]
 
@@ -505,7 +505,7 @@ class LoLAV07Pytorch(nn.Module):
         arm_loss_mean = arm_loss.mean()
         arm_loss_per_dim = arm_loss.mean(dim=(0, 1))
 
-        target_gripper_01 = (target_gripper > 0).float()
+        target_gripper_01 = (target_gripper > 0).to(target_dtype)
         gripper_loss = F.binary_cross_entropy_with_logits(pred_gripper_logits_matched, target_gripper_01)
 
         # 12. Total loss
