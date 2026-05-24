@@ -279,7 +279,9 @@ class LoLADataset(LeRobotDataset):
             # Randomly select one 'ann' per completed task (training diversity)
             # Only keep the most recent completed_tasks_history_len tasks
             max_keep = self.completed_tasks_history_len
-            if max_keep > 0 and len(completed_tasks) > max_keep:
+            if max_keep == 0:
+                completed_tasks = []
+            elif len(completed_tasks) > max_keep:
                 completed_tasks = completed_tasks[-max_keep:]
 
             completed_tasks_ann = []

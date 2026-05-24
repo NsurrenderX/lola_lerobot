@@ -788,7 +788,7 @@ class LoLAV07Trainer:
         )
 
     def _setup_fsdp(self):
-        """设置 FSDP"""
+        """设置 FSDP - v07: include v07 encoder classes, activation checkpointing for DiT blocks"""
         _log("Setting up FSDP...")
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
@@ -796,6 +796,7 @@ class LoLAV07Trainer:
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
         from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
         from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor, LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock
+        from lerobot.policies.lola_v07.modeling_lola_v07 import LolaV07ActionEncoder, LolaV07StateEncoder
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -813,16 +814,35 @@ class LoLAV07Trainer:
                 LolaVLMFeatureExtractor,
                 LoLADualExpertDoubleBlock,
                 LoLADualExpertSingleBlock,
+                LolaV07ActionEncoder,
+                LolaV07StateEncoder,
             }
         )
 
         self.model = FSDP(
             self.policy,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
             mixed_precision=mixed_precision,
             auto_wrap_policy=auto_wrap_policy,
             device_id=self.local_rank,
         )
+
+        # v07: Apply FSDP activation checkpointing to DiT transformer blocks
+        if self.config.gradient_checkpointing:
+            from torch.distributed.fsdp import apply_activation_checkpointing, CheckpointWrapper
+            _log("Enabling FSDP activation checkpointing for DiT blocks...")
+            # Checkpoint double-stream and single-stream DiT blocks
+            # These are the most memory-intensive layers (attention + FFN)
+            apply_activation_checkpointing(
+                self.model,
+                checkpoint_wrapper_fn=CheckpointWrapper,
+                check_fn=lambda submodule: isinstance(
+                    submodule,
+                    (LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock),
+                ),
+            )
+            _log("FSDP activation checkpointing enabled for DiT blocks")
+
 
     def _setup_deepspeed(self):
         """Set up DeepSpeed ZeRO-2 engine. Called after setup_model() and setup_optimizer()."""
@@ -980,7 +1000,8 @@ class LoLAV07Trainer:
     def _extract_special_fields(self, batch):
         """提取特殊字段"""
         special_data = {}
-        keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length"]
+        keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length",
+                           "hist_states_full", "hist_states_mask", "hist_states_length"]
         for key in keys_to_extract:
             if key in batch:
                 special_data[key] = batch.pop(key)

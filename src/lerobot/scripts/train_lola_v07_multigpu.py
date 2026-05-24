@@ -31,7 +31,6 @@ import os
 import sys
 import time
 from typing import Any, Dict
-import datetime
 
 import torch
 import torch.nn as nn
@@ -638,13 +637,14 @@ def compute_vlm_max_length(
 # ----------------------------------------------------------------------
 # FSDP 配置
 # ----------------------------------------------------------------------
-def get_fsdp_strategy():
+def get_fsdp_strategy(gradient_checkpointing=True):
     """获取 FSDP 策略配置"""
     from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, StateDictType
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
     from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
     from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor, LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock
+    from lerobot.policies.lola_v07.modeling_lola_v07 import LolaV07ActionEncoder, LolaV07StateEncoder
 
     mixed_precision = MixedPrecision(
         param_dtype=torch.bfloat16,
@@ -663,14 +663,23 @@ def get_fsdp_strategy():
             LolaVLMFeatureExtractor,
             LoLADualExpertDoubleBlock,
             LoLADualExpertSingleBlock,
+            LolaV07ActionEncoder,
+            LolaV07StateEncoder,
         }
     )
-    
+
+    # v07: Activation checkpointing for DiT transformer blocks
+    activation_checkpointing = None
+    if gradient_checkpointing:
+        activation_checkpointing = [LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock]
+        print("FSDP activation checkpointing enabled for DiT blocks")
+
     strategy = FSDPStrategy(
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         cpu_offload=False,
         mixed_precision=mixed_precision,
         auto_wrap_policy=auto_wrap_policy,
+        activation_checkpointing=activation_checkpointing,
         use_orig_params=True,  # 兼容优化器
         state_dict_type=StateDictType.FULL_STATE_DICT,
     )
@@ -878,7 +887,7 @@ def main():
 
     # 设置策略
     if args.strategy == "fsdp":
-        strategy = get_fsdp_strategy()
+        strategy = get_fsdp_strategy(gradient_checkpointing=not args.no_gradient_checkpointing)
     elif args.strategy == "deepspeed":
         strategy = get_deepspeed_strategy(
             learning_rate=args.learning_rate,
@@ -973,9 +982,8 @@ def main():
         state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
         encoder_lr_mult=args.encoder_lr_mult,
         warmup_pct=args.warmup_pct,
+        gradient_checkpointing=gradient_checkpointing,
     )
-    # draccus.ChoiceRegistry 不接受 gradient_checkpointing 作为构造参数
-    config.gradient_checkpointting = gradient_checkpointing
 
     # 归一化模式
     if args.norm_mode == "robovlm":

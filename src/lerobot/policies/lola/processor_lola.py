@@ -406,13 +406,29 @@ class LolaQwenProcessor(ObservationProcessorStep):
 
         # Format text based on template version
         if self.task_text_template_version == "v1_with_completed" and completed_tasks_ann:
-            if isinstance(completed_tasks_ann, list) and len(completed_tasks_ann) > 0:
+            # Batch mode: task is list[str], completed_tasks_ann is list[list[str]]
+            if isinstance(task, list) and isinstance(completed_tasks_ann, list):
+                # Check if batch-level (inner elements are lists) vs single-item (inner elements are strings)
+                if len(completed_tasks_ann) > 0 and isinstance(completed_tasks_ann[0], list):
+                    # Batch mode: format per-item
+                    text_content = []
+                    for t, ann_list in zip(task, completed_tasks_ann):
+                        if ann_list:
+                            numbered = [f"{i+1}. {a}" for i, a in enumerate(ann_list)]
+                            tasks_str = ", ".join(numbered)
+                            text_content.append(f"Perform task: {t}. Completed: {tasks_str}")
+                        else:
+                            text_content.append(f"Perform task: {t}")
+                else:
+                    # Single-item mode: task is list[str], completed_tasks_ann is list[str]
+                    numbered = [f"{i+1}. {t}" for i, t in enumerate(completed_tasks_ann)]
+                    tasks_str = ", ".join(numbered)
+                    text_content = [f"Perform task: {t}. Completed: {tasks_str}" for t in task]
+            elif isinstance(completed_tasks_ann, list) and len(completed_tasks_ann) > 0:
+                # Single-item: task is str, completed_tasks_ann is list[str]
                 numbered = [f"{i+1}. {t}" for i, t in enumerate(completed_tasks_ann)]
                 tasks_str = ", ".join(numbered)
-                if isinstance(task, list):
-                    text_content = [f"Perform task: {t}. Completed: {tasks_str}" for t in task]
-                else:
-                    text_content = f"Perform task: {task}. Completed: {tasks_str}"
+                text_content = f"Perform task: {task}. Completed: {tasks_str}"
             else:
                 if isinstance(task, list):
                     text_content = [f"Perform task: {t}" for t in task]

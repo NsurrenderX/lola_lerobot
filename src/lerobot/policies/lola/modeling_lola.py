@@ -1148,7 +1148,12 @@ class LoLAPolicy(PreTrainedPolicy):
         #   and torch.compile because hidden_states are tensor-level model returns.
         # - "split": manually iterates decoder layers, NOT compatible with FSDP
         #   (bypasses _pre_forward_unshard, causing size-0 parameter errors).
-        if config.compile_model:
+        if config.gradient_checkpointing and config.train_vlm:
+            # Gradient checkpointing recomputes layers during backward, which causes
+            # forward hooks to fire again with stale _in_vlm_forward state, corrupting
+            # _captured_hidden_states. Use output_hidden_states mode instead.
+            self._vlm_forward_mode = "output_hidden_states"
+        elif config.compile_model:
             import warnings
             warnings.warn(
                 "torch.compile + FSDP is incompatible with hook-based hidden state capture "

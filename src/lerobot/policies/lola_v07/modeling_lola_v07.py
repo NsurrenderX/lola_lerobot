@@ -688,7 +688,9 @@ class LoLAV07Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
 
         # VLM forward mode
-        if config.compile_model:
+        if config.gradient_checkpointing and config.train_vlm:
+            self._vlm_forward_mode = "output_hidden_states"
+        elif config.compile_model:
             import warnings
             warnings.warn(
                 "torch.compile + FSDP is incompatible with hook-based hidden state capture. "
