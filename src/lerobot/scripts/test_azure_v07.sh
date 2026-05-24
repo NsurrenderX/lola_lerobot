@@ -316,6 +316,32 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        # V07: Bottleneck dimensions
+        --action_bottleneck_dim)
+            ACTION_BOTTLENECK_DIM="$2"
+            shift 2
+            ;;
+        --grip_bottleneck_dim)
+            GRIP_BOTTLENECK_DIM="$2"
+            shift 2
+            ;;
+        --state_bottleneck_dim)
+            STATE_BOTTLENECK_DIM="$2"
+            shift 2
+            ;;
+        --state_grip_bottleneck_dim)
+            STATE_GRIP_BOTTLENECK_DIM="$2"
+            shift 2
+            ;;
+        --encoder_lr_mult)
+            ENCODER_LR_MULT="$2"
+            shift 2
+            ;;
+        --warmup_pct)
+            WARMUP_PCT="$2"
+            shift 2
+            ;;
+
         # V2: Text template + completed tasks + transition masking
         --task_text_template_version)
             TASK_TEXT_TEMPLATE_VERSION="$2"
