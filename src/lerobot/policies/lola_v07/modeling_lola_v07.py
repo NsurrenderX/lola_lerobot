@@ -390,11 +390,13 @@ class LoLAV07Pytorch(nn.Module):
                 hist_chunks = self.action_encoder(hist_actions)
         hist_chunks = hist_chunks.to(target_dtype)
 
-        # 3. Target action encoding to latent (force FP32)
+        # 3. Target action encoding to latent (force FP32, output to BF16)
         with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
             _, target_arm_latent, target_grip_latent = self.action_encoder(
                 target_actions, return_latent=True
             )
+        target_arm_latent = target_arm_latent.to(target_dtype)
+        target_grip_latent = target_grip_latent.to(target_dtype)
 
         # 4. Hist actions mask processing (same as v06)
         hist_chunks_mask = None
@@ -411,17 +413,14 @@ class LoLAV07Pytorch(nn.Module):
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()
             hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)
 
-        # 5. Flow Matching in latent space (FP32)
-        target_arm_latent = target_arm_latent.float()
-        target_grip_latent = target_grip_latent.float()
-
+        # 5. Flow Matching in latent space (BF16)
         if noise is None:
             noise_arm_latent = torch.randn_like(target_arm_latent)
             noise_grip_latent = torch.randn_like(target_grip_latent)
         else:
             noise_arm_latent, noise_grip_latent = noise
-            noise_arm_latent = noise_arm_latent.float()
-            noise_grip_latent = noise_grip_latent.float()
+            noise_arm_latent = noise_arm_latent.to(target_dtype)
+            noise_grip_latent = noise_grip_latent.to(target_dtype)
 
         if time is None:
             dist = torch.distributions.Beta(
@@ -430,8 +429,8 @@ class LoLAV07Pytorch(nn.Module):
             )
             time = dist.sample((b,)).to(device)
 
-        time_f32 = time.float()
-        t_expand = time_f32[:, None, None]
+        time = time.to(target_dtype)
+        t_expand = time[:, None, None]
 
         z_t_arm = (1 - t_expand) * target_arm_latent + t_expand * noise_arm_latent
         z_t_grip = (1 - t_expand) * target_grip_latent + t_expand * noise_grip_latent
@@ -439,10 +438,11 @@ class LoLAV07Pytorch(nn.Module):
         u_t_arm = noise_arm_latent - target_arm_latent
         u_t_grip = noise_grip_latent - target_grip_latent
 
-        # 6. Latent -> DiT (reuse decoder, no modality_emb)
-        z_t_arm_dit = self.action_encoder.arm_dec(z_t_arm.to(target_dtype))
-        z_t_grip_dit = self.action_encoder.grip_dec(z_t_grip.to(target_dtype))
-        z_t_dit = torch.cat([z_t_arm_dit, z_t_grip_dit], dim=1)  # [B, 2N, 1024]
+        # 6. Latent -> DiT (FP32 for decoder precision, output to BF16)
+        with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
+            z_t_arm_dit = self.action_encoder.arm_dec(z_t_arm)
+            z_t_grip_dit = self.action_encoder.grip_dec(z_t_grip)
+        z_t_dit = torch.cat([z_t_arm_dit.to(target_dtype), z_t_grip_dit.to(target_dtype)], dim=1)
 
         # 7. DiT forward (1024D, unchanged interface)
         pred_z0_dit = self.dit(
@@ -453,15 +453,18 @@ class LoLAV07Pytorch(nn.Module):
             use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
         )
 
-        # 8. DiT -> Latent (dit_to_latent projections)
+        # 8. DiT -> Latent (FP32 for dit_to_latent precision, output to BF16)
         num_chunks = pred_z0_dit.shape[1] // 2
         pred_z0_arm_dit = pred_z0_dit[:, :num_chunks, :]
         pred_z0_grip_dit = pred_z0_dit[:, num_chunks:, :]
 
-        pred_z0_arm_latent = self.arm_dit_to_latent(pred_z0_arm_dit).float()
-        pred_z0_grip_latent = self.grip_dit_to_latent(pred_z0_grip_dit).float()
+        with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
+            pred_z0_arm_latent = self.arm_dit_to_latent(pred_z0_arm_dit)
+            pred_z0_grip_latent = self.grip_dit_to_latent(pred_z0_grip_dit)
+        pred_z0_arm_latent = pred_z0_arm_latent.to(target_dtype)
+        pred_z0_grip_latent = pred_z0_grip_latent.to(target_dtype)
 
-        # 9. v-loss in latent space (FP32)
+        # 9. v-loss in latent space (BF16)
         t_expand_clamped = t_expand.clamp(min=1e-5)
         v_pred_arm = (z_t_arm - pred_z0_arm_latent) / t_expand_clamped
         v_pred_grip = (z_t_grip - pred_z0_grip_latent) / t_expand_clamped
@@ -565,10 +568,11 @@ class LoLAV07Pytorch(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(b)
 
-            # 2. Latent -> DiT (reuse decoder, no modality_emb)
-            z_t_arm_dit = self.action_encoder.arm_dec(z_t_arm.to(target_dtype))
-            z_t_grip_dit = self.action_encoder.grip_dec(z_t_grip.to(target_dtype))
-            z_t_dit = torch.cat([z_t_arm_dit, z_t_grip_dit], dim=1)
+            # 2. Latent -> DiT (FP32 for decoder precision, output to BF16)
+            with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
+                z_t_arm_dit = self.action_encoder.arm_dec(z_t_arm)
+                z_t_grip_dit = self.action_encoder.grip_dec(z_t_grip)
+            z_t_dit = torch.cat([z_t_arm_dit.to(target_dtype), z_t_grip_dit.to(target_dtype)], dim=1)
 
             # 3. DiT forward
             pred_z0_dit = self.dit(
@@ -582,10 +586,11 @@ class LoLAV07Pytorch(nn.Module):
                 use_gradient_checkpointing=False,
             )
 
-            # 4. DiT -> Latent
+            # 4. DiT -> Latent (FP32 for dit_to_latent precision)
             num = pred_z0_dit.shape[1] // 2
-            pred_z0_arm_latent = self.arm_dit_to_latent(pred_z0_dit[:, :num, :]).float()
-            pred_z0_grip_latent = self.grip_dit_to_latent(pred_z0_dit[:, num:, :]).float()
+            with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
+                pred_z0_arm_latent = self.arm_dit_to_latent(pred_z0_dit[:, :num, :])
+                pred_z0_grip_latent = self.grip_dit_to_latent(pred_z0_dit[:, num:, :])
 
             # 5. Euler step in latent space
             t_expand = time.clamp(min=1e-5)
