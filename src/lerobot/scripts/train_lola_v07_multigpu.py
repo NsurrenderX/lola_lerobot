@@ -61,19 +61,19 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.lola_dataset import LoLADataset  # 新增：支持完整历史action的数据集
 from lerobot.datasets.utils import dataset_to_policy_features
-from lerobot.policies.lola import LoLAConfig, LoLAPolicy
+from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
 
 # ----------------------------------------------------------------------
 # LoLA Lightning Module - 包装实际模型
 # ----------------------------------------------------------------------
-class LoLALightningModule(pl.LightningModule):
-    """LoLA 的 PyTorch Lightning 模块 - 包装实际的 LoLAPolicy"""
+class LoLAV07LightningModule(pl.LightningModule):
+    """LoLA 的 PyTorch Lightning 模块 - 包装实际的 LoLAV07Policy"""
     
     def __init__(
         self,
-        config: LoLAConfig,
+        config: LoLAV07Config,
         dataset_stats: dict | None = None,
         learning_rate: float = 2.5e-5,
         weight_decay: float = 0.01,
@@ -123,7 +123,7 @@ class LoLALightningModule(pl.LightningModule):
         print(f"[Rank {self.global_rank}] VLM Path: {self.config.vlm_path}")
         
         # 加载 LoLA Policy
-        self.policy = LoLAPolicy(self.config)
+        self.policy = LoLAV07Policy(self.config)
         
         # 将模型移动到正确的设备
         self.policy._device = device
@@ -169,9 +169,9 @@ class LoLALightningModule(pl.LightningModule):
                 if hasattr(self.policy, '_vlm_forward_mode'):
                     self.policy._vlm_forward_mode = "output_hidden_states"
         
-    def forward(self, batch):
+    def forward(self, batch, time=None):
         """前向传播"""
-        return self.policy(batch)
+        return self.policy(batch, time=time)
     
     def _extract_special_fields(self, batch):
         """
@@ -213,23 +213,39 @@ class LoLALightningModule(pl.LightningModule):
         return batch
     
     def training_step(self, batch, batch_idx):
-        """训练步骤"""
+        """训练步骤 - v07: warmup t-truncation and v-loss alarm"""
         self._step_start_time = time.monotonic()
 
         # 提取特殊字段（避免被preprocessor处理）
         special_data = self._extract_special_fields(batch)
-        
+
         # 应用预处理器
         batch = self.preprocessor(batch)
-        
+
         # 恢复特殊字段
         batch = self._restore_special_fields(batch, special_data)
-        
-        loss, loss_dict = self(batch)
+
+        # v07: Warmup t-truncation
+        warmup_steps = int(self.trainer.estimated_stepping_batches * self.config.warmup_pct)
+        if self.global_step < warmup_steps:
+            b = batch["action"].shape[0]
+            t_raw = torch.distributions.Beta(
+                self.config.time_sampling_beta_alpha,
+                self.config.time_sampling_beta_beta,
+            ).sample((b,)).to(batch["action"].device)
+            time_param = t_raw * (self.config.warmup_t_trunc_high - self.config.warmup_t_trunc_low) + self.config.warmup_t_trunc_low
+            loss, loss_dict = self(batch, time=time_param)
+        else:
+            loss, loss_dict = self(batch)
+
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
         for k, v in loss_dict.items():
             if k != "loss":
                 self.log(f"train_{k}", v, prog_bar=False, sync_dist=True)
+
+        # v07: v-loss alarm
+        if loss_dict.get("v_loss", 0) > 1.0:
+            print(f"[WARNING] v_loss = {loss_dict['v_loss']:.4f} > 1.0 at step {self.global_step}")
 
         # 记录步耗时
         if self._step_start_time is not None:
@@ -253,30 +269,44 @@ class LoLALightningModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        """配置优化器"""
-        # 只优化需要梯度的参数
-        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
-        
+        """配置优化器 - v07: Separate parameter groups with encoder LR multiplier"""
+        # v07: Separate parameter groups
+        encoder_lr_mult = self.config.encoder_lr_mult
+        base_lr = self.learning_rate
+
+        param_groups = [
+            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+        ]
+        if self.policy.model.state_encoder is not None:
+            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+
+        # Filter out params that don't require grad
+        for group in param_groups:
+            group["params"] = [p for p in group["params"] if p.requires_grad]
+
         optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
+            param_groups,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
             eps=1e-8,
         )
-        
+
         # Cosine decay scheduler
         from torch.optim.lr_scheduler import OneCycleLR
         warmup_ratio = min(self.hparams.warmup_ratio, 0.1)
         total_steps = self.max_steps if self.max_steps is not None else int(self.trainer.estimated_stepping_batches)
         scheduler = OneCycleLR(
             optimizer,
-            max_lr=self.learning_rate,
+            max_lr=[group["lr"] for group in optimizer.param_groups],
             total_steps=total_steps,
             pct_start=warmup_ratio,
             anneal_strategy='cos',
         )
-        
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -291,7 +321,7 @@ class LoLALightningModule(pl.LightningModule):
 # ----------------------------------------------------------------------
 def create_lola_dataset(
     repo_id: str,
-    config: LoLAConfig,
+    config: LoLAV07Config,
     root: str | None = None,
     episodes: list | None = None,
     image_transforms=None,
@@ -675,7 +705,7 @@ def get_deepspeed_strategy(learning_rate=2.5e-5, gradient_clip_val=1.0, deepspee
 # ----------------------------------------------------------------------
 def main():
     os.environ['WANDB_API_KEY'] = "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"
-    parser = argparse.ArgumentParser(description="LoLA Multi-GPU Training with LeRobotDataset")
+    parser = argparse.ArgumentParser(description="LoLA V07 Multi-GPU Training with LeRobotDataset")
     
     # 数据集参数
     parser.add_argument("--dataset_repo_id", type=str, default=None,
@@ -780,6 +810,20 @@ def main():
                         help="Comma-separated gripper dim indices (supports negative)")
     parser.add_argument("--hist_action_token_drop_rate", type=float, default=0.0,
                         help="Probability of dropping each valid history action token during training (0.0 = no dropout)")
+
+    # V07: Bottleneck dimensions
+    parser.add_argument("--action_bottleneck_dim", type=int, default=256,
+                        help="Arm latent dimension for flow matching (default: 256)")
+    parser.add_argument("--grip_bottleneck_dim", type=int, default=128,
+                        help="Grip latent dimension for flow matching (default: 128)")
+    parser.add_argument("--state_bottleneck_dim", type=int, default=256,
+                        help="StateEncoder unified mode arm bottleneck dimension (default: 256)")
+    parser.add_argument("--state_grip_bottleneck_dim", type=int, default=128,
+                        help="StateEncoder unified mode grip bottleneck dimension (default: 128)")
+    parser.add_argument("--encoder_lr_mult", type=float, default=1.5,
+                        help="Encoder LR multiplier relative to base LR (default: 1.5)")
+    parser.add_argument("--warmup_pct", type=float, default=0.1,
+                        help="Warm-up fraction of total steps (default: 0.1)")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4,
@@ -888,7 +932,7 @@ def main():
 
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
-    config = LoLAConfig(
+    config = LoLAV07Config(
         vlm_model_name="Qwen/Qwen3.5-4B",
         vlm_path=args.vlm_path,
         action_dim=action_dim,
@@ -922,6 +966,13 @@ def main():
         completed_tasks_history_len=args.completed_tasks_history_len,
         transition_mask_rate=args.transition_mask_rate,
         max_transition_len=args.max_transition_len,
+        # V07: Bottleneck dimensions
+        action_bottleneck_dim=args.action_bottleneck_dim,
+        grip_bottleneck_dim=args.grip_bottleneck_dim,
+        state_bottleneck_dim=args.state_bottleneck_dim,
+        state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
+        encoder_lr_mult=args.encoder_lr_mult,
+        warmup_pct=args.warmup_pct,
     )
     # draccus.ChoiceRegistry 不接受 gradient_checkpointing 作为构造参数
     config.gradient_checkpointting = gradient_checkpointing
@@ -1035,7 +1086,7 @@ def main():
         print(f"Total validation samples: {len(val_dataset)}")
 
     # 创建模型
-    model = LoLALightningModule(
+    model = LoLAV07LightningModule(
         config=config,
         dataset_stats=dataset_metadata.stats,
         learning_rate=args.learning_rate,
@@ -1046,7 +1097,7 @@ def main():
     
     # 回调函数
     time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    ckpt_dir = os.path.join(args.ckpt_dir, f"lola-{time_str}")
+    ckpt_dir = os.path.join(args.ckpt_dir, f"lola-v07-{time_str}")
 
     # Save all training configurations as JSON at training start (rank 0 only)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1108,7 +1159,7 @@ def main():
     logger_name = args.dataset_repo_id.replace('/', '-') if args.dataset_repo_id else os.path.basename(args.dataset_root)
     logger = WandbLogger(
         project="lola-multigpu",
-        name=f"lola-{args.strategy}-{logger_name}",
+        name=f"lola-v07-{args.strategy}-{logger_name}",
         save_dir="logs",
     )
     
@@ -1141,7 +1192,7 @@ def main():
     
     # 打印配置信息
     print("=" * 60)
-    print("LoLA Multi-GPU Training with LeRobotDataset")
+    print("LoLA V07 Multi-GPU Training with LeRobotDataset")
     print("=" * 60)
     print(f"Dataset: {args.dataset_repo_id}")
     print(f"Strategy: {args.strategy}")

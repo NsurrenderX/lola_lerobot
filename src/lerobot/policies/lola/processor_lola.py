@@ -337,6 +337,9 @@ class LolaQwenProcessor(ObservationProcessorStep):
         processor_name: str = "Qwen/Qwen3.5-4B",
         max_length: int = 512,
         task_key: str = "task",
+        completed_tasks_key: str = "completed_tasks",
+        completed_tasks_ann_key: str = "completed_tasks_ann",
+        task_text_template_version: str = "raw",
         max_image_pixels: int = 230400,
         min_image_pixels: int = 65536,
         static_vlm_padding: bool = False,
@@ -348,20 +351,22 @@ class LolaQwenProcessor(ObservationProcessorStep):
             processor_name: The HuggingFace model name for the processor.
             max_length: Maximum sequence length for tokenization.
             task_key: Key in complementary_data containing the task description.
+            completed_tasks_key: Key for completed task labels (list[str]).
+            completed_tasks_ann_key: Key for completed task annotation texts (list[str]).
+            task_text_template_version: "raw" = old behavior (just task string),
+                "v1_with_completed" = new template with completed tasks.
             max_image_pixels: Maximum pixels per image for Qwen3.5 smart_resize.
-                230400 → max_height≈360p for 720p images (220 visual tokens/image).
-                Controls the maximum number of visual tokens per image.
             min_image_pixels: Minimum pixels per image for Qwen3.5 smart_resize.
-                65536 → minimum 64 visual tokens per image (256x256).
-            static_vlm_padding: Pad VLM tokens to fixed vlm_max_length instead of
-                dynamic per-batch longest. Eliminates shape variance across steps.
+            static_vlm_padding: Pad VLM tokens to fixed vlm_max_length instead of dynamic.
             vlm_max_length: Override tokenizer max_length for static padding.
-                If None and static_vlm_padding=True, auto-compute from dataset tasks.
         """
         super().__init__(**kwargs)
         self.processor_name = processor_name
         self.max_length = max_length
         self.task_key = task_key
+        self.completed_tasks_key = completed_tasks_key
+        self.completed_tasks_ann_key = completed_tasks_ann_key
+        self.task_text_template_version = task_text_template_version
         self.static_vlm_padding = static_vlm_padding
         self.vlm_max_length = vlm_max_length
 
@@ -387,15 +392,34 @@ class LolaQwenProcessor(ObservationProcessorStep):
         """
         new_observation = dict(observation)
 
-        # Get task from complementary_data
+        # Get task + completed_tasks from complementary_data
         task = None
+        completed_tasks_ann = None
         if hasattr(self, 'transition') and self.transition is not None:
             from lerobot.processor.core import TransitionKey
             complementary_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
             task = complementary_data.get(self.task_key, "Perform the robot task.")
+            completed_tasks_ann = complementary_data.get(self.completed_tasks_ann_key, None)
 
         if task is None:
             task = "Perform the robot task."
+
+        # Format text based on template version
+        if self.task_text_template_version == "v1_with_completed" and completed_tasks_ann:
+            if isinstance(completed_tasks_ann, list) and len(completed_tasks_ann) > 0:
+                numbered = [f"{i+1}. {t}" for i, t in enumerate(completed_tasks_ann)]
+                tasks_str = ", ".join(numbered)
+                if isinstance(task, list):
+                    text_content = [f"Perform task: {t}. Completed: {tasks_str}" for t in task]
+                else:
+                    text_content = f"Perform task: {task}. Completed: {tasks_str}"
+            else:
+                if isinstance(task, list):
+                    text_content = [f"Perform task: {t}" for t in task]
+                else:
+                    text_content = f"Perform task: {task}"
+        else:
+            text_content = task  # raw mode (backward compatible)
 
         # Check for batch mode
         images_per_item = observation.get('_lola_images_per_item', None)
@@ -404,18 +428,18 @@ class LolaQwenProcessor(ObservationProcessorStep):
             # Batch mode: one conversation per item
             batch_size = len(images_per_item)
 
-            # Handle task: list[str] of length B, or single string (broadcast)
-            if isinstance(task, list):
-                per_item_tasks = task
+            # Handle text_content: list[str] or single string
+            if isinstance(text_content, list):
+                per_item_texts = text_content
             else:
-                per_item_tasks = [task] * batch_size
+                per_item_texts = [text_content] * batch_size
 
             messages = []
             for i in range(batch_size):
                 content = []
                 for img in images_per_item[i]:
                     content.append({"type": "image", "image": img})
-                content.append({"type": "text", "text": per_item_tasks[i]})
+                content.append({"type": "text", "text": per_item_texts[i]})
                 messages.append([{"role": "user", "content": content}])
 
             self.qwen_processor.tokenizer.padding_side = 'left'
@@ -434,7 +458,8 @@ class LolaQwenProcessor(ObservationProcessorStep):
             content = []
             for img in images:
                 content.append({"type": "image", "image": img})
-            content.append({"type": "text", "text": task if isinstance(task, str) else str(task)})
+            text_str = text_content if isinstance(text_content, str) else str(text_content)
+            content.append({"type": "text", "text": text_str})
             messages = [[{"role": "user", "content": content}]]
 
             self.qwen_processor.tokenizer.padding_side = 'left'
@@ -565,6 +590,9 @@ def make_lola_pre_post_processors(
             min_image_pixels=config.min_image_pixels,
             static_vlm_padding=config.static_vlm_padding,
             vlm_max_length=config.vlm_max_length,
+            task_text_template_version=config.task_text_template_version,
+            completed_tasks_key="completed_tasks",
+            completed_tasks_ann_key="completed_tasks_ann",
         ),
         LolaEmptyTokenProcessor(empty_token_id=config.empty_token_id),  # Append empty token for LoLA
         AddBatchDimensionProcessorStep(),

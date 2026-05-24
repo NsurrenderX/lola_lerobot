@@ -22,11 +22,13 @@ from .smolvla.processor_smolvla import SmolVLANewLineProcessor
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .lola.configuration_lola import LoLAConfig as LoLAConfig
+from .lola_v07.configuration_lola_v07 import LoLAV07Config as LoLAV07Config
 from .robovlm.configuration_robovlm import RoboVLMConfig as RoboVLMConfig
 from .cronusvla.configuration_cronusvla import CronusVLAConfig as CronusVLAConfig
 
 __all__ = [
     "LoLAConfig",
+    "LoLAV07Config",
     "RoboVLMConfig",
     "CronusVLAConfig",
     "ACTConfig",

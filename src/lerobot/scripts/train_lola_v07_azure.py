@@ -84,7 +84,7 @@ from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.lola_dataset import LoLADataset
 from lerobot.datasets.utils import dataset_to_policy_features
-from lerobot.policies.lola import LoLAConfig, LoLAPolicy
+from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
 # 设置日志
@@ -484,7 +484,7 @@ def get_deepspeed_config(
 # ----------------------------------------------------------------------
 def create_lola_dataset(
     repo_id: str,
-    config: LoLAConfig,
+    config: LoLAV07Config,
     root: str | None = None,
     episodes: list | None = None,
     image_transforms=None,
@@ -642,12 +642,12 @@ def make_collate_fn(static_max_len: int | None = None):
 # ----------------------------------------------------------------------
 # 训练器
 # ----------------------------------------------------------------------
-class LoLATrainer:
+class LoLAV07Trainer:
     """原生 PyTorch 训练器，支持 DDP 和 FSDP"""
 
     def __init__(
         self,
-        config: LoLAConfig,
+        config: LoLAV07Config,
         dataset_stats: dict | None,
         dist_info: dict,
         learning_rate: float = 2.5e-5,
@@ -741,7 +741,7 @@ class LoLATrainer:
         _log(f"Loading LoLA Policy on {self.device}...")
 
         # 加载 LoLA Policy
-        self.policy = LoLAPolicy(self.config)
+        self.policy = LoLAV07Policy(self.config)
         self.policy._device = self.device
         self.policy.model = self.policy.model.to(self.device)
         self.policy.vlm = self.policy.vlm.to(self.device)
@@ -849,7 +849,21 @@ class LoLATrainer:
                 custom_config = json.load(f)
             ds_config.update(custom_config)
 
-        trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+        # v07: Separate parameter groups for DeepSpeed
+        encoder_lr_mult = self.config.encoder_lr_mult
+        base_lr = self.learning_rate
+        trainable_param_groups = [
+            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+        ]
+        if self.policy.model.state_encoder is not None:
+            trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+        # Filter out params that don't require grad
+        for group in trainable_param_groups:
+            group["params"] = [p for p in group["params"] if p.requires_grad]
 
         # DeepSpeed passes the basic (unwrapped) optimizer to this callable,
         # so OneCycleLR's isinstance(optimizer, Optimizer) check passes.
@@ -857,7 +871,7 @@ class LoLATrainer:
             from torch.optim.lr_scheduler import OneCycleLR
             return OneCycleLR(
                 optimizer,
-                max_lr=self.learning_rate,
+                max_lr=[group["lr"] for group in optimizer.param_groups],
                 total_steps=self.total_steps,
                 pct_start=min(self.warmup_ratio, 0.1),
                 anneal_strategy="cos",
@@ -865,7 +879,7 @@ class LoLATrainer:
 
         model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=self.policy,
-            model_parameters=trainable_params,
+            model_parameters=trainable_param_groups,
             config=ds_config,
             lr_scheduler=lr_scheduler_callable,
             dist_init_required=False,
@@ -916,7 +930,7 @@ class LoLATrainer:
                 self.policy._vlm_forward_mode = "output_hidden_states"
 
     def setup_optimizer(self, total_steps: int | None = None):
-        """设置优化器"""
+        """设置优化器 - v07: Separate parameter groups with encoder LR multiplier"""
         if total_steps is None:
             total_steps = self.max_steps
         if total_steps is None:
@@ -928,11 +942,26 @@ class LoLATrainer:
             _log("Skipping optimizer creation - DeepSpeed will create from config")
             return
 
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        # v07: Separate parameter groups
+        encoder_lr_mult = self.config.encoder_lr_mult
+        base_lr = self.learning_rate
+
+        param_groups = [
+            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+        ]
+        if self.policy.model.state_encoder is not None:
+            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+
+        # Filter out params that don't require grad
+        for group in param_groups:
+            group["params"] = [p for p in group["params"] if p.requires_grad]
 
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
+            param_groups,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
             eps=1e-8,
@@ -942,7 +971,7 @@ class LoLATrainer:
         warmup_ratio = min(self.warmup_ratio, 0.1)
         self.scheduler = OneCycleLR(
             self.optimizer,
-            max_lr=self.learning_rate,
+            max_lr=[group["lr"] for group in self.optimizer.param_groups],
             total_steps=total_steps,
             pct_start=warmup_ratio,
             anneal_strategy="cos",
@@ -965,7 +994,7 @@ class LoLATrainer:
         return batch
 
     def training_step(self, batch, timing_dict: dict | None = None):
-        """单步训练"""
+        """单步训练 - v07: warmup t-truncation and v-loss alarm"""
         t0 = time.monotonic()
 
         # 移动数据到设备
@@ -981,14 +1010,29 @@ class LoLATrainer:
         batch = self._restore_special_fields(batch, special_data)
         t_preprocess = time.monotonic() - t1
 
+        # v07: Warmup t-truncation
+        warmup_steps = int(self.total_steps * self.config.warmup_pct)
+        time_param = None
+        if self.global_step < warmup_steps:
+            b = batch["action"].shape[0]
+            t_raw = torch.distributions.Beta(
+                self.config.time_sampling_beta_alpha,
+                self.config.time_sampling_beta_beta,
+            ).sample((b,)).to(self.device)
+            time_param = t_raw * (self.config.warmup_t_trunc_high - self.config.warmup_t_trunc_low) + self.config.warmup_t_trunc_low
+
         # 前向传播（混合精度）
         t2 = time.monotonic()
         if self.strategy == "deepspeed":
             # DeepSpeed handles BF16 autocast internally when bf16.enabled=True
-            loss, loss_dict = self.model(batch)
+            loss, loss_dict = self.model(batch, time=time_param)
         else:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                loss, loss_dict = self.model(batch)
+                loss, loss_dict = self.model(batch, time=time_param)
+
+        # v07: v-loss alarm
+        if loss_dict.get("v_loss", 0) > 1.0:
+            _log(f"[WARNING] v_loss = {loss_dict['v_loss']:.4f} > 1.0 at step {self.global_step}")
         t_model_fwd = time.monotonic() - t2
 
         if timing_dict is not None:
@@ -1010,7 +1054,7 @@ class LoLATrainer:
             time_str_list = [time_str]
             dist.broadcast_object_list(time_str_list, src=0)
             time_str = time_str_list[0]
-        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-{time_str}")
+        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-v07-azure-{time_str}")
         if self.is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             _log(f"Checkpoint directory: {ckpt_dir}")
@@ -1409,7 +1453,7 @@ def main():
     dist_info = setup_distributed()
 
     # 参数解析
-    parser = argparse.ArgumentParser(description="LoLA Azure Distributed Training")
+    parser = argparse.ArgumentParser(description="LoLA V07 Azure Distributed Training")
 
     # 数据集参数
     parser.add_argument("--dataset_repo_id", type=str, default=None)
@@ -1477,6 +1521,20 @@ def main():
                         help="Comma-separated gripper dim indices (supports negative)")
     parser.add_argument("--hist_action_token_drop_rate", type=float, default=0.0,
                         help="Probability of dropping each valid history action token during training (0.0 = no dropout)")
+
+    # V07: Bottleneck dimensions
+    parser.add_argument("--action_bottleneck_dim", type=int, default=256,
+                        help="Arm latent dimension for flow matching (default: 256)")
+    parser.add_argument("--grip_bottleneck_dim", type=int, default=128,
+                        help="Grip latent dimension for flow matching (default: 128)")
+    parser.add_argument("--state_bottleneck_dim", type=int, default=256,
+                        help="StateEncoder unified mode arm bottleneck dimension (default: 256)")
+    parser.add_argument("--state_grip_bottleneck_dim", type=int, default=128,
+                        help="StateEncoder unified mode grip bottleneck dimension (default: 128)")
+    parser.add_argument("--encoder_lr_mult", type=float, default=1.5,
+                        help="Encoder LR multiplier relative to base LR (default: 1.5)")
+    parser.add_argument("--warmup_pct", type=float, default=0.1,
+                        help="Warm-up fraction of total steps (default: 0.1)")
 
     # V2: Text template + completed tasks + transition masking
     parser.add_argument("--task_text_template_version", type=str, default="raw", choices=["raw", "v1_with_completed"],
@@ -1590,7 +1648,7 @@ def main():
     # 打印配置
     if dist_info["world_rank"] == 0:
         _log("=" * 60)
-        _log("LoLA Azure Distributed Training")
+        _log("LoLA V07 Azure Distributed Training")
         _log("=" * 60)
         _log(f"Dataset: {args.dataset_repo_id or args.dataset_root}")
         _log(f"Strategy: {args.strategy}")
@@ -1637,7 +1695,7 @@ def main():
 
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
-    config = LoLAConfig(
+    config = LoLAV07Config(
         vlm_model_name="Qwen/Qwen3.5-4B",
         vlm_path=args.vlm_path,
         action_dim=action_dim,
@@ -1672,6 +1730,13 @@ def main():
         completed_tasks_history_len=args.completed_tasks_history_len,
         transition_mask_rate=args.transition_mask_rate,
         max_transition_len=args.max_transition_len,
+        # V07: Bottleneck dimensions
+        action_bottleneck_dim=args.action_bottleneck_dim,
+        grip_bottleneck_dim=args.grip_bottleneck_dim,
+        state_bottleneck_dim=args.state_bottleneck_dim,
+        state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
+        encoder_lr_mult=args.encoder_lr_mult,
+        warmup_pct=args.warmup_pct,
     )
 
     # 归一化模式
@@ -1753,7 +1818,7 @@ def main():
     )
 
     # 创建训练器
-    trainer = LoLATrainer(
+    trainer = LoLAV07Trainer(
         config=config,
         dataset_stats=dataset_metadata.stats,
         dist_info=dist_info,

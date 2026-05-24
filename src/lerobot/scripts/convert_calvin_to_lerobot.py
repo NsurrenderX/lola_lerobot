@@ -382,8 +382,8 @@ def encode_videos_parallel(dataset, video_encode_workers: int):
 
     for ei in range(num_episodes):
         ep = episodes[ei]
-        ck = ep["data/chunk_index"]
-        fi = ep["data/file_index"]
+        ck = ep["meta/episodes/chunk_index"]
+        fi = ep["meta/episodes/file_index"]
         key = (ck, fi)
         if key not in chunk_file_episodes:
             chunk_file_episodes[key] = []

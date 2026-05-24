@@ -21,11 +21,18 @@ LoLA专用数据集，支持加载从episode开始到当前帧的完整历史act
 - 标准LeRobotDataset只加载固定长度的历史帧（n_obs_steps帧）
 - LoLADataset加载从episode开始到当前帧的所有action历史
 - 支持左侧padding以处理变长历史序列
+- V2: 支持completed_tasks（已完成任务序列）和transition-aware token mask
 """
+
+import json
+import os
+import random
+import torch
+import torch.nn.functional as F
+from typing import Callable
 
 import os
 import torch
-import torch.nn.functional as F
 from typing import Callable
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -76,6 +83,13 @@ class LoLADataset(LeRobotDataset):
         gripper_dim_indices_abs: tuple[int, ...] | None = None,
         history_type: str = "action",
         state_dim: int | None = None,
+        # V2: completed tasks + transition masking
+        track_completed_tasks: bool = True,
+        transition_mask_rate: float = 0.0,
+        completed_tasks_use_ann: bool = True,
+        hist_action_token_drop_rate: float = 0.0,
+        max_transition_len: int = 64,
+        completed_tasks_history_len: int = 5,
     ):
         """
         Args:
@@ -116,6 +130,13 @@ class LoLADataset(LeRobotDataset):
         self.norm_max = norm_max
         self.gripper_dim_indices_abs = gripper_dim_indices_abs
         self.history_type = history_type
+
+        # V2: completed tasks + transition masking
+        self.track_completed_tasks = track_completed_tasks
+        self.transition_mask_rate = transition_mask_rate  # 0=no mask, 1=full mask
+        self.completed_tasks_use_ann = completed_tasks_use_ann
+        self.hist_action_token_drop_rate = hist_action_token_drop_rate
+        self.completed_tasks_history_len = completed_tasks_history_len
 
         # Z-score normalization stats (computed from dataset metadata)
         self._action_mean = None
@@ -158,6 +179,35 @@ class LoLADataset(LeRobotDataset):
         else:
             self.action_dim = 1  # fallback
 
+        # ── Load episode metadata (V2: completed_tasks, transition_len) ────
+        self.episode_metadata = {}
+        metadata_path = self.root / "calvin_episode_metadata.json"
+        if metadata_path.exists():
+            with open(str(metadata_path)) as f:
+                raw_meta = json.load(f)
+            self.episode_metadata = {int(k): v for k, v in raw_meta.items()}
+            print(f"[LoLADataset] Loaded episode metadata: {len(self.episode_metadata)} episodes")
+        else:
+            print("[LoLADataset] No calvin_episode_metadata.json found — V1 mode (no completed_tasks)")
+
+        # ── Load pre-computed hist_action/hist_state from npz (V2) ──────
+        self._hist_action_all = None
+        self._hist_state_all = None
+        self._hist_len_all = None
+        npz_path = self.root / "calvin_episode_metadata.npz"
+        if npz_path.exists():
+            import numpy as np
+            npz = np.load(str(npz_path))
+            self._hist_action_all = torch.from_numpy(npz["hist_action"])  # [n_ep, max_t, action_dim]
+            self._hist_state_all = torch.from_numpy(npz["hist_state"])   # [n_ep, max_t, state_dim]
+            self._hist_len_all = torch.from_numpy(npz["hist_len"])       # [n_ep]
+            npz_max_t = self._hist_action_all.shape[1]
+            if npz_max_t != max_transition_len:
+                print(f"[LoLADataset] WARNING: npz max_t={npz_max_t} != max_transition_len={max_transition_len}")
+            print(f"[LoLADataset] Loaded hist metadata: {self._hist_action_all.shape}")
+        else:
+            print("[LoLADataset] No calvin_episode_metadata.npz found — no pre-computed history")
+
         # ── Seek-mode mapping (scan videos at init) ────────────────
         self._video_seek_modes: dict[str, str] = {}
         if os.path.isdir(os.path.join(str(self.root), "videos")):
@@ -197,15 +247,19 @@ class LoLADataset(LeRobotDataset):
         """
         获取数据项，包含完整历史action。
 
+        V2 enhancements:
+        - completed_tasks / completed_tasks_ann: 任务历史序列（来自episode metadata）
+        - hist_actions支持transition zone扩展（向前包含transition帧）
+        - chunk-level mask: transition-dominant token用transition_mask_rate,
+          task-dominant token用hist_action_token_drop_rate
+
         Returns:
             dict with additional keys:
             - hist_actions_full: [padded_length, action_dim] 历史action（含padding）
             - hist_actions_mask: [padded_length] 标识真实action (1) vs padding (0)
             - hist_actions_length: 标量，真实action数量
-
-        Note:
-            padded_length 会被补齐到 action_chunk_size 的整数倍，
-            便于模型将每 action_chunk_size 个 action 合并为 1 个 Token。
+            - completed_tasks: list[str] 已完成的任务标签序列
+            - completed_tasks_ann: list[str] 随机选择的annotation文本序列
         """
         # 调用父类方法获取基础数据
         item = super().__getitem__(idx)
@@ -216,82 +270,143 @@ class LoLADataset(LeRobotDataset):
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
 
-        # 计算当前帧在episode内的位置
-        current_frame_in_ep = idx - ep_start
+        # ── V2: Compute completed_tasks + completed_tasks_ann ───────────
+        if self.track_completed_tasks and ep_idx in self.episode_metadata:
+            meta = self.episode_metadata[ep_idx]
+            completed_tasks = meta["completed_tasks"]  # list[str]
+            completed_tasks_ann_choices = meta.get("completed_tasks_ann_choices", {})
 
-        # 计算历史长度（从episode开始到当前帧，包含当前帧）
-        history_length = current_frame_in_ep + 1
+            # Randomly select one 'ann' per completed task (training diversity)
+            # Only keep the most recent completed_tasks_history_len tasks
+            max_keep = self.completed_tasks_history_len
+            if max_keep > 0 and len(completed_tasks) > max_keep:
+                completed_tasks = completed_tasks[-max_keep:]
 
-        # 确定实际加载的历史范围
-        if history_length > self.max_history_length:
-            # 历史超过最大长度，只取最近的max_history_length帧
-            start_idx = idx - self.max_history_length + 1
-            actual_history_length = self.max_history_length
-        else:
-            # 历史不足最大长度，从episode开始加载
-            start_idx = ep_start
-            actual_history_length = history_length
+            completed_tasks_ann = []
+            for task in completed_tasks:
+                choices = completed_tasks_ann_choices.get(task, [task])
+                if self.completed_tasks_use_ann:
+                    selected_ann = random.choice(choices)
+                else:
+                    selected_ann = task  # concise mode: just use task label
+                completed_tasks_ann.append(selected_ann)
 
-        # 加载历史数据
-        history_indices = list(range(start_idx, idx + 1))
+            item["completed_tasks"] = completed_tasks
+            item["completed_tasks_ann"] = completed_tasks_ann
+        elif self.track_completed_tasks:
+            # V1 dataset without metadata — no completed tasks
+            item["completed_tasks"] = []
+            item["completed_tasks_ann"] = []
 
-        if self.history_type == "state":
-            # 加载历史状态
-            hist_data_dict = self._query_hf_dataset({"observation.state": history_indices})
-            hist_data = hist_data_dict["observation.state"]  # [actual_length, state_dim]
-            hist_dim = self.state_dim
-            hist_key_prefix = "hist_states"
-        else:
-            # 加载历史action
-            hist_data_dict = self._query_hf_dataset({"action": history_indices})
-            hist_data = hist_data_dict["action"]  # [actual_length, action_dim]
-            hist_dim = self.action_dim
-            hist_key_prefix = "hist_actions"
+        # ── V2: Build history from two sources ────────────────────────────
+        # Source 1: Transition history (pre-annotation) from npz
+        # Source 2: Task history (current episode frames from parquet)
+        # Both are concatenated into one continuous sequence with token-level weighted mask.
 
-        # 创建mask：标识真实数据
-        hist_mask = torch.ones(actual_history_length, dtype=torch.bool)
-
-        # 计算补齐后的长度（action_chunk_size的整数倍）
-        # 向上取整到最近的 action_chunk_size 倍数
-        padded_length = ((actual_history_length + self.action_chunk_size - 1) // self.action_chunk_size) * self.action_chunk_size
-
-        # 确保不超过 max_history_length（向上取整后可能超过）
-        if padded_length > self.max_history_length:
-            # 如果补齐后超过最大长度，向下取整到最近的 action_chunk_size 倍数
-            padded_length = (self.max_history_length // self.action_chunk_size) * self.action_chunk_size
-            # 如果实际历史长度超过了调整后的 padded_length，需要截断
-            if actual_history_length > padded_length:
-                # 从开头截断（保留最近的动作）
-                truncate_length = actual_history_length - padded_length
-                hist_data = hist_data[truncate_length:]
-                hist_mask = hist_mask[truncate_length:]
-                actual_history_length = padded_length
-
-        # Padding到 action_chunk_size 的整数倍
-        if actual_history_length < padded_length:
-            pad_length = padded_length - actual_history_length
-
-            # 创建padding张量
-            padding_data = torch.zeros(pad_length, hist_dim, dtype=hist_data.dtype)
-            padding_mask = torch.zeros(pad_length, dtype=torch.bool)
-
-            if self.history_padding_side == "left":
-                # 左侧padding：padding在前面
-                hist_data = torch.cat([padding_data, hist_data], dim=0)
-                hist_mask = torch.cat([padding_mask, hist_mask], dim=0)
+        transition_data = None
+        transition_data_len = 0
+        if self._hist_action_all is not None and ep_idx < len(self._hist_action_all):
+            pre_len = int(self._hist_len_all[ep_idx])
+            if self.history_type == "state":
+                transition_data = self._hist_state_all[ep_idx]  # [max_t, state_dim]
             else:
-                # 右侧padding：padding在后面
-                hist_data = torch.cat([hist_data, padding_data], dim=0)
-                hist_mask = torch.cat([hist_mask, padding_mask], dim=0)
+                transition_data = self._hist_action_all[ep_idx]  # [max_t, action_dim]
+            transition_data_len = pre_len
 
-        # 添加到item
-        item[f"{hist_key_prefix}_full"] = hist_data  # [padded_length, dim]
-        item[f"{hist_key_prefix}_mask"] = hist_mask  # [padded_length]
+        # Source 2: Task history (current episode frames from parquet)
+        task_data = None
+        task_frame_count = idx - ep_start + 1  # frames from ep_start to idx (inclusive)
+        if task_frame_count > 0:
+            task_indices = list(range(ep_start, idx + 1))
+            if self.history_type == "state":
+                task_data_dict = self._query_hf_dataset({"observation.state": task_indices})
+                task_data = task_data_dict["observation.state"]
+            else:
+                task_data_dict = self._query_hf_dataset({"action": task_indices})
+                task_data = task_data_dict["action"]
+
+        # Concatenate into one continuous sequence
+        parts = []
+        if transition_data is not None and transition_data_len > 0:
+            # Extract only the real (non-padded) portion from pre-computed arrays
+            offset = transition_data.shape[0] - transition_data_len
+            parts.append(transition_data[offset:])
+        if task_data is not None:
+            parts.append(task_data)
+
+        if parts:
+            hist_data = torch.cat(parts, dim=0)
+        else:
+            dim = self.state_dim if self.history_type == "state" else self.action_dim
+            hist_data = torch.zeros(0, dim, dtype=torch.float32)
+
+        total_len = hist_data.shape[0]
+        hist_mask = torch.ones(total_len, dtype=torch.bool)
+
+        # Record the boundary: first transition_data_len frames are transition, rest are task
+        n_transition = transition_data_len if transition_data is not None else 0
+
+        # Token-level (chunk-level) mask with weighted rate
+        chunk_size = self.action_chunk_size
+        if (self.transition_mask_rate > 0 or self.hist_action_token_drop_rate > 0) and total_len >= chunk_size:
+            num_chunks = total_len // chunk_size
+            for chunk_idx in range(num_chunks):
+                cs = chunk_idx * chunk_size
+                ce = cs + chunk_size
+
+                # Count transition vs task frames in this chunk
+                t_count = min(ce, n_transition) - min(cs, n_transition)
+                k_count = chunk_size - t_count
+
+                # Weighted mask rate
+                if t_count > 0 and k_count > 0:
+                    weighted_rate = (t_count * self.transition_mask_rate + k_count * self.hist_action_token_drop_rate) / chunk_size
+                elif t_count > 0:
+                    weighted_rate = self.transition_mask_rate
+                else:
+                    weighted_rate = self.hist_action_token_drop_rate
+
+                if weighted_rate > 0 and random.random() < weighted_rate:
+                    hist_mask[cs:ce] = False
+
+            actual_history_length = int(hist_mask.sum().item())
+            if actual_history_length == 0 and total_len > 0:
+                actual_history_length = chunk_size
+                hist_mask[:chunk_size] = True
+        else:
+            actual_history_length = total_len
+
+        # Zero out masked entries in data
+        hist_data = hist_data * hist_mask.unsqueeze(-1)
+
+        # Truncate from left to max_history_length
+        if hist_data.shape[0] > self.max_history_length:
+            hist_data = hist_data[-self.max_history_length:]
+            hist_mask = hist_mask[-self.max_history_length:]
+            actual_history_length = int(hist_mask.sum().item())
+
+        # Pad to action_chunk_size multiple (left-padding with zeros)
+        padded_length = ((hist_data.shape[0] + chunk_size - 1) // chunk_size) * chunk_size
+        if padded_length > self.max_history_length:
+            padded_length = (self.max_history_length // chunk_size) * chunk_size
+        pad_len = padded_length - hist_data.shape[0]
+        if pad_len > 0:
+            dim = hist_data.shape[1] if hist_data.dim() > 1 else (self.state_dim if self.history_type == "state" else self.action_dim)
+            if hist_data.dim() > 1:
+                padding_data = torch.zeros(pad_len, dim, dtype=hist_data.dtype)
+            else:
+                padding_data = torch.zeros(pad_len, dtype=hist_data.dtype)
+            padding_mask = torch.zeros(pad_len, dtype=torch.bool)
+            hist_data = torch.cat([padding_data, hist_data], dim=0)
+            hist_mask = torch.cat([padding_mask, hist_mask], dim=0)
+
+        hist_key_prefix = "hist_states" if self.history_type == "state" else "hist_actions"
+        item[f"{hist_key_prefix}_full"] = hist_data
+        item[f"{hist_key_prefix}_mask"] = hist_mask
         item[f"{hist_key_prefix}_length"] = torch.tensor(actual_history_length, dtype=torch.long)
 
         # Normalization
         if self.norm_action in (True, "minmax", "robovlm"):
-            # RoboVLM-style: min-max → [-1, 1], preserve gripper as-is
             from lerobot.datasets.robovlm_dataset import normalize_action
             if "action" in item:
                 item["action"] = normalize_action(item["action"], self.norm_min, self.norm_max)
@@ -300,7 +415,6 @@ class LoLADataset(LeRobotDataset):
             if "hist_states_full" in item:
                 item["hist_states_full"] = normalize_action(item["hist_states_full"], self.norm_min, self.norm_max)
         elif self.norm_action == "zscore":
-            # Z-score arm dims + binarize gripper dims for BCE (actions)
             from lerobot.datasets.robovlm_dataset import normalize_action_zscore
             if "action" in item:
                 item["action"] = normalize_action_zscore(
@@ -312,7 +426,6 @@ class LoLADataset(LeRobotDataset):
                     item["hist_actions_full"], self._action_mean, self._action_std,
                     self.gripper_dim_indices_abs,
                 )
-            # State normalization: z-score all dims uniformly (gripper is continuous width, not binary)
             if "hist_states_full" in item and self._state_mean is not None:
                 item["hist_states_full"] = (
                     (item["hist_states_full"] - self._state_mean) / (self._state_std + 1e-8)

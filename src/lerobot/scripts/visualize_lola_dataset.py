@@ -7,22 +7,27 @@ Each video frame combines:
   - Camera observation images (side-by-side)
   - Action & state values (text overlay)
   - Task description & episode/frame metadata (header)
+  - V2: transition zone indicator, completed tasks display
 
 Output video runs at fps_factor * dataset.fps (default 0.5 = half original fps).
 
 Usage:
+  # Basic (V1 dataset)
   python visualize_lola_dataset.py \
       --repo-id lerobot/pusht \
       --num-to-render 3 \
       --output-dir outputs/lola_viz
 
+  # V2 Calvin dataset with transition frames + completed tasks
   python visualize_lola_dataset.py \
-      --repo-id cup_full_plus \
-      --root /path/to/data \
-      --episode-indices 0 5 10
+      --root /data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v4 \
+      --episode-indices 0 5 10 \
+      --track-completed-tasks \
+      --output-dir outputs/lola_viz
 """
 
 import argparse
+import json
 import random
 from pathlib import Path
 
@@ -107,7 +112,9 @@ def compose_frame(
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     action_names: list[str],
     state_names: list[str],
-    header_h: int = 40,
+    episode_metadata: dict | None = None,
+    ep_idx: int | None = None,
+    header_h: int = 60,
     info_panel_h: int = 200,
 ) -> Image.Image:
     """Compose a single annotated video frame from a dataset item."""
@@ -117,9 +124,7 @@ def compose_frame(
     cam_images: list[Image.Image] = []
 
     if cam_keys:
-        # Determine target height from first camera's metadata shape
         first_cam_shape = dataset.meta.info["features"][cam_keys[0]]["shape"]
-        # shape is (C, H, W) for video/image features
         target_h = first_cam_shape[1] if len(first_cam_shape) >= 2 else 480
 
         for cam_key in cam_keys:
@@ -141,7 +146,6 @@ def compose_frame(
                 pil = pil.resize((new_w, target_h), Image.LANCZOS)
             cam_images.append(pil)
     else:
-        # No cameras — create a blank placeholder
         cam_images.append(make_invalid_placeholder(640, 480))
 
     # ── Camera row ──────────────────────────────────────────────────────────
@@ -160,22 +164,50 @@ def compose_frame(
     draw_hdr = ImageDraw.Draw(header)
 
     task_text = str(item.get("task", "N/A"))
-    # Truncate task if it's too wide
     bbox = draw_hdr.textbbox((0, 0), task_text, font=font)
     if bbox[2] - bbox[0] > frame_width - 20:
         task_text = task_text[: max(1, int((frame_width - 50) / 6))] + "..."
 
-    ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
+    ep_idx_val = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
     frame_idx = item["frame_index"].item() if isinstance(item["frame_index"], torch.Tensor) else item["frame_index"]
     ts = item["timestamp"].item() if isinstance(item["timestamp"], torch.Tensor) else item["timestamp"]
 
-    draw_hdr.text((10, 5), f"Task: {task_text}", fill=(255, 255, 255), font=font)
+    draw_hdr.text((10, 3), f"Task: {task_text}", fill=(255, 255, 255), font=font)
     draw_hdr.text(
-        (10, 22),
-        f"Ep: {ep_idx}  Frame: {frame_idx}  Timestamp: {ts:.3f}s",
+        (10, 20),
+        f"Ep: {ep_idx_val}  Frame: {frame_idx}  Timestamp: {ts:.3f}s",
         fill=(200, 200, 200),
         font=font,
     )
+
+    # V2: hist_len + completed tasks info
+    transition_info = ""
+    completed_info = ""
+    if episode_metadata and ep_idx is not None and str(ep_idx) in episode_metadata:
+        ep_meta = episode_metadata[str(ep_idx)]
+        hist_len = ep_meta.get("hist_len", 0)
+        annotation_len = ep_meta.get("annotation_len", 0)
+        completed_tasks = ep_meta.get("completed_tasks", [])
+
+        transition_info = f"HistLen: {hist_len}  Annotation: {annotation_len}  Frame: {frame_idx}/{annotation_len - 1}"
+
+        if completed_tasks:
+            # Show up to 5 most recently completed tasks (reverse order)
+            shown = list(reversed(completed_tasks[-5:]))
+            completed_info = f"Completed ({len(completed_tasks)}): " + ", ".join(shown)
+            if len(completed_tasks) > 5:
+                completed_info += f" +{len(completed_tasks) - 5} earlier"
+        else:
+            completed_info = "Completed: (none)"
+
+    if transition_info:
+        draw_hdr.text((10, 37), transition_info, fill=(255, 200, 100), font=font)
+    if completed_info:
+        # Truncate if too wide
+        bbox = draw_hdr.textbbox((0, 0), completed_info, font=font)
+        if bbox[2] - bbox[0] > frame_width - 20:
+            completed_info = completed_info[: max(1, int((frame_width - 50) / 6))] + "..."
+        draw_hdr.text((10, 50), completed_info, fill=(150, 200, 255), font=font)
 
     # ── Info panel (action + state) ──────────────────────────────────────────
     info = Image.new("RGB", (frame_width, info_panel_h), color=(30, 30, 30))
@@ -201,6 +233,19 @@ def compose_frame(
             draw_info.text((10, y), line, fill=(100, 200, 255), font=font)
             y += 18
 
+    # V2: completed_tasks_ann (randomly selected for this sample)
+    completed_tasks_ann = item.get("completed_tasks_ann")
+    if completed_tasks_ann:
+        y += 10
+        draw_info.text((10, y), "Completed tasks (ann, recent first):", fill=(200, 200, 100), font=font)
+        y += 18
+        for i, ann in enumerate(reversed(completed_tasks_ann[-8:])):
+            draw_info.text((20, y), f"{i + 1}. {ann}", fill=(220, 200, 130), font=font)
+            y += 16
+        if len(completed_tasks_ann) > 8:
+            draw_info.text((20, y), f"  ... +{len(completed_tasks_ann) - 8} earlier", fill=(180, 180, 100), font=font)
+            y += 16
+
     # ── Compose full frame ──────────────────────────────────────────────────
     total_h = header_h + cam_max_h + info_panel_h
     full = Image.new("RGB", (frame_width, total_h), color=(0, 0, 0))
@@ -220,6 +265,7 @@ def render_episode(
     output_path: Path,
     fps_factor: float,
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    episode_metadata: dict | None = None,
 ) -> None:
     """Render one episode as an annotated mp4 video."""
     ep = dataset.meta.episodes[ep_idx]
@@ -231,31 +277,37 @@ def render_episode(
     action_names_raw = dataset.meta.names.get("action", None)
     action_names = flatten_dim_names(action_names_raw, "a", action_dim)
 
-    state_dim = 1
-    state_names_raw = None
-    state_names = [f"s{i}" for i in range(1)]
-    if "observation.state" in dataset.meta.names:
-        state_names_raw = dataset.meta.names["observation.state"]
-        # Determine state_dim from first item
-        sample = dataset[from_idx]
-        if "observation.state" in sample and isinstance(sample["observation.state"], torch.Tensor):
-            state_dim = sample["observation.state"].shape[0]
-        state_names = flatten_dim_names(state_names_raw, "s", state_dim)
+    state_dim = dataset.state_dim if hasattr(dataset, "state_dim") and dataset.state_dim else 1
+    state_names_raw = dataset.meta.names.get("observation.state", None)
+    state_names = flatten_dim_names(state_names_raw, "s", state_dim)
+
+    # V2: check episode metadata for hist_len and annotation_len
+    hist_len = 0
+    annotation_len = 0
+    if episode_metadata and str(ep_idx) in episode_metadata:
+        ep_meta = episode_metadata[str(ep_idx)]
+        hist_len = ep_meta.get("hist_len", 0)
+        annotation_len = ep_meta.get("annotation_len", 0)
+
+    total_frames = to_idx - from_idx
+    print(f"  Rendering episode {ep_idx}: {total_frames} frames "
+          f"(hist={hist_len}, annotation={annotation_len}) "
+          f"[indices {from_idx}..{to_idx - 1}]")
 
     # Collect all frames
     frames: list[np.ndarray] = []
-    total_frames = to_idx - from_idx
-    print(f"  Rendering episode {ep_idx}: {total_frames} frames (indices {from_idx}..{to_idx - 1})")
-
     for idx in range(from_idx, to_idx):
         item = dataset[idx]
-        pil_frame = compose_frame(item, dataset, font, action_names, state_names)
-        frames.append(np.array(pil_frame))  # (H, W, 3) uint8
+        pil_frame = compose_frame(
+            item, dataset, font, action_names, state_names,
+            episode_metadata=episode_metadata, ep_idx=ep_idx,
+        )
+        frames.append(np.array(pil_frame))
 
     # Determine output dimensions and fps (h264 requires even dimensions)
     h, w, _ = frames[0].shape
-    w = w + (w % 2)  # round up to nearest even width
-    h = h + (h % 2)  # round up to nearest even height
+    w = w + (w % 2)
+    h = h + (h % 2)
     output_fps = max(1, int(dataset.fps * fps_factor))
 
     # Write video with PyAV
@@ -268,7 +320,6 @@ def render_episode(
         stream.codec_context.options = {"crf": "23", "preset": "medium"}
 
         for frame_np in frames:
-            # Pad to even dimensions if needed
             fh, fw, _ = frame_np.shape
             if fw != w or fh != h:
                 padded = np.zeros((h, w, 3), dtype=np.uint8)
@@ -278,7 +329,6 @@ def render_episode(
             for packet in stream.encode(video_frame):
                 container.mux(packet)
 
-        # Flush encoder
         for packet in stream.encode():
             container.mux(packet)
 
@@ -297,21 +347,79 @@ def main():
     parser.add_argument("--output-dir", default="outputs/lola_viz", help="Output directory")
     parser.add_argument("--max-history-length", type=int, default=100, help="LoLADataset max_history_length")
     parser.add_argument("--action-chunk-size", type=int, default=10, help="LoLADataset action_chunk_size")
-    parser.add_argument("--video-backend", default="pyav", help="Video backend (default: pyav)")
+    parser.add_argument("--video-backend", default="torchcodec", help="Video backend: torchcodec (default), pyav")
     parser.add_argument("--fps-factor", type=float, default=0.5, help="Output fps = dataset.fps * fps_factor")
+    parser.add_argument("--tolerance-frame", type=int, default=2,
+                        help="Frame-level tolerance for video timestamp matching (default: 2)")
+    parser.add_argument("--tolerance-s", type=float, default=None,
+                        help="Timestamp tolerance in seconds (default: auto from tolerance_frame/fps)")
+    # V2 params
+    parser.add_argument("--track-completed-tasks", action="store_true", default=False,
+                        help="Enable completed tasks tracking (V2 dataset)")
+    parser.add_argument("--completed-tasks-use-ann", action="store_true", default=True,
+                        help="Use descriptive 'ann' text for completed tasks")
+    parser.add_argument("--no-completed-tasks-use-ann", action="store_true",
+                        help="Use concise 'task' label instead of 'ann'")
+    parser.add_argument("--transition-mask-rate", type=float, default=0.0,
+                        help="Mask rate for transition-dominant hist tokens (0=no mask)")
+    parser.add_argument("--hist-action-token-drop-rate", type=float, default=0.0,
+                        help="Drop rate for task-dominant hist tokens")
+    parser.add_argument("--history-type", type=str, default="action", choices=["action", "state"])
+    parser.add_argument("--state-dim", type=int, default=None)
+    parser.add_argument("--norm-mode", type=str, default="default",
+                        choices=["default", "robovlm", "zscore"],
+                        help="Normalization mode")
+    parser.add_argument("--norm-min", type=float, default=-0.65)
+    parser.add_argument("--norm-max", type=float, default=0.65)
     args = parser.parse_args()
 
-    # ── Instantiate dataset (no delta_timestamps → single-frame data) ────────
-    
-    dataset = LoLADataset(
+    # ── Normalization setup ──────────────────────────────────────────────────
+    norm_action = False
+    if args.norm_mode == "robovlm":
+        norm_action = True
+    elif args.norm_mode == "zscore":
+        norm_action = "zscore"
+
+    completed_tasks_use_ann = not args.no_completed_tasks_use_ann if args.no_completed_tasks_use_ann else args.completed_tasks_use_ann
+
+    # ── Instantiate dataset ──────────────────────────────────────────────────
+    ds_kwargs = dict(
         repo_id=args.repo_id,
         root=args.root,
         max_history_length=args.max_history_length,
         action_chunk_size=args.action_chunk_size,
         video_backend=args.video_backend,
+        norm_action=norm_action,
+        norm_min=args.norm_min,
+        norm_max=args.norm_max,
+        history_type=args.history_type,
+        state_dim=args.state_dim,
+        tolerance_frame=args.tolerance_frame,
+        track_completed_tasks=args.track_completed_tasks,
+        transition_mask_rate=args.transition_mask_rate,
+        completed_tasks_use_ann=completed_tasks_use_ann,
+        hist_action_token_drop_rate=args.hist_action_token_drop_rate,
     )
+    if args.tolerance_s is not None:
+        ds_kwargs["tolerance_s"] = args.tolerance_s
+    dataset = LoLADataset(**ds_kwargs)
 
-    print(f"Dataset: {args.repo_id}  fps={dataset.fps}  episodes={len(dataset.meta.episodes)}")
+    print(f"Dataset: {args.repo_id or args.root}  fps={dataset.fps}  episodes={len(dataset.meta.episodes)}")
+
+    # ── Load V2 episode metadata ─────────────────────────────────────────────
+    episode_metadata = None
+    if args.root:
+        metadata_path = Path(args.root) / "calvin_episode_metadata.json"
+    else:
+        # Try to find metadata from dataset root
+        metadata_path = Path(dataset.root) / "calvin_episode_metadata.json"
+
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            episode_metadata = json.load(f)
+        print(f"Loaded V2 episode metadata: {len(episode_metadata)} episodes")
+    else:
+        print("No calvin_episode_metadata.json found (V1 dataset mode)")
 
     # ── Select episodes ──────────────────────────────────────────────────────
     num_episodes = len(dataset.meta.episodes)
@@ -329,12 +437,15 @@ def main():
     output_dir = Path(args.output_dir)
     if args.repo_id is not None:
         repo_id_sanitized = args.repo_id.replace("/", "_")
+    elif args.root:
+        repo_id_sanitized = Path(args.root).name
     else:
         repo_id_sanitized = "dataset"
 
     for ep_idx in ep_indices:
         output_path = output_dir / f"{repo_id_sanitized}_episode_{ep_idx}.mp4"
-        render_episode(dataset, ep_idx, output_path, args.fps_factor, font)
+        render_episode(dataset, ep_idx, output_path, args.fps_factor, font,
+                       episode_metadata=episode_metadata)
 
     print(f"\nDone. Videos saved to {output_dir}")
 

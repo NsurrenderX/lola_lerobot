@@ -32,6 +32,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.lola.configuration_lola import LoLAConfig
+from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
 from lerobot.policies.robovlm.configuration_robovlm import RoboVLMConfig
 from lerobot.policies.cronusvla.configuration_cronusvla import CronusVLAConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
@@ -114,6 +115,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.lola.modeling_lola import LoLAPolicy
 
         return LoLAPolicy
+    elif name == "lola_v07":
+        from lerobot.policies.lola_v07.modeling_lola_v07 import LoLAV07Policy
+
+        return LoLAV07Policy
     elif name == "robovlm":
         from lerobot.policies.robovlm.modeling_robovlm import RoboVLMPolicy
 
@@ -167,6 +172,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return GrootConfig(**kwargs)
     elif policy_type == "lola":
         return LoLAConfig(**kwargs)
+    elif policy_type == "lola_v07":
+        return LoLAV07Config(**kwargs)
     elif policy_type == "robovlm":
         return RoboVLMConfig(**kwargs)
     elif policy_type == "cronusvla":
@@ -352,6 +359,14 @@ def make_pre_post_processors(
         )
 
     elif isinstance(policy_cfg, LoLAConfig):
+        from lerobot.policies.lola.processor_lola import make_lola_pre_post_processors
+
+        processors = make_lola_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, LoLAV07Config):
         from lerobot.policies.lola.processor_lola import make_lola_pre_post_processors
 
         processors = make_lola_pre_post_processors(

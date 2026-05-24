@@ -374,12 +374,12 @@ def update_episode_video_metadata(meta, video_meta_map: dict):
     episodes = load_episodes(meta.root)
     num_episodes = meta.total_episodes
 
-    # Group episodes by their data parquet file
+    # Group episodes by their meta/episodes parquet file
     chunk_file_episodes = {}
     for i in range(len(episodes)):
         ei = episodes[i]["episode_index"]
-        ck = episodes[i]["data/chunk_index"]
-        fi = episodes[i]["data/file_index"]
+        ck = episodes[i]["meta/episodes/chunk_index"]
+        fi = episodes[i]["meta/episodes/file_index"]
         key = (ck, fi)
         if key not in chunk_file_episodes:
             chunk_file_episodes[key] = []

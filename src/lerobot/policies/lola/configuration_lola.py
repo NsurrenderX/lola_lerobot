@@ -93,6 +93,13 @@ class LoLAConfig(PreTrainedConfig):
     state_dim: int = 20  # Dimension of observation.state (set from dataset features)
     state_encoder_mode: str = "unified"  # State encoder mode: "unified" or "separated"
     max_state_dim: int = 32  # Maximum state dimension for padding
+    max_transition_len: int = 64  # Max history frames before annotation (must match conversion)
+
+    # V2: Text template + completed tasks + transition masking
+    task_text_template_version: str = "raw"  # "raw" = old behavior, "v1_with_completed" = new template with completed tasks
+    completed_tasks_use_ann: bool = True  # True=use descriptive 'ann' text for completed tasks, False=use concise 'task' label
+    completed_tasks_history_len: int = 5  # Only keep the most recent N completed tasks (older ones may be overwritten by later tasks)
+    transition_mask_rate: float = 0.0  # 0=no mask (keep transition tokens), 1=fully mask all transition-dominant tokens
 
     # Image resolution limits for VLM visual token balancing
     max_image_pixels: int = 230400  # Enforces max visual tokens per image (230400 → max_h≈360p for 720p → 220 tokens)
@@ -156,6 +163,12 @@ class LoLAConfig(PreTrainedConfig):
 
         if self.state_encoder_mode not in ("unified", "separated"):
             raise ValueError(f"Invalid state_encoder_mode: {self.state_encoder_mode}, must be 'unified' or 'separated'")
+
+        if self.task_text_template_version not in ("raw", "v1_with_completed"):
+            raise ValueError(f"Invalid task_text_template_version: {self.task_text_template_version}, must be 'raw' or 'v1_with_completed'")
+
+        if not (0.0 <= self.transition_mask_rate <= 1.0):
+            raise ValueError(f"transition_mask_rate must be in [0.0, 1.0], got {self.transition_mask_rate}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

@@ -82,9 +82,17 @@ MAX_IMAGE_PIXELS=230400
 MIN_IMAGE_PIXELS=65536
 NUM_INFERENCE_STEPS=10
 GRIPPER_DIMS="-1"
-ACTION_LOSS_WEIGHT=1.0
+ACTION_LOSS_WEIGHT=10.0
 GRIPPER_LOSS_WEIGHT=1.0
 HIST_ACTION_TOKEN_DROP_RATE=0.0
+
+# LoLA V07: Bottleneck dimensions
+ACTION_BOTTLENECK_DIM=256
+GRIP_BOTTLENECK_DIM=128
+STATE_BOTTLENECK_DIM=256
+STATE_GRIP_BOTTLENECK_DIM=128
+ENCODER_LR_MULT=1.5
+WARMUP_PCT=0.1
 
 # V2: Text template + completed tasks + transition masking
 TASK_TEXT_TEMPLATE_VERSION="raw"
@@ -438,7 +446,7 @@ echo "========================================"
 if [ "$NNODES" -eq 1 ]; then
     # 单节点：使用简化的 torchrun 命令
     cmd="/opt/conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
-        src/lerobot/scripts/train_lola_azure.py \
+        src/lerobot/scripts/train_lola_v07_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
         --learning_rate ${LEARNING_RATE} \
@@ -458,6 +466,12 @@ if [ "$NNODES" -eq 1 ]; then
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
+        --action_bottleneck_dim ${ACTION_BOTTLENECK_DIM} \
+        --grip_bottleneck_dim ${GRIP_BOTTLENECK_DIM} \
+        --state_bottleneck_dim ${STATE_BOTTLENECK_DIM} \
+        --state_grip_bottleneck_dim ${STATE_GRIP_BOTTLENECK_DIM} \
+        --encoder_lr_mult ${ENCODER_LR_MULT} \
+        --warmup_pct ${WARMUP_PCT} \
         --task_text_template_version ${TASK_TEXT_TEMPLATE_VERSION} \
         --transition_mask_rate ${TRANSITION_MASK_RATE} \
         --max_transition_len ${MAX_TRANSITION_LEN} \
@@ -477,7 +491,7 @@ else
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
         --master_port=${MASTER_PORT} \
-        src/lerobot/scripts/train_lola_azure.py \
+        src/lerobot/scripts/train_lola_v07_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
         --learning_rate ${LEARNING_RATE} \
@@ -497,6 +511,12 @@ else
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
+        --action_bottleneck_dim ${ACTION_BOTTLENECK_DIM} \
+        --grip_bottleneck_dim ${GRIP_BOTTLENECK_DIM} \
+        --state_bottleneck_dim ${STATE_BOTTLENECK_DIM} \
+        --state_grip_bottleneck_dim ${STATE_GRIP_BOTTLENECK_DIM} \
+        --encoder_lr_mult ${ENCODER_LR_MULT} \
+        --warmup_pct ${WARMUP_PCT} \
         --task_text_template_version ${TASK_TEXT_TEMPLATE_VERSION} \
         --transition_mask_rate ${TRANSITION_MASK_RATE} \
         --max_transition_len ${MAX_TRANSITION_LEN} \
