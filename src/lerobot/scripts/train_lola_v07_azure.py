@@ -905,7 +905,7 @@ class LoLAV07Trainer:
 
         self._configure_deepspeed_checkpointing()
 
-        trainable_count = sum(p.numel() for p in trainable_params)
+        trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         _log(f"DeepSpeed ZeRO-{self.deepspeed_zero_stage} initialized: {trainable_count:,} trainable params")
 
     def _configure_deepspeed_checkpointing(self):
