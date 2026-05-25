@@ -656,6 +656,7 @@ class LoLAV07Trainer:
         max_steps: int | None = None,
         max_epochs: int | None = None,
         train_vlm: bool = False,
+        vlm_lr: float = 1e-6,
         strategy: str = "ddp",
         gradient_clip_val: float = 1.0,
         batch_size: int = 4,
@@ -686,6 +687,7 @@ class LoLAV07Trainer:
         self.max_steps = max_steps
         self.max_epochs = max_epochs
         self.train_vlm = train_vlm
+        self.vlm_lr = vlm_lr
         self.strategy = strategy
         self.gradient_clip_val = gradient_clip_val
         self.batch_size = batch_size
@@ -778,13 +780,15 @@ class LoLAV07Trainer:
         self.interconnect_monitor = InterconnectMonitor(self.device)
 
     def _setup_ddp(self):
-        """设置 DDP"""
+        """设置 DDP (通信/计算重叠优化)"""
         _log("Setting up DDP...")
         self.model = DDP(
             self.policy,
             device_ids=[self.local_rank],
             output_device=self.local_rank,
             find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
         )
 
     def _setup_fsdp(self):
@@ -881,9 +885,12 @@ class LoLAV07Trainer:
         ]
         if self.policy.model.state_encoder is not None:
             trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        # Filter out params that don't require grad
+        if self.train_vlm and hasattr(self.policy, "vlm"):
+            trainable_param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
+        # Filter out params that don't require grad, then remove empty groups
         for group in trainable_param_groups:
             group["params"] = [p for p in group["params"] if p.requires_grad]
+        trainable_param_groups = [g for g in trainable_param_groups if g["params"]]
 
         # DeepSpeed passes the basic (unwrapped) optimizer to this callable,
         # so OneCycleLR's isinstance(optimizer, Optimizer) check passes.
@@ -975,10 +982,13 @@ class LoLAV07Trainer:
         ]
         if self.policy.model.state_encoder is not None:
             param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+        if self.train_vlm and hasattr(self.policy, "vlm"):
+            param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
 
-        # Filter out params that don't require grad
+        # Filter out params that don't require grad, then remove empty groups
         for group in param_groups:
             group["params"] = [p for p in group["params"] if p.requires_grad]
+        param_groups = [g for g in param_groups if g["params"]]
 
         self.optimizer = torch.optim.AdamW(
             param_groups,
@@ -1170,7 +1180,7 @@ class LoLAV07Trainer:
                 step_start = time.monotonic()
 
                 if self.strategy != "deepspeed":
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 # ── Forward pass (with split timing) ────────────────
                 fwd_timing = {}
