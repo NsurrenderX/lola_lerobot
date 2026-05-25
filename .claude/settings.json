@@ -14,7 +14,8 @@
       "Read(//home/v-wenhuitan/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/transformers/models/qwen3_5/**)",
       "Read(//datassd_1T/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/transformers/models/qwen3_5/**)",
       "Read(//home/v-wenhuitan/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/deepspeed/runtime/zero/**)",
-      "Read(//datassd_1T/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/deepspeed/runtime/zero/**)"
+      "Read(//datassd_1T/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/deepspeed/runtime/zero/**)",
+      "Read(//datassd_1T/anaconda3/envs/lerobot-gcr3/lib/python3.10/site-packages/diffusers/models/transformers/**)"
     ]
   }
 }

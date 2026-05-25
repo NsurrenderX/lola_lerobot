@@ -1455,9 +1455,9 @@ class LoLAV07Trainer:
         else:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             if self.is_distributed:
-                self.model.module.load_state_dict(checkpoint["model_state_dict"])
+                self.model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
             else:
-                self.model.load_state_dict(checkpoint["model_state_dict"])
+                self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             self.global_step = checkpoint.get("step", 0)

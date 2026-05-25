@@ -293,7 +293,6 @@ class LoLA5StreamDoubleBlock(nn.Module):
             setattr(self, f'{prefix}_norm_k', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
             setattr(self, f'{prefix}_to_out', nn.Linear(self.inner_dim, dim, bias=bias))
             setattr(self, f'{prefix}_norm2', nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
-            setattr(self, f'{prefix}_modulation', Flux2Modulation(dim, mod_param_sets=2, bias=bias))
 
         self.ctx_shared_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=ctx_mlp_ratio, bias=bias)
 
@@ -307,7 +306,6 @@ class LoLA5StreamDoubleBlock(nn.Module):
         self.arm_to_out = nn.Linear(self.inner_dim, dim, bias=bias)
         self.arm_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.arm_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=arm_mlp_ratio, bias=bias)
-        self.arm_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=bias)
 
         # --- Target gripper expert ---
         self.grip_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -319,7 +317,6 @@ class LoLA5StreamDoubleBlock(nn.Module):
         self.grip_to_out = nn.Linear(self.inner_dim, dim, bias=bias)
         self.grip_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.grip_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=grip_mlp_ratio, bias=bias)
-        self.grip_modulation = Flux2Modulation(dim, mod_param_sets=2, bias=bias)
 
     def _ctx_qkv(self, prefix, hidden, mod):
         """Compute QKV for a context sub-stream."""
@@ -442,11 +439,12 @@ class LoLA5StreamSingleBlock(nn.Module):
     """
     def __init__(self, dim, num_attention_heads, attention_head_dim,
                  arm_mlp_ratio=4.0, grip_mlp_ratio=2.0, ctx_mlp_ratio=4.0,
-                 eps=1e-6, bias=False):
+                 eps=1e-6, bias=False, skip_ctx_ff: bool = False):
         super().__init__()
         self.num_heads = num_attention_heads
         self.head_dim = attention_head_dim
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.skip_ctx_ff = skip_ctx_ff
 
         # --- Context sub-streams: independent QKV, shared FFN ---
         for prefix in ['ctx_vlm', 'ctx_arm', 'ctx_grip']:
@@ -456,9 +454,9 @@ class LoLA5StreamSingleBlock(nn.Module):
             setattr(self, f'{prefix}_to_v', nn.Linear(dim, self.inner_dim, bias=bias))
             setattr(self, f'{prefix}_norm_q', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
             setattr(self, f'{prefix}_norm_k', nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True))
-            setattr(self, f'{prefix}_modulation', Flux2Modulation(dim, mod_param_sets=1, bias=bias))
 
-        self.ctx_shared_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=ctx_mlp_ratio, bias=bias)
+        if not skip_ctx_ff:
+            self.ctx_shared_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=ctx_mlp_ratio, bias=bias)
 
         # --- Target arm expert ---
         self.arm_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -468,7 +466,6 @@ class LoLA5StreamSingleBlock(nn.Module):
         self.arm_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
         self.arm_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
         self.arm_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=arm_mlp_ratio, bias=bias)
-        self.arm_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=bias)
 
         # --- Target gripper expert ---
         self.grip_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -478,7 +475,6 @@ class LoLA5StreamSingleBlock(nn.Module):
         self.grip_norm_q = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
         self.grip_norm_k = nn.RMSNorm(self.head_dim, eps=eps, elementwise_affine=True)
         self.grip_ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=grip_mlp_ratio, bias=bias)
-        self.grip_modulation = Flux2Modulation(dim, mod_param_sets=1, bias=bias)
 
     def forward(self, ctx_vlm_hidden, ctx_arm_hidden, ctx_grip_hidden,
                 arm_hidden, grip_hidden,
@@ -561,15 +557,19 @@ class LoLA5StreamSingleBlock(nn.Module):
 
         # 8. Parallel pattern: attn + FFN combined with single gate
         # Context: shared FFN on merged norms
-        ctx_merged_norm = torch.cat([ctx_norms[0][0], ctx_norms[1][0], ctx_norms[2][0]], dim=1)
-        ctx_ffn_out = self.ctx_shared_ff(ctx_merged_norm)
-        vlm_ffn = ctx_ffn_out[:, :ctx_vlm_len, :]
-        grip_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len:ctx_vlm_len + ctx_grip_len, :]
-        arm_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len + ctx_grip_len:, :]
-
-        vlm_combined = vlm_attn + vlm_ffn
-        grip_ctx_combined = grip_ctx_attn + grip_ctx_ffn
-        arm_ctx_combined = arm_ctx_attn + arm_ctx_ffn
+        if self.skip_ctx_ff:
+            vlm_combined = vlm_attn
+            grip_ctx_combined = grip_ctx_attn
+            arm_ctx_combined = arm_ctx_attn
+        else:
+            ctx_merged_norm = torch.cat([ctx_norms[0][0], ctx_norms[1][0], ctx_norms[2][0]], dim=1)
+            ctx_ffn_out = self.ctx_shared_ff(ctx_merged_norm)
+            vlm_ffn = ctx_ffn_out[:, :ctx_vlm_len, :]
+            grip_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len:ctx_vlm_len + ctx_grip_len, :]
+            arm_ctx_ffn = ctx_ffn_out[:, ctx_vlm_len + ctx_grip_len:, :]
+            vlm_combined = vlm_attn + vlm_ffn
+            grip_ctx_combined = grip_ctx_attn + grip_ctx_ffn
+            arm_ctx_combined = arm_ctx_attn + arm_ctx_ffn
 
         # Target: independent FFN
         arm_combined = arm_attn + self.arm_ff(arm_norm)
@@ -630,6 +630,7 @@ class LoLADiT(nn.Module):
             for _ in range(config.dit_double_layers)
         ])
 
+        num_single = config.dit_single_layers
         self.single_blocks = nn.ModuleList([
             LoLA5StreamSingleBlock(
                 dim=config.dit_hidden_size,
@@ -638,8 +639,9 @@ class LoLADiT(nn.Module):
                 arm_mlp_ratio=config.dit_arm_ffn_mult,
                 grip_mlp_ratio=config.dit_grip_ffn_mult,
                 ctx_mlp_ratio=config.dit_ctx_ffn_mult,
+                skip_ctx_ff=(i == num_single - 1),
             )
-            for _ in range(config.dit_single_layers)
+            for i in range(num_single)
         ])
 
         # Dual output heads: arm regression + gripper classification
