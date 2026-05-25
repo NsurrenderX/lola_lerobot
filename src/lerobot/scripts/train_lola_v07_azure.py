@@ -640,6 +640,106 @@ def make_collate_fn(static_max_len: int | None = None):
 
 
 # ----------------------------------------------------------------------
+# BF16 Optimizer Wrapper: FP32 master weights for DDP bf16 training
+# ----------------------------------------------------------------------
+class BF16OptimizerWrapper:
+    """Maintains fp32 master params alongside bf16 model params for DDP training.
+
+    Same pattern as DeepSpeed's BF16_Optimizer and FSDP's MixedPrecision:
+    optimizer operates entirely in fp32 on master params, updates are copied
+    back to bf16 model params after each step.
+
+    Compatible with DDP gradient_as_bucket_view=True and static_graph=True.
+    """
+
+    def __init__(self, optimizer: torch.optim.AdamW):
+        self.optimizer = optimizer
+        self.bf16_param_groups = []   # original bf16 param lists per group
+        self.fp32_master_param_groups = []  # fp32 master params per group
+        self.param_to_master = {}     # bf16 param -> fp32 master param
+
+        for i, group in enumerate(optimizer.param_groups):
+            bf16_params = list(group['params'])
+            self.bf16_param_groups.append(bf16_params)
+
+            fp32_masters = []
+            for p in bf16_params:
+                master = p.detach().clone().float().requires_grad_(True)
+                self.param_to_master[p] = master
+                fp32_masters.append(master)
+
+            self.fp32_master_param_groups.append(fp32_masters)
+            # Swap optimizer's param list to fp32 masters (keep all group metadata)
+            group['params'] = fp32_masters
+
+    @torch.no_grad()
+    def copy_grads_to_fp32(self):
+        """Cast bf16 DDP bucket-view grads to fp32 master param grads."""
+        for bf16_list in self.bf16_param_groups:
+            for p in bf16_list:
+                master = self.param_to_master[p]
+                if p.grad is not None:
+                    master.grad = p.grad.float()
+                else:
+                    master.grad = None
+
+    @torch.no_grad()
+    def clip_grad_norm(self, max_norm: float) -> torch.Tensor:
+        """Clip gradient norm on fp32 master params."""
+        fp32_params = [m for masters in self.fp32_master_param_groups for m in masters]
+        return torch.nn.utils.clip_grad_norm_(fp32_params, max_norm)
+
+    @torch.no_grad()
+    def step(self):
+        """Optimizer step on fp32 masters, then copy updates to bf16 model params."""
+        self.optimizer.step()
+        for bf16_list in self.bf16_param_groups:
+            for p in bf16_list:
+                p.data.copy_(self.param_to_master[p])
+
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = False):
+        """Zero bf16 DDP bucket-view grads and fp32 master grads."""
+        for bf16_list in self.bf16_param_groups:
+            for p in bf16_list:
+                if p.grad is not None:
+                    if set_to_none:
+                        p.grad = None
+                    else:
+                        p.grad.zero_()
+        for masters in self.fp32_master_param_groups:
+            for m in masters:
+                m.grad = None
+
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
+
+    def state_dict(self):
+        """Save optimizer state + fp32 master param values."""
+        return {
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'fp32_master_params': {
+                f"g{i}_p{j}": master.detach().cpu()
+                for i, masters in enumerate(self.fp32_master_param_groups)
+                for j, master in enumerate(masters)
+            },
+        }
+
+    def load_state_dict(self, state_dict: dict):
+        """Load optimizer state + fp32 master params, sync to bf16 model."""
+        self.optimizer.load_state_dict(state_dict['optimizer_state_dict'])
+        for i, masters in enumerate(self.fp32_master_param_groups):
+            for j, master in enumerate(masters):
+                key = f"g{i}_p{j}"
+                if key in state_dict['fp32_master_params']:
+                    master.data.copy_(state_dict['fp32_master_params'][key].to(master.device))
+        for bf16_list in self.bf16_param_groups:
+            for p in bf16_list:
+                p.data.copy_(self.param_to_master[p])
+
+
+# ----------------------------------------------------------------------
 # 训练器
 # ----------------------------------------------------------------------
 class LoLAV07Trainer:
@@ -719,6 +819,7 @@ class LoLAV07Trainer:
         self.policy = None
         self.model = None
         self.optimizer = None
+        self.bf16_optimizer = None
         self.scheduler = None
         self.model_engine = None  # DeepSpeed engine (set by _setup_deepspeed)
         self.preprocessor = None
@@ -997,21 +1098,24 @@ class LoLAV07Trainer:
             eps=1e-8,
         )
 
-        # Diagnostic: verify optimizer param group coverage
-        opt_total = sum(len(g["params"]) for g in self.optimizer.param_groups)
-        opt_params = sum(p.numel() for g in self.optimizer.param_groups for p in g["params"])
-        all_params = sum(p.numel() for p in self.policy.parameters())
-        _log(f"Optimizer param groups: {len(self.optimizer.param_groups)}, "
-             f"total params in optimizer: {opt_params:,} / {all_params:,}")
-        for i, g in enumerate(self.optimizer.param_groups):
-            n = sum(p.numel() for p in g["params"])
-            _log(f"  Group {i}: lr={g['lr']:.2e}, params={n:,}")
+        # DDP: wrap optimizer with FP32 master weights (bf16 optimizer states have
+        # only ~3.3 decimal digits vs ~7 in fp32, degrading Adam numerical stability)
+        self.bf16_optimizer = None
+        if self.strategy == "ddp" and self.use_bf16:
+            self.bf16_optimizer = BF16OptimizerWrapper(self.optimizer)
+            # After wrapping, optimizer.param_groups now reference fp32 masters
+            # foreach=True is safe (all params same dtype), scheduler metadata unchanged
+            _log(f"DDP: BF16OptimizerWrapper enabled, optimizer operates on fp32 master params")
 
-        # Diagnostic: check optimizer state dtype after first step
-        self._pending_optimizer_dtype_check = True
+        # Verify optimizer param group coverage
+        opt_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        all_params = sum(p.numel() for p in self.policy.parameters())
+        _log(f"Optimizer: {opt_params:,} / {all_params:,} params in optimizer")
 
         from torch.optim.lr_scheduler import OneCycleLR
         warmup_ratio = min(self.warmup_ratio, 0.1)
+        # Scheduler reads param_groups metadata (lr, initial_lr, betas) which is unchanged
+        # regardless of whether BF16OptimizerWrapper swapped params to fp32 masters
         self.scheduler = OneCycleLR(
             self.optimizer,
             max_lr=[group["lr"] for group in self.optimizer.param_groups],
@@ -1193,7 +1297,10 @@ class LoLAV07Trainer:
                 step_start = time.monotonic()
 
                 if self.strategy != "deepspeed":
-                    self.optimizer.zero_grad()
+                    if self.bf16_optimizer is not None:
+                        self.bf16_optimizer.zero_grad()
+                    else:
+                        self.optimizer.zero_grad()
 
                 # ── Forward pass (with split timing) ────────────────
                 fwd_timing = {}
@@ -1218,6 +1325,13 @@ class LoLAV07Trainer:
                 clip_start = time.monotonic()
                 if self.strategy == "deepspeed":
                     grad_norm = None  # DeepSpeed clips from config
+                elif self.bf16_optimizer is not None:
+                    # DDP+BF16OptimizerWrapper: cast bf16 grads -> fp32, clip on fp32 masters
+                    self.bf16_optimizer.copy_grads_to_fp32()
+                    if self.gradient_clip_val > 0:
+                        grad_norm = self.bf16_optimizer.clip_grad_norm(self.gradient_clip_val)
+                    else:
+                        grad_norm = None
                 elif self.gradient_clip_val > 0:
                     if not self.use_bf16:
                         self.scaler.unscale_(self.optimizer)
@@ -1236,6 +1350,8 @@ class LoLAV07Trainer:
                 opt_start = time.monotonic()
                 if self.strategy == "deepspeed":
                     self.model.step()
+                elif self.bf16_optimizer is not None:
+                    self.bf16_optimizer.step()
                 elif self.use_bf16:
                     self.optimizer.step()
                 else:
@@ -1249,22 +1365,21 @@ class LoLAV07Trainer:
 
                 self.global_step += 1
 
-                # Diagnostic: check optimizer state dtype after first step
-                if self._pending_optimizer_dtype_check and self.global_step == 1:
-                    self._pending_optimizer_dtype_check = False
+                # Optimizer state dtype diagnostic (all strategies, step 10)
+                if self.global_step == 10 and self.is_main_process:
                     dtypes_found = {}
                     for group in self.optimizer.param_groups:
                         for p in group["params"]:
                             if p in self.optimizer.state:
-                                state = self.optimizer.state[p]
-                                for key, val in state.items():
+                                for key, val in self.optimizer.state[p].items():
                                     if isinstance(val, torch.Tensor):
-                                        dtypes_found[str(val.dtype)] = dtypes_found.get(str(val.dtype), 0) + val.numel()
-                    if self.is_main_process:
-                        _log(f"Optimizer state dtype breakdown:")
-                        for dtype, count in dtypes_found.items():
-                            size_gb = count * (2 if 'bf16' in dtype or 'half' in dtype else 4) / 1e9
-                            _log(f"  {dtype}: {count:,} elements, ~{size_gb:.1f} GB")
+                                        d = str(val.dtype)
+                                        dtypes_found[d] = dtypes_found.get(d, 0) + val.numel()
+                    _log(f"[Step 10] Optimizer state dtype stats:")
+                    for dtype, count in dtypes_found.items():
+                        bytes_per = 4 if 'float32' in dtype else 2 if 'bfloat16' in dtype or 'half' in dtype else 1
+                        size_gb = count * bytes_per / 1e9
+                        _log(f"  {dtype}: {count:,} elements, ~{size_gb:.1f} GB")
 
                 update_s = time.monotonic() - step_start
                 batch_per_s = 1.0 / update_s if update_s > 0 else 0
@@ -1453,7 +1568,7 @@ class LoLAV07Trainer:
                 "step": step,
                 "epoch": self.current_epoch,
                 "model_state_dict": state_dict,
-                "optimizer_state_dict": self.optimizer.state_dict(),
+                "optimizer_state_dict": self.bf16_optimizer.state_dict() if self.bf16_optimizer else self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
             }, ckpt_path)
 
@@ -1498,7 +1613,10 @@ class LoLAV07Trainer:
                 self.model.module.load_state_dict(checkpoint["model_state_dict"], strict=False)
             else:
                 self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if self.bf16_optimizer is not None:
+                self.bf16_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            else:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             self.global_step = checkpoint.get("step", 0)
             self.current_epoch = checkpoint.get("epoch", 0)
