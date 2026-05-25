@@ -1007,6 +1007,9 @@ class LoLAV07Trainer:
             n = sum(p.numel() for p in g["params"])
             _log(f"  Group {i}: lr={g['lr']:.2e}, params={n:,}")
 
+        # Diagnostic: check optimizer state dtype after first step
+        self._pending_optimizer_dtype_check = True
+
         from torch.optim.lr_scheduler import OneCycleLR
         warmup_ratio = min(self.warmup_ratio, 0.1)
         self.scheduler = OneCycleLR(
@@ -1245,6 +1248,23 @@ class LoLAV07Trainer:
                     self.scheduler.step()
 
                 self.global_step += 1
+
+                # Diagnostic: check optimizer state dtype after first step
+                if self._pending_optimizer_dtype_check and self.global_step == 1:
+                    self._pending_optimizer_dtype_check = False
+                    dtypes_found = {}
+                    for group in self.optimizer.param_groups:
+                        for p in group["params"]:
+                            if p in self.optimizer.state:
+                                state = self.optimizer.state[p]
+                                for key, val in state.items():
+                                    if isinstance(val, torch.Tensor):
+                                        dtypes_found[str(val.dtype)] = dtypes_found.get(str(val.dtype), 0) + val.numel()
+                    if self.is_main_process:
+                        _log(f"Optimizer state dtype breakdown:")
+                        for dtype, count in dtypes_found.items():
+                            size_gb = count * (2 if 'bf16' in dtype or 'half' in dtype else 4) / 1e9
+                            _log(f"  {dtype}: {count:,} elements, ~{size_gb:.1f} GB")
 
                 update_s = time.monotonic() - step_start
                 batch_per_s = 1.0 / update_s if update_s > 0 else 0
