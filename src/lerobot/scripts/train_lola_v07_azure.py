@@ -1190,7 +1190,7 @@ class LoLAV07Trainer:
                 step_start = time.monotonic()
 
                 if self.strategy != "deepspeed":
-                    self.optimizer.zero_grad(set_to_none=True)
+                    self.optimizer.zero_grad()
 
                 # ── Forward pass (with split timing) ────────────────
                 fwd_timing = {}
