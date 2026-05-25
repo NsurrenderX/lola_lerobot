@@ -1113,7 +1113,7 @@ class LoLAV07Trainer:
         _log(f"Optimizer: {opt_params:,} / {all_params:,} params in optimizer")
 
         from torch.optim.lr_scheduler import OneCycleLR
-        warmup_ratio = min(self.warmup_ratio, 0.1)
+        warmup_ratio = min(self.config.warmup_pct, 0.5)
         # Scheduler reads param_groups metadata (lr, initial_lr, betas) which is unchanged
         # regardless of whether BF16OptimizerWrapper swapped params to fp32 masters
         self.scheduler = OneCycleLR(
