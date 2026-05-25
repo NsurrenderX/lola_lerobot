@@ -997,6 +997,16 @@ class LoLAV07Trainer:
             eps=1e-8,
         )
 
+        # Diagnostic: verify optimizer param group coverage
+        opt_total = sum(len(g["params"]) for g in self.optimizer.param_groups)
+        opt_params = sum(p.numel() for g in self.optimizer.param_groups for p in g["params"])
+        all_params = sum(p.numel() for p in self.policy.parameters())
+        _log(f"Optimizer param groups: {len(self.optimizer.param_groups)}, "
+             f"total params in optimizer: {opt_params:,} / {all_params:,}")
+        for i, g in enumerate(self.optimizer.param_groups):
+            n = sum(p.numel() for p in g["params"])
+            _log(f"  Group {i}: lr={g['lr']:.2e}, params={n:,}")
+
         from torch.optim.lr_scheduler import OneCycleLR
         warmup_ratio = min(self.warmup_ratio, 0.1)
         self.scheduler = OneCycleLR(
