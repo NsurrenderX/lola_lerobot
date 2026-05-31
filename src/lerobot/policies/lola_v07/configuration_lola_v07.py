@@ -45,3 +45,15 @@ class LoLAV07Config(LoLAConfig):
                 f"state_grip_bottleneck_dim ({self.state_grip_bottleneck_dim}) must be < "
                 f"dit_hidden_size ({self.dit_hidden_size})"
             )
+        # VLM dynamic unfreezing validation
+        if self.vlm_lr_mult <= 0:
+            raise ValueError(f"vlm_lr_mult ({self.vlm_lr_mult}) must be > 0")
+        if not self.train_vlm and self.vlm_unfreeze_v_loss_threshold > 0:
+            import warnings
+            warnings.warn(
+                f"vlm_unfreeze_v_loss_threshold={self.vlm_unfreeze_v_loss_threshold} is set but "
+                f"train_vlm=False. The threshold logic will be ignored — VLM will remain frozen. "
+                f"Set --train_vlm to enable dynamic VLM unfreezing.",
+                UserWarning,
+                stacklevel=2,
+            )

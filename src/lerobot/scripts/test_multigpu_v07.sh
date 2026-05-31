@@ -59,6 +59,13 @@ COMPLETED_TASKS_HISTORY_LEN=10
 TRANSITION_MASK_RATE=0.8
 MAX_TRANSITION_LEN=64
 
+# VLM dynamic unfreezing parameters
+VLM_UNFREEZE_V_LOSS_THRESHOLD=0.3
+VLM_LR_MULT=1.5
+
+# Special tokens
+USE_SPECIAL_TOKENS=true
+
 CKPT_DIR="/data_16T/deepseek/checkpoints/lola_v07"
 
 # 历史 action 加载参数
@@ -120,6 +127,8 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_v07_mul
     --state_grip_bottleneck_dim ${STATE_GRIP_BOTTLENECK_DIM} \
     --encoder_lr_mult ${ENCODER_LR_MULT} \
     --warmup_pct ${WARMUP_PCT} \
+    --vlm_unfreeze_v_loss_threshold ${VLM_UNFREEZE_V_LOSS_THRESHOLD} \
+    --vlm_lr_mult ${VLM_LR_MULT} \
     --task_text_template_version ${TASK_TEXT_TEMPLATE_VERSION} \
     --transition_mask_rate ${TRANSITION_MASK_RATE} \
     --max_transition_len ${MAX_TRANSITION_LEN} \
@@ -160,6 +169,11 @@ if [ "$GRADIENT_CHECKPOINTING" = false ]; then
 fi
 if [ "$COMPILE_MODEL" = true ]; then
     cmd="${cmd} --compile_model --compile_mode ${COMPILE_MODE}"
+fi
+
+# Special tokens
+if [ "$USE_SPECIAL_TOKENS" = true ]; then
+    cmd="${cmd} --use_special_tokens"
 fi
 
 # V2: completed tasks 参数

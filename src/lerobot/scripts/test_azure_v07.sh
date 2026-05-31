@@ -101,6 +101,13 @@ COMPLETED_TASKS_HISTORY_LEN=5
 TRANSITION_MASK_RATE=0.0
 MAX_TRANSITION_LEN=64
 
+# VLM dynamic unfreezing parameters
+VLM_UNFREEZE_V_LOSS_THRESHOLD=0.3
+VLM_LR_MULT=1.5
+
+# Special tokens
+USE_SPECIAL_TOKENS=false
+
 # 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
 NORM_MODE="zscore"
 NORM_MIN=-0.65
@@ -363,6 +370,18 @@ while [[ $# -gt 0 ]]; do
             MAX_TRANSITION_LEN="$2"
             shift 2
             ;;
+        --vlm_unfreeze_v_loss_threshold)
+            VLM_UNFREEZE_V_LOSS_THRESHOLD="$2"
+            shift 2
+            ;;
+        --vlm_lr_mult)
+            VLM_LR_MULT="$2"
+            shift 2
+            ;;
+        --use_special_tokens)
+            USE_SPECIAL_TOKENS=true
+            shift
+            ;;
 
         # 归一化参数
         --norm_mode)
@@ -498,6 +517,8 @@ if [ "$NNODES" -eq 1 ]; then
         --state_grip_bottleneck_dim ${STATE_GRIP_BOTTLENECK_DIM} \
         --encoder_lr_mult ${ENCODER_LR_MULT} \
         --warmup_pct ${WARMUP_PCT} \
+        --vlm_unfreeze_v_loss_threshold ${VLM_UNFREEZE_V_LOSS_THRESHOLD} \
+        --vlm_lr_mult ${VLM_LR_MULT} \
         --task_text_template_version ${TASK_TEXT_TEMPLATE_VERSION} \
         --transition_mask_rate ${TRANSITION_MASK_RATE} \
         --max_transition_len ${MAX_TRANSITION_LEN} \
@@ -543,6 +564,8 @@ else
         --state_grip_bottleneck_dim ${STATE_GRIP_BOTTLENECK_DIM} \
         --encoder_lr_mult ${ENCODER_LR_MULT} \
         --warmup_pct ${WARMUP_PCT} \
+        --vlm_unfreeze_v_loss_threshold ${VLM_UNFREEZE_V_LOSS_THRESHOLD} \
+        --vlm_lr_mult ${VLM_LR_MULT} \
         --task_text_template_version ${TASK_TEXT_TEMPLATE_VERSION} \
         --transition_mask_rate ${TRANSITION_MASK_RATE} \
         --max_transition_len ${MAX_TRANSITION_LEN} \
@@ -638,6 +661,11 @@ if [ "$STATIC_VLM_PADDING" = true ]; then
 fi
 if [ -n "$VLM_MAX_LENGTH" ]; then
     cmd="${cmd} --vlm_max_length ${VLM_MAX_LENGTH}"
+fi
+
+# Special tokens
+if [ "$USE_SPECIAL_TOKENS" = true ]; then
+    cmd="${cmd} --use_special_tokens"
 fi
 
 echo "Running: $cmd"

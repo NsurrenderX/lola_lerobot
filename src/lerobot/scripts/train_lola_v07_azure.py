@@ -834,6 +834,12 @@ class LoLAV07Trainer:
         self.best_loss = float("inf")
         self.interconnect_monitor = None
 
+        # VLM dynamic unfreezing state
+        self._vlm_unfrozen = False
+        self._vlm_delayed_unfreeze = False
+        if self.train_vlm and self.config.vlm_unfreeze_v_loss_threshold > 0:
+            self._vlm_delayed_unfreeze = True
+
     def setup_model(self):
         # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
         torch.backends.cuda.enable_cudnn_sdp(True)
@@ -858,6 +864,13 @@ class LoLAV07Trainer:
         # 冻结 VLM 参数
         if not self.train_vlm and hasattr(self.policy, "vlm"):
             _log("Freezing VLM parameters...")
+            for param in self.policy.vlm.parameters():
+                param.requires_grad = False
+            self.policy.vlm.eval()
+
+        # VLM delayed unfreeze: start frozen when threshold is set
+        if self.train_vlm and self._vlm_delayed_unfreeze:
+            _log(f"VLM starts frozen (delayed unfreeze enabled, threshold={self.config.vlm_unfreeze_v_loss_threshold})")
             for param in self.policy.vlm.parameters():
                 param.requires_grad = False
             self.policy.vlm.eval()
@@ -986,7 +999,7 @@ class LoLAV07Trainer:
         ]
         if self.policy.model.state_encoder is not None:
             trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        if self.train_vlm and hasattr(self.policy, "vlm"):
+        if self.train_vlm and hasattr(self.policy, "vlm") and not self._vlm_delayed_unfreeze:
             trainable_param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
         # Filter out params that don't require grad, then remove empty groups
         for group in trainable_param_groups:
@@ -1057,6 +1070,250 @@ class LoLAV07Trainer:
             if hasattr(self.policy, '_vlm_forward_mode'):
                 self.policy._vlm_forward_mode = "output_hidden_states"
 
+    def _unfreeze_vlm(self):
+        """Unfreeze VLM parameters and rebuild optimizer/scheduler for DDP/FSDP.
+
+        This method is called when v_loss drops below vlm_unfreeze_v_loss_threshold.
+        It:
+        1. Sets _vlm_unfrozen = True
+        2. Unfreezes VLM parameters (requires_grad=True, .train())
+        3. Switches VLM forward mode from hook to output_hidden_states
+        4. Enables VLM gradient checkpointing if configured
+        5. Rebuilds the ENTIRE optimizer + scheduler with VLM group included
+        6. Rebuilds DDP if strategy is DDP
+        """
+        _log(f"Unfreezing VLM at step {self.global_step} (v_loss < {self.config.vlm_unfreeze_v_loss_threshold})")
+        self._vlm_unfrozen = True
+        self._vlm_delayed_unfreeze = False
+
+        # 1. Unfreeze VLM parameters
+        for param in self.policy.vlm.parameters():
+            param.requires_grad = True
+        self.policy.vlm.train()
+
+        # 2. Switch VLM forward mode: hook → output_hidden_states
+        # When VLM is unfrozen, we must use output_hidden_states mode for proper
+        # gradient flow through gradient checkpointing (hook mode captures output
+        # without gradients, which is fine for frozen VLM but breaks when training)
+        if hasattr(self.policy, '_vlm_forward_mode') and self.policy._vlm_forward_mode == "hook":
+            # Remove existing hooks
+            if hasattr(self.policy, '_hook_handles'):
+                for handle in self.policy._hook_handles:
+                    handle.remove()
+                self.policy._hook_handles = []
+            self.policy._vlm_forward_mode = "output_hidden_states"
+            _log("VLM forward mode switched from hook to output_hidden_states")
+
+        # 3. Enable VLM gradient checkpointing if configured
+        if self.config.gradient_checkpointing:
+            self.policy.vlm.gradient_checkpointing_enable()
+            _log("VLM gradient checkpointing enabled")
+
+        # 4. Rebuild optimizer + scheduler with VLM group included
+        encoder_lr_mult = self.config.encoder_lr_mult
+        vlm_lr_mult = self.config.vlm_lr_mult
+        base_lr = self.learning_rate
+
+        param_groups = [
+            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+        ]
+        if self.policy.model.state_encoder is not None:
+            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+        # VLM group now included since unfrozen
+        param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
+
+        # Filter out params that don't require grad, then remove empty groups
+        for group in param_groups:
+            group["params"] = [p for p in group["params"] if p.requires_grad]
+        param_groups = [g for g in param_groups if g["params"]]
+
+        self.optimizer = torch.optim.AdamW(
+            param_groups,
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+        )
+
+        # Rebuild BF16OptimizerWrapper if needed
+        self.bf16_optimizer = None
+        if self.strategy == "ddp" and self.use_bf16:
+            self.bf16_optimizer = BF16OptimizerWrapper(self.optimizer)
+            _log("Rebuilt BF16OptimizerWrapper with VLM params included")
+
+        # Rebuild scheduler with remaining steps
+        remaining_steps = self.total_steps - self.global_step
+        if remaining_steps <= 0:
+            remaining_steps = 1  # minimum to avoid scheduler crash
+        from torch.optim.lr_scheduler import OneCycleLR
+        warmup_ratio = min(self.config.warmup_pct, 0.5)
+        self.scheduler = OneCycleLR(
+            self.optimizer,
+            max_lr=[group["lr"] for group in self.optimizer.param_groups],
+            total_steps=remaining_steps,
+            pct_start=warmup_ratio,
+            anneal_strategy="cos",
+        )
+        _log(f"Rebuilt optimizer + scheduler with VLM group (remaining_steps={remaining_steps})")
+
+        # 5. Rebuild DDP if strategy is DDP (needed because param graph changed)
+        if self.strategy == "ddp":
+            self.model = DDP(
+                self.policy,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+                static_graph=False,  # Must use static_graph=False after unfreezing new params
+            )
+            _log("Rebuilt DDP with VLM params included (static_graph=False for dynamic param graph)")
+
+        trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        _log(f"VLM unfrozen: {trainable_count:,} trainable params")
+
+    def _unfreeze_vlm_deepspeed(self):
+        """Unfreeze VLM for DeepSpeed: save model weights, rebuild engine, load weights back.
+
+        DeepSpeed ZeRO partitioning is set at engine initialization and cannot be
+        dynamically changed. To add VLM optimizer states, we must rebuild the
+        entire engine. This method:
+        1. Saves a checkpoint (model weights only) before rebuilding
+        2. Unfreezes VLM parameters (requires_grad=True, .train())
+        3. Switches VLM forward mode and enables gradient checkpointing
+        4. Rebuilds DeepSpeed engine with VLM group included
+        5. Loads model weights back from checkpoint
+        """
+        import tempfile
+        import deepspeed
+        _log(f"Unfreezing VLM for DeepSpeed at step {self.global_step}")
+
+        self._vlm_unfrozen = True
+        self._vlm_delayed_unfreeze = False
+
+        # 1. Unfreeze VLM parameters
+        for param in self.policy.vlm.parameters():
+            param.requires_grad = True
+        self.policy.vlm.train()
+
+        # 2. Switch VLM forward mode: hook → output_hidden_states
+        if hasattr(self.policy, '_vlm_forward_mode') and self.policy._vlm_forward_mode == "hook":
+            if hasattr(self.policy, '_hook_handles'):
+                for handle in self.policy._hook_handles:
+                    handle.remove()
+                self.policy._hook_handles = []
+            self.policy._vlm_forward_mode = "output_hidden_states"
+            _log("VLM forward mode switched from hook to output_hidden_states")
+
+        # 3. Enable VLM gradient checkpointing
+        if self.config.gradient_checkpointing:
+            ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
+            self.policy.vlm.gradient_checkpointing_enable()
+            vlm = self.policy.vlm
+            if hasattr(vlm, '_gradient_checkpointing_func'):
+                vlm._gradient_checkpointing_func = ds_fn
+            for module in vlm.modules():
+                if hasattr(module, '_gradient_checkpointing_func'):
+                    module._gradient_checkpointing_func = ds_fn
+            _log("VLM gradient checkpointing enabled with DeepSpeed checkpointing func")
+
+        # 4. Save model weights to temporary checkpoint (for restoring after rebuild)
+        tmp_dir = tempfile.mkdtemp(prefix="vlm_unfreeze_")
+        self.model_engine.save_checkpoint(
+            save_dir=tmp_dir,
+            tag="pre_unfreeze",
+            exclude_frozen_parameters=True,
+        )
+        _log(f"Saved pre-unfreeze checkpoint to {tmp_dir}/pre_unfreeze")
+
+        # 5. Rebuild DeepSpeed engine with VLM group included
+        encoder_lr_mult = self.config.encoder_lr_mult
+        vlm_lr_mult = self.config.vlm_lr_mult
+        base_lr = self.learning_rate
+
+        trainable_param_groups = [
+            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
+            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
+        ]
+        if self.policy.model.state_encoder is not None:
+            trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
+        # VLM group now included since unfrozen
+        trainable_param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
+        # Filter out params that don't require grad, then remove empty groups
+        for group in trainable_param_groups:
+            group["params"] = [p for p in group["params"] if p.requires_grad]
+        trainable_param_groups = [g for g in trainable_param_groups if g["params"]]
+
+        remaining_steps = self.total_steps - self.global_step
+        if remaining_steps <= 0:
+            remaining_steps = 1
+
+        ds_config = get_deepspeed_config(
+            learning_rate=base_lr,
+            weight_decay=self.weight_decay,
+            gradient_clip_val=self.gradient_clip_val,
+            train_vlm=True,  # Now VLM is trainable
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            reduce_bucket_size=self.deepspeed_reduce_bucket_size,
+            allgather_bucket_size=self.deepspeed_allgather_bucket_size,
+            zero_stage=self.deepspeed_zero_stage,
+        )
+        if self.deepspeed_config_path is not None:
+            import json
+            with open(self.deepspeed_config_path) as f:
+                custom_config = json.load(f)
+            ds_config.update(custom_config)
+
+        def lr_scheduler_callable(optimizer):
+            from torch.optim.lr_scheduler import OneCycleLR
+            return OneCycleLR(
+                optimizer,
+                max_lr=[group["lr"] for group in optimizer.param_groups],
+                total_steps=remaining_steps,
+                pct_start=min(self.warmup_ratio, 0.1),
+                anneal_strategy="cos",
+            )
+
+        model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=self.policy,
+            model_parameters=trainable_param_groups,
+            config=ds_config,
+            lr_scheduler=lr_scheduler_callable,
+            dist_init_required=False,
+        )
+
+        # 6. Load model weights back from checkpoint
+        load_path, _ = model_engine.load_checkpoint(
+            load_dir=tmp_dir,
+            tag="pre_unfreeze",
+            load_optimizer_states=False,  # New optimizer, don't load old states
+            load_lr_scheduler_states=False,  # New scheduler, don't load old states
+        )
+        if load_path is None:
+            _log("WARNING: Failed to load pre-unfreeze model weights, VLM weights may be random")
+
+        # Clean up temporary checkpoint
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # 7. Replace trainer references
+        self.model = model_engine
+        self.model_engine = model_engine
+        self.optimizer = optimizer
+        self.scheduler = lr_scheduler
+
+        # Re-configure DeepSpeed checkpointing
+        self._configure_deepspeed_checkpointing()
+
+        trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        _log(f"DeepSpeed VLM unfrozen: {trainable_count:,} trainable params, engine rebuilt")
+
     def setup_optimizer(self, total_steps: int | None = None):
         """设置优化器 - v07: Separate parameter groups with encoder LR multiplier"""
         if total_steps is None:
@@ -1083,7 +1340,7 @@ class LoLAV07Trainer:
         ]
         if self.policy.model.state_encoder is not None:
             param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        if self.train_vlm and hasattr(self.policy, "vlm"):
+        if self.train_vlm and hasattr(self.policy, "vlm") and not self._vlm_delayed_unfreeze:
             param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
 
         # Filter out params that don't require grad, then remove empty groups
@@ -1128,7 +1385,8 @@ class LoLAV07Trainer:
         """提取特殊字段"""
         special_data = {}
         keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length",
-                           "hist_states_full", "hist_states_mask", "hist_states_length"]
+                           "hist_states_full", "hist_states_mask", "hist_states_length",
+                           "n_transition", "n_transition_chunks"]
         for key in keys_to_extract:
             if key in batch:
                 special_data[key] = batch.pop(key)
@@ -1181,6 +1439,19 @@ class LoLAV07Trainer:
         # v07: v-loss alarm
         if loss_dict.get("v_loss", 0) > 1.0:
             _log(f"[WARNING] v_loss = {loss_dict['v_loss']:.4f} > 1.0 at step {self.global_step}")
+
+        # Conditional VLM unfreezing detection (requires train_vlm=True)
+        if self.train_vlm and not self._vlm_unfrozen and self.config.vlm_unfreeze_v_loss_threshold > 0:
+            v_loss_val = loss_dict.get("v_loss", float("inf"))
+            if self.is_distributed:
+                v_loss_tensor = torch.tensor([v_loss_val], device=self.device)
+                dist.all_reduce(v_loss_tensor, op=dist.ReduceOp.AVG)
+                v_loss_val = v_loss_tensor.item()
+            if v_loss_val < self.config.vlm_unfreeze_v_loss_threshold:
+                if self.strategy == "deepspeed":
+                    self._unfreeze_vlm_deepspeed()
+                else:
+                    self._unfreeze_vlm()
         t_model_fwd = time.monotonic() - t2
 
         if timing_dict is not None:
@@ -1524,11 +1795,13 @@ class LoLAV07Trainer:
 
     def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
         """保存 checkpoint"""
+        extra_state = {"vlm_unfrozen": self._vlm_unfrozen, "global_step": self.global_step}
         if self.strategy == "deepspeed":
             tag = f"step_{step:06d}" if not is_final else "final"
             client_state = {
                 "step": step,
                 "epoch": self.current_epoch,
+                "vlm_unfrozen": self._vlm_unfrozen,
             }
             self.model.save_checkpoint(
                 save_dir=ckpt_dir,
@@ -1550,13 +1823,14 @@ class LoLAV07Trainer:
                     "optimizer": optimizer_sd,
                     "step": [step],
                     "epoch": [self.current_epoch],
+                    "vlm_unfrozen": [self._vlm_unfrozen],
                 },
                 checkpoint_id=ckpt_path,
             )
             # scheduler 不支持 torch.distributed.checkpoint，单独用 torch.save 保存
             if self.is_main_process:
                 torch.save(
-                    {"scheduler_state_dict": self.scheduler.state_dict()},
+                    {"scheduler_state_dict": self.scheduler.state_dict(), **extra_state},
                     os.path.join(ckpt_path, "scheduler.pt"),
                 )
         else:
@@ -1570,12 +1844,15 @@ class LoLAV07Trainer:
                 "model_state_dict": state_dict,
                 "optimizer_state_dict": self.bf16_optimizer.state_dict() if self.bf16_optimizer else self.optimizer.state_dict(),
                 "scheduler_state_dict": self.scheduler.state_dict(),
+                "vlm_unfrozen": self._vlm_unfrozen,
+                "global_step": self.global_step,
             }, ckpt_path)
 
         _log(f"Checkpoint saved: {ckpt_path}")
 
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
+        vlm_unfrozen = False
         if self.strategy == "deepspeed":
             load_path, client_state = self.model.load_checkpoint(
                 load_dir=ckpt_path,
@@ -1586,6 +1863,7 @@ class LoLAV07Trainer:
                 raise ValueError(f"Failed to load DeepSpeed checkpoint from {ckpt_path}")
             self.global_step = client_state.get("step", 0)
             self.current_epoch = client_state.get("epoch", 0)
+            vlm_unfrozen = client_state.get("vlm_unfrozen", False)
         elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import load as load_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
@@ -1595,18 +1873,23 @@ class LoLAV07Trainer:
             # 用 list 包装 step，因为 int 是不可变对象，load 无法原地修改
             step_container = [0]
             epoch_container = [0]
+            vlm_unfrozen_container = [False]
             load_fsdp_checkpoint(
-                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container, "epoch": epoch_container},
+                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container, "epoch": epoch_container, "vlm_unfrozen": vlm_unfrozen_container},
                 checkpoint_id=ckpt_path,
             )
             set_state_dict(self.model, self.optimizer, model_state_dict=model_sd, optim_state_dict=optimizer_sd)
             self.global_step = step_container[0]
             self.current_epoch = epoch_container[0]
+            vlm_unfrozen = vlm_unfrozen_container[0]
             # 恢复 scheduler 状态
             scheduler_path = os.path.join(ckpt_path, "scheduler.pt")
             if os.path.exists(scheduler_path):
                 scheduler_ckpt = torch.load(scheduler_path, map_location=self.device)
                 self.scheduler.load_state_dict(scheduler_ckpt["scheduler_state_dict"])
+                # vlm_unfrozen may also be stored in scheduler.pt for FSDP
+                if "vlm_unfrozen" in scheduler_ckpt:
+                    vlm_unfrozen = scheduler_ckpt["vlm_unfrozen"]
         else:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             if self.is_distributed:
@@ -1620,6 +1903,15 @@ class LoLAV07Trainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             self.global_step = checkpoint.get("step", 0)
             self.current_epoch = checkpoint.get("epoch", 0)
+            vlm_unfrozen = checkpoint.get("vlm_unfrozen", False)
+
+        # Restore VLM unfreezing state: if VLM was unfrozen before checkpoint,
+        # we need to unfreeze it again (optimizer/scheduler rebuilt with VLM group)
+        if vlm_unfrozen and self.train_vlm:
+            if self.strategy == "deepspeed":
+                self._unfreeze_vlm_deepspeed()
+            else:
+                self._unfreeze_vlm()
 
         _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
@@ -1686,6 +1978,12 @@ def main():
                         help="VLM 学习率（仅 train_vlm=True 时生效）")
     parser.add_argument("--vlm_extract_layers", type=int, nargs="+", default=[8, 16, 24],
                         help="VLM 提取层索引")
+    parser.add_argument("--vlm_unfreeze_v_loss_threshold", type=float, default=0.3,
+                        help="v_loss threshold for dynamic VLM unfreezing (0 = disabled, only works with train_vlm=True)")
+    parser.add_argument("--vlm_lr_mult", type=float, default=1.5,
+                        help="VLM LR multiplier after unfreezing: peak_lr = base_lr * vlm_lr_mult")
+    parser.add_argument("--use_special_tokens", action="store_true",
+                        help="Insert 5 special tokens in DiT sequence (vlm_start/end, hist_start/end, previous_task_end)")
     parser.add_argument("--max_image_pixels", type=int, default=230400,
                         help="每张图片最大像素数（控制 visual token 数）")
     parser.add_argument("--min_image_pixels", type=int, default=65536,
@@ -1895,6 +2193,9 @@ def main():
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
         vlm_extract_layers=tuple(args.vlm_extract_layers),
+        vlm_unfreeze_v_loss_threshold=args.vlm_unfreeze_v_loss_threshold,
+        vlm_lr_mult=args.vlm_lr_mult,
+        use_special_tokens=args.use_special_tokens,
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
         gripper_loss_weight=args.gripper_loss_weight,

@@ -300,24 +300,33 @@ class LoLADataset(LeRobotDataset):
             item["completed_tasks"] = []
             item["completed_tasks_ann"] = []
 
-        # ── V2: Build history from two sources ────────────────────────────
+        # ── V2: Build history from two sources, SEPARATE padding/mask ────
         # Source 1: Transition history (pre-annotation) from npz
         # Source 2: Task history (current episode frames from parquet)
-        # Both are concatenated into one continuous sequence with token-level weighted mask.
+        # Each source is padded/masked independently to chunk_size multiples,
+        # then concatenated as [transition_padded | task_padded].
+        # This ensures chunk boundaries align so previous_task_end token
+        # can be inserted cleanly between transition chunks and task chunks.
 
+        chunk_size = self.action_chunk_size
+        max_total_len = self.max_history_length
+
+        # ── Step 1: Extract transition and task data ──
         transition_data = None
         transition_data_len = 0
         if self._hist_action_all is not None and ep_idx < len(self._hist_action_all):
             pre_len = int(self._hist_len_all[ep_idx])
             if self.history_type == "state":
-                transition_data = self._hist_state_all[ep_idx]  # [max_t, state_dim]
+                transition_data = self._hist_state_all[ep_idx]
             else:
-                transition_data = self._hist_action_all[ep_idx]  # [max_t, action_dim]
+                transition_data = self._hist_action_all[ep_idx]
             transition_data_len = pre_len
+            # Extract real (non-padded) portion
+            offset = transition_data.shape[0] - transition_data_len
+            transition_data = transition_data[offset:]
 
-        # Source 2: Task history (current episode frames from parquet)
         task_data = None
-        task_frame_count = idx - ep_start + 1  # frames from ep_start to idx (inclusive)
+        task_frame_count = idx - ep_start + 1
         if task_frame_count > 0:
             task_indices = list(range(ep_start, idx + 1))
             if self.history_type == "state":
@@ -327,85 +336,118 @@ class LoLADataset(LeRobotDataset):
                 task_data_dict = self._query_hf_dataset({"action": task_indices})
                 task_data = task_data_dict["action"]
 
-        # Concatenate into one continuous sequence
-        parts = []
-        if transition_data is not None and transition_data_len > 0:
-            # Extract only the real (non-padded) portion from pre-computed arrays
-            offset = transition_data.shape[0] - transition_data_len
-            parts.append(transition_data[offset:])
-        if task_data is not None:
-            parts.append(task_data)
-
-        if parts:
-            hist_data = torch.cat(parts, dim=0)
-        else:
-            dim = self.state_dim if self.history_type == "state" else self.action_dim
-            hist_data = torch.zeros(0, dim, dtype=torch.float32)
-
-        total_len = hist_data.shape[0]
-        hist_mask = torch.ones(total_len, dtype=torch.bool)
-
-        # Record the boundary: first transition_data_len frames are transition, rest are task
+        # ── Step 2: Truncate (prioritize truncating transition, keep task intact) ──
         n_transition = transition_data_len if transition_data is not None else 0
 
-        # Token-level (chunk-level) mask with weighted rate
-        chunk_size = self.action_chunk_size
-        if (self.transition_mask_rate > 0 or self.hist_action_token_drop_rate > 0) and total_len >= chunk_size:
-            num_chunks = total_len // chunk_size
-            for chunk_idx in range(num_chunks):
-                cs = chunk_idx * chunk_size
-                ce = cs + chunk_size
+        if transition_data is not None and n_transition > 0:
+            total_raw_len = n_transition + (task_data.shape[0] if task_data is not None else 0)
+            if total_raw_len > max_total_len:
+                # Truncate transition from left, keep task intact
+                task_len = task_data.shape[0] if task_data is not None else 0
+                max_transition_allowed = max_total_len - task_len
+                if max_transition_allowed <= 0:
+                    # Task alone exceeds max_history_length, drop all transition
+                    transition_data = None
+                    n_transition = 0
+                elif n_transition > max_transition_allowed:
+                    truncated = n_transition - max_transition_allowed
+                    transition_data = transition_data[truncated:]
+                    n_transition = max_transition_allowed
+            # If task still exceeds remaining space
+            if task_data is not None and task_data.shape[0] > max_total_len - n_transition:
+                task_data = task_data[-(max_total_len - n_transition):]
+        elif task_data is not None and task_data.shape[0] > max_total_len:
+            task_data = task_data[-max_total_len:]
 
-                # Count transition vs task frames in this chunk
-                t_count = min(ce, n_transition) - min(cs, n_transition)
-                k_count = chunk_size - t_count
-
-                # Weighted mask rate
-                if t_count > 0 and k_count > 0:
-                    weighted_rate = (t_count * self.transition_mask_rate + k_count * self.hist_action_token_drop_rate) / chunk_size
-                elif t_count > 0:
-                    weighted_rate = self.transition_mask_rate
+        # ── Step 3: Separate padding and mask ──
+        def _pad_to_chunk_size(data, mask, chunk_size, max_len):
+            """Left-pad data and mask to chunk_size multiple, truncate if exceeding max_len."""
+            if data.shape[0] == 0:
+                return data, mask, 0
+            padded_length = ((data.shape[0] + chunk_size - 1) // chunk_size) * chunk_size
+            if padded_length > max_len:
+                padded_length = (max_len // chunk_size) * chunk_size
+                data = data[-padded_length:]
+                mask = mask[-padded_length:]
+            pad_len = padded_length - data.shape[0]
+            if pad_len > 0:
+                dim = data.shape[1] if data.dim() > 1 else (self.state_dim if self.history_type == "state" else self.action_dim)
+                if data.dim() > 1:
+                    padding_data = torch.zeros(pad_len, dim, dtype=data.dtype)
                 else:
-                    weighted_rate = self.hist_action_token_drop_rate
+                    padding_data = torch.zeros(pad_len, dtype=data.dtype)
+                padding_mask = torch.zeros(pad_len, dtype=mask.dtype)
+                data = torch.cat([padding_data, data], dim=0)
+                mask = torch.cat([padding_mask, mask], dim=0)
+            return data, mask, padded_length
 
-                if weighted_rate > 0 and random.random() < weighted_rate:
-                    hist_mask[cs:ce] = False
-
-            actual_history_length = int(hist_mask.sum().item())
-            if actual_history_length == 0 and total_len > 0:
-                actual_history_length = chunk_size
-                hist_mask[:chunk_size] = True
+        # ── Transition part ──
+        if transition_data is not None and n_transition > 0:
+            t_mask = torch.ones(n_transition, dtype=torch.bool)
+            # Pure transition chunks: apply transition_mask_rate per chunk
+            if self.transition_mask_rate > 0 and n_transition >= chunk_size:
+                num_t_chunks = n_transition // chunk_size
+                for ci in range(num_t_chunks):
+                    if random.random() < self.transition_mask_rate:
+                        t_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                # Ensure at least one valid chunk
+                if int(t_mask.sum().item()) == 0 and n_transition >= chunk_size:
+                    t_mask[:chunk_size] = True
+            t_max = max_total_len  # transition can use up to full max_history_length
+            t_data, t_mask, t_padded_len = _pad_to_chunk_size(transition_data, t_mask, chunk_size, t_max)
+            n_transition_chunks = t_padded_len // chunk_size
         else:
-            actual_history_length = total_len
+            dim = self.state_dim if self.history_type == "state" else self.action_dim
+            t_data = torch.zeros(0, dim, dtype=torch.float32)
+            t_mask = torch.zeros(0, dtype=torch.bool)
+            n_transition_chunks = 0
+
+        # ── Task part ──
+        if task_data is not None and task_data.shape[0] > 0:
+            task_len = task_data.shape[0]
+            k_mask = torch.ones(task_len, dtype=torch.bool)
+            # Pure task chunks: apply hist_action_token_drop_rate per chunk
+            if self.hist_action_token_drop_rate > 0 and task_len >= chunk_size:
+                num_k_chunks = task_len // chunk_size
+                for ci in range(num_k_chunks):
+                    if random.random() < self.hist_action_token_drop_rate:
+                        k_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                # Ensure at least one valid chunk
+                if int(k_mask.sum().item()) == 0 and task_len >= chunk_size:
+                    k_mask[:chunk_size] = True
+            k_max = max_total_len - t_data.shape[0]  # remaining space after transition
+            k_data, k_mask, k_padded_len = _pad_to_chunk_size(task_data, k_mask, chunk_size, k_max)
+        else:
+            dim = self.state_dim if self.history_type == "state" else self.action_dim
+            k_data = torch.zeros(0, dim, dtype=torch.float32)
+            k_mask = torch.zeros(0, dtype=torch.bool)
+
+        # ── Step 4: Merge ──
+        # Concatenate as [transition_padded | task_padded]
+        if t_data.shape[0] > 0 and k_data.shape[0] > 0:
+            hist_data = torch.cat([t_data, k_data], dim=0)
+            hist_mask = torch.cat([t_mask, k_mask], dim=0)
+        elif t_data.shape[0] > 0:
+            hist_data = t_data
+            hist_mask = t_mask
+        elif k_data.shape[0] > 0:
+            hist_data = k_data
+            hist_mask = k_mask
+        else:
+            dim = self.state_dim if self.history_type == "state" else self.action_dim
+            hist_data = torch.zeros(chunk_size, dim, dtype=torch.float32)
+            hist_mask = torch.zeros(chunk_size, dtype=torch.bool)
 
         # Zero out masked entries in data
         hist_data = hist_data * hist_mask.unsqueeze(-1)
-
-        # Truncate from left to max_history_length
-        if hist_data.shape[0] > self.max_history_length:
-            hist_data = hist_data[-self.max_history_length:]
-            hist_mask = hist_mask[-self.max_history_length:]
-            actual_history_length = int(hist_mask.sum().item())
-
-        # Pad to action_chunk_size multiple (left-padding with zeros)
-        padded_length = ((hist_data.shape[0] + chunk_size - 1) // chunk_size) * chunk_size
-        if padded_length > self.max_history_length:
-            padded_length = (self.max_history_length // chunk_size) * chunk_size
-        pad_len = padded_length - hist_data.shape[0]
-        if pad_len > 0:
-            dim = hist_data.shape[1] if hist_data.dim() > 1 else (self.state_dim if self.history_type == "state" else self.action_dim)
-            if hist_data.dim() > 1:
-                padding_data = torch.zeros(pad_len, dim, dtype=hist_data.dtype)
-            else:
-                padding_data = torch.zeros(pad_len, dtype=hist_data.dtype)
-            padding_mask = torch.zeros(pad_len, dtype=torch.bool)
-            hist_data = torch.cat([padding_data, hist_data], dim=0)
-            hist_mask = torch.cat([padding_mask, hist_mask], dim=0)
+        actual_history_length = int(hist_mask.sum().item())
 
         hist_key_prefix = "hist_states" if self.history_type == "state" else "hist_actions"
         item[f"{hist_key_prefix}_full"] = hist_data
         item[f"{hist_key_prefix}_mask"] = hist_mask
         item[f"{hist_key_prefix}_length"] = torch.tensor(actual_history_length, dtype=torch.long)
+        item["n_transition"] = torch.tensor(n_transition, dtype=torch.long)
+        item["n_transition_chunks"] = torch.tensor(n_transition_chunks, dtype=torch.long)
 
         # Normalization
         if self.norm_action in (True, "minmax", "robovlm"):

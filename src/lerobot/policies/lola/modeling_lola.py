@@ -615,6 +615,13 @@ class LoLADiT(nn.Module):
         self.arm_target_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.grip_target_modality_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
 
+        # 5 Special Token Embeddings (used when config.use_special_tokens=True)
+        self.vlm_start_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.vlm_end_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.hist_start_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.hist_end_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.previous_task_end_emb = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+
         # 5-Stream Transformer Blocks
         attention_head_dim = config.dit_hidden_size // config.dit_num_heads
 
@@ -703,7 +710,7 @@ class LoLADiT(nn.Module):
 
     def forward(self, target_actions, hist_actions, vlm_features, empty_emb, timestep,
                 hist_actions_mask=None, vlm_attention_mask=None, return_chunks: bool = False,
-                use_gradient_checkpointing: bool = False):
+                use_gradient_checkpointing: bool = False, joint_attention_kwargs: dict = None):
         b = target_actions.shape[0]
 
         # Split target_actions into arm (first half) and gripper (second half)
@@ -741,8 +748,11 @@ class LoLADiT(nn.Module):
 
         # Build attention mask
         # Sequence order: [ctx_vlm, ctx_grip, ctx_arm, target_grip, target_arm]
-        joint_attention_kwargs = {}
-        if hist_actions_mask is not None or vlm_attention_mask is not None:
+        if joint_attention_kwargs is None:
+            joint_attention_kwargs = {}
+        # If attention_mask is already provided (e.g., from LoLAV07Pytorch with special tokens),
+        # skip the internal mask construction
+        if 'attention_mask' not in joint_attention_kwargs and (hist_actions_mask is not None or vlm_attention_mask is not None):
             vlm_len = vlm_features.shape[1]
             arm_hist_len = arm_hist.shape[1]
             grip_hist_len = grip_hist.shape[1]

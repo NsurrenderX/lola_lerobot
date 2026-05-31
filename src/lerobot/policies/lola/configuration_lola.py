@@ -81,6 +81,9 @@ class LoLAConfig(PreTrainedConfig):
     # VLM training settings (for two-stage training)
     train_vlm: bool = False  # Whether to train VLM (default: False, VLM is frozen)
     vlm_lr: float = 1e-6  # Learning rate for VLM when train_vlm=True (lower than DiT lr)
+    vlm_unfreeze_v_loss_threshold: float = 0.3  # v_loss < threshold 时动态解冻 VLM（0 = 禁用自动解冻；仅在 train_vlm=True 时生效）
+    vlm_lr_mult: float = 1.5  # VLM 解冻后峰值 LR = base_lr × 此倍率
+    use_special_tokens: bool = False  # 是否在 DiT 序列中插入 5 个特殊 token（vlm_start/end, hist_start/end, previous_task_end）
     
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None

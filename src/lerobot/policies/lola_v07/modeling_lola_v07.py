@@ -370,10 +370,15 @@ class LoLAV07Pytorch(nn.Module):
         return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
-                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None):
+                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None,
+                n_transition_chunks=0, n_transition_chunks_batch=None):
         """Training forward with Latent Flow Matching.
 
         v-loss is computed in Bottleneck latent space (256D/128D), not 1024D.
+
+        Args:
+            n_transition_chunks: number of transition chunks in history (for previous_task_end placement)
+            n_transition_chunks_batch: per-sample [B] tensor for attention mask construction
         """
         b = target_actions.shape[0]
         device = target_actions.device
@@ -444,14 +449,148 @@ class LoLAV07Pytorch(nn.Module):
             z_t_grip_dit = self.action_encoder.grip_dec(z_t_grip)
         z_t_dit = torch.cat([z_t_arm_dit.to(target_dtype), z_t_grip_dit.to(target_dtype)], dim=1)
 
-        # 7. DiT forward (1024D, unchanged interface)
-        pred_z0_dit = self.dit(
-            z_t_dit, hist_chunks, vlm_features, empty_emb, time,
-            hist_actions_mask=hist_chunks_mask,
-            vlm_attention_mask=vlm_attention_mask,
-            return_chunks=True,
-            use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
-        )
+        # 7. DiT forward with optional special tokens
+        use_st = self.config.use_special_tokens
+
+        # ── Split hist_chunks into arm/grip halves ──
+        num_hist_chunks = hist_chunks.shape[1] // 2
+        arm_hist = hist_chunks[:, :num_hist_chunks, :]
+        grip_hist = hist_chunks[:, num_hist_chunks:, :]
+
+        # ── Special token concatenation (all done here, DiT receives pre-assembled sequences) ──
+        # Also build corresponding attention masks for each stream
+
+        # VLM attention mask preprocessing
+        if vlm_attention_mask is not None:
+            vlm_mask = vlm_attention_mask[:, :-1].bool()  # exclude empty_token
+        else:
+            vlm_mask = torch.ones(b, vlm_features.shape[1], dtype=torch.bool, device=device)
+
+        # Hist mask preprocessing (chunk-level, per-sample)
+        arm_hist_mask_base = None
+        grip_hist_mask_base = None
+        if hist_chunks_mask is not None:
+            hist_mask_bool = hist_chunks_mask.bool()
+            arm_hist_mask_base = hist_mask_bool[:, :num_hist_chunks]
+            grip_hist_mask_base = hist_mask_bool[:, num_hist_chunks:]
+        else:
+            arm_hist_mask_base = torch.ones(b, num_hist_chunks, dtype=torch.bool, device=device)
+            grip_hist_mask_base = torch.ones(b, num_hist_chunks, dtype=torch.bool, device=device)
+
+        # Build the final sequences and masks
+        if use_st:
+            # ── ctx_vlm stream: vlm_start + vlm_features + vlm_end ──
+            vlm_stream = torch.cat([
+                self.dit.vlm_start_emb.expand(b, -1, -1),
+                vlm_features,
+                self.dit.vlm_end_emb.expand(b, -1, -1),
+            ], dim=1)
+            vlm_stream_mask = torch.cat([
+                torch.ones(b, 1, dtype=torch.bool, device=device),  # vlm_start
+                vlm_mask,
+                torch.ones(b, 1, dtype=torch.bool, device=device),  # vlm_end
+            ], dim=1)
+
+            # ── ctx_arm/ctx_grip streams: hist_start + [transition_chunks + previous_task_end + task_chunks] + hist_end ──
+            max_n_tc = n_transition_chunks  # already batch-max from Policy layer
+            n_tc_batch = n_transition_chunks_batch  # [B] tensor for per-sample mask
+
+            if max_n_tc > 0:
+                # Split into transition and task chunks
+                arm_transition = arm_hist[:, :max_n_tc, :]
+                arm_task = arm_hist[:, max_n_tc:, :]
+                grip_transition = grip_hist[:, :max_n_tc, :]
+                grip_task = grip_hist[:, max_n_tc:, :]
+
+                # Per-sample transition validity mask [B, max_n_tc]
+                tc_range = torch.arange(max_n_tc, device=device).unsqueeze(0)  # [1, max_n_tc]
+                tc_valid = tc_range < n_tc_batch.unsqueeze(1)  # [B, max_n_tc]
+
+                # previous_task_end validity: per-sample, only if n_tc > 0 for that sample
+                pte_valid = (n_tc_batch > 0)  # [B]
+
+                # Arm stream assembly
+                arm_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    arm_transition,
+                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    arm_task,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                arm_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
+                    tc_valid,                                          # transition chunks (per-sample)
+                    pte_valid.unsqueeze(1),                            # previous_task_end
+                    arm_hist_mask_base[:, max_n_tc:],                 # task chunks
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
+                ], dim=1)
+
+                # Grip stream assembly (symmetric)
+                grip_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    grip_transition,
+                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    grip_task,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                grip_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
+                    tc_valid,                                          # transition chunks (per-sample)
+                    pte_valid.unsqueeze(1),                            # previous_task_end
+                    grip_hist_mask_base[:, max_n_tc:],                 # task chunks
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
+                ], dim=1)
+            else:
+                # No transition data: hist_start + all chunks + hist_end (no previous_task_end)
+                arm_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    arm_hist,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                arm_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
+                    arm_hist_mask_base,                                  # all chunks
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
+                ], dim=1)
+
+                grip_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    grip_hist,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                grip_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
+                    grip_hist_mask_base,                                  # all chunks
+                    torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
+                ], dim=1)
+
+            # Reassemble hist_actions for DiT: [arm_stream | grip_stream] in the standard order
+            # DiT expects: hist_actions = [arm_half, grip_half] concatenated along dim=1
+            hist_actions_for_dit = torch.cat([arm_stream, grip_stream], dim=1)
+            # Build full mask in DiT's expected order: [vlm, grip_hist, arm_hist, grip_target, arm_target]
+            # (matching LoLADiT.forward's attention mask concatenation order)
+            grip_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
+            arm_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
+            full_mask = torch.cat([vlm_stream_mask, grip_stream_mask, arm_stream_mask,
+                                   grip_target_mask, arm_target_mask], dim=1)
+
+            pred_z0_dit = self.dit(
+                z_t_dit, hist_actions_for_dit, vlm_stream, empty_emb, time,
+                hist_actions_mask=None,  # mask is passed via joint_attention_kwargs
+                vlm_attention_mask=None,
+                return_chunks=True,
+                use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
+                joint_attention_kwargs={'attention_mask': full_mask},
+            )
+        else:
+            # No special tokens: use standard DiT forward (unchanged)
+            pred_z0_dit = self.dit(
+                z_t_dit, hist_chunks, vlm_features, empty_emb, time,
+                hist_actions_mask=hist_chunks_mask,
+                vlm_attention_mask=vlm_attention_mask,
+                return_chunks=True,
+                use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
+            )
 
         # 8. DiT -> Latent (FP32 for dit_to_latent precision, output to BF16)
         num_chunks = pred_z0_dit.shape[1] // 2
@@ -523,8 +662,13 @@ class LoLAV07Pytorch(nn.Module):
         }
 
     @torch.no_grad()
-    def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None):
-        """Inference: Euler integration in latent space."""
+    def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None,
+                       n_transition_chunks=None):
+        """Inference: Euler integration in latent space.
+
+        Args:
+            n_transition_chunks: number of transition chunks (None = auto-detect 0)
+        """
         b = hist_actions.shape[0]
         device = hist_actions.device
 
@@ -554,7 +698,100 @@ class LoLAV07Pytorch(nn.Module):
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()
             hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)
 
-        # 1. Initial noise in latent space
+        # Handle n_transition_chunks default
+        if n_transition_chunks is None:
+            n_transition_chunks = 0
+
+        # ── Special token handling for inference ──
+        use_st = self.config.use_special_tokens
+
+        if use_st:
+            num_hist_chunks = hist_chunks.shape[1] // 2
+            arm_hist = hist_chunks[:, :num_hist_chunks, :]
+            grip_hist = hist_chunks[:, num_hist_chunks:, :]
+
+            # VLM mask
+            vlm_mask = torch.ones(b, vlm_features.shape[1], dtype=torch.bool, device=device)
+
+            # Hist mask (chunk-level)
+            if hist_chunks_mask is not None:
+                hist_mask_bool = hist_chunks_mask.bool()
+                arm_hist_mask_base = hist_mask_bool[:, :num_hist_chunks]
+                grip_hist_mask_base = hist_mask_bool[:, num_hist_chunks:]
+            else:
+                arm_hist_mask_base = torch.ones(b, num_hist_chunks, dtype=torch.bool, device=device)
+                grip_hist_mask_base = torch.ones(b, num_hist_chunks, dtype=torch.bool, device=device)
+
+            # VLM stream: vlm_start + vlm_features + vlm_end
+            vlm_stream = torch.cat([
+                self.dit.vlm_start_emb.expand(b, -1, -1),
+                vlm_features,
+                self.dit.vlm_end_emb.expand(b, -1, -1),
+            ], dim=1)
+            vlm_stream_mask = torch.cat([
+                torch.ones(b, 1, dtype=torch.bool, device=device),
+                vlm_mask,
+                torch.ones(b, 1, dtype=torch.bool, device=device),
+            ], dim=1)
+
+            # Hist streams with special tokens
+            if n_transition_chunks > 0:
+                arm_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    arm_hist[:, :n_transition_chunks, :],
+                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    arm_hist[:, n_transition_chunks:, :],
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                arm_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    arm_hist_mask_base[:, :n_transition_chunks],
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    arm_hist_mask_base[:, n_transition_chunks:],
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                ], dim=1)
+                grip_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    grip_hist[:, :n_transition_chunks, :],
+                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    grip_hist[:, n_transition_chunks:, :],
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                grip_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    grip_hist_mask_base[:, :n_transition_chunks],
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    grip_hist_mask_base[:, n_transition_chunks:],
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                ], dim=1)
+            else:
+                arm_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    arm_hist,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                arm_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    arm_hist_mask_base,
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                ], dim=1)
+                grip_stream = torch.cat([
+                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    grip_hist,
+                    self.dit.hist_end_emb.expand(b, -1, -1),
+                ], dim=1)
+                grip_stream_mask = torch.cat([
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    grip_hist_mask_base,
+                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                ], dim=1)
+
+            hist_actions_for_dit = torch.cat([arm_stream, grip_stream], dim=1)
+        else:
+            vlm_stream = vlm_features
+            hist_actions_for_dit = hist_chunks
+            hist_chunks_mask_for_dit = hist_chunks_mask
+            vlm_attention_mask_for_dit = None  # will use default VLM mask in DiT
         predict_chunks_len = self.config.pred_chunk_size // self.config.action_chunk_size
         arm_btl = self.config.action_bottleneck_dim
         grip_btl = self.config.grip_bottleneck_dim
@@ -575,16 +812,36 @@ class LoLAV07Pytorch(nn.Module):
             z_t_dit = torch.cat([z_t_arm_dit.to(target_dtype), z_t_grip_dit.to(target_dtype)], dim=1)
 
             # 3. DiT forward
-            pred_z0_dit = self.dit(
-                target_actions=z_t_dit,
-                hist_actions=hist_chunks,
-                vlm_features=vlm_features,
-                empty_emb=empty_emb,
-                timestep=expanded_time,
-                hist_actions_mask=hist_chunks_mask,
-                return_chunks=True,
-                use_gradient_checkpointing=False,
-            )
+            if use_st:
+                # Build full mask for special token mode
+                grip_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
+                arm_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
+                full_mask = torch.cat([vlm_stream_mask, grip_stream_mask, arm_stream_mask,
+                                       grip_target_mask, arm_target_mask], dim=1)
+                pred_z0_dit = self.dit(
+                    target_actions=z_t_dit,
+                    hist_actions=hist_actions_for_dit,
+                    vlm_features=vlm_stream,
+                    empty_emb=empty_emb,
+                    timestep=expanded_time,
+                    hist_actions_mask=None,
+                    vlm_attention_mask=None,
+                    return_chunks=True,
+                    use_gradient_checkpointing=False,
+                    joint_attention_kwargs={'attention_mask': full_mask},
+                )
+            else:
+                pred_z0_dit = self.dit(
+                    target_actions=z_t_dit,
+                    hist_actions=hist_actions_for_dit,
+                    vlm_features=vlm_stream,
+                    empty_emb=empty_emb,
+                    timestep=expanded_time,
+                    hist_actions_mask=hist_chunks_mask_for_dit,
+                    vlm_attention_mask=vlm_attention_mask_for_dit,
+                    return_chunks=True,
+                    use_gradient_checkpointing=False,
+                )
 
             # 4. DiT -> Latent (FP32 for dit_to_latent precision)
             num = pred_z0_dit.shape[1] // 2
@@ -906,6 +1163,15 @@ class LoLAV07Policy(PreTrainedPolicy):
             or batch.get("observation.language.attention_mask", None)
         )
 
+        # Extract n_transition_chunks for special token placement
+        n_transition_chunks_batch = batch.get("n_transition_chunks", None)
+        max_n_tc = 0
+        if n_transition_chunks_batch is not None and isinstance(n_transition_chunks_batch, torch.Tensor):
+            max_n_tc = int(n_transition_chunks_batch.max())
+            n_transition_chunks_batch = n_transition_chunks_batch.to(self.device)
+        else:
+            n_transition_chunks_batch = torch.tensor([0], dtype=torch.long, device=self.device)
+
         # v07: do NOT convert hist_actions/target_actions to self.dtype here;
         # LoLAV07Pytorch.forward() handles FP32 isolation for encoders internally.
         if hist_actions_mask is not None:
@@ -920,6 +1186,8 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask=hist_actions_mask,
             vlm_attention_mask=vlm_attention_mask,
             time=time,
+            n_transition_chunks=max_n_tc,
+            n_transition_chunks_batch=n_transition_chunks_batch,
         )
 
         loss = losses["total_loss"]
@@ -943,10 +1211,18 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask = hist_actions_mask.to(self.dtype)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
 
+        # Extract n_transition_chunks for special token placement (CALVIN inference)
+        n_transition_chunks = batch.get("n_transition_chunks", None)
+        if n_transition_chunks is not None and isinstance(n_transition_chunks, torch.Tensor):
+            n_transition_chunks = int(n_transition_chunks.max())  # batch max
+        else:
+            n_transition_chunks = None  # default: auto-detect 0
+
         actions = self.model.sample_actions(
             hidden_states_all_layers=hidden_states_all_layers,
             hist_actions=hist_actions,
             hist_actions_mask=hist_actions_mask,
+            n_transition_chunks=n_transition_chunks,
         )
         return actions
 
