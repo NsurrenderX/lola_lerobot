@@ -1178,22 +1178,28 @@ class LoLAV07Trainer:
         _log(f"VLM unfrozen: {trainable_count:,} trainable params")
 
     def _unfreeze_vlm_deepspeed(self):
-        """Unfreeze VLM for DeepSpeed: extract weights, rebuild engine, restore weights.
+        """Unfreeze VLM for DeepSpeed: extract weights, destroy old hooks, rebuild engine, restore weights.
 
         DeepSpeed ZeRO partitioning is set at engine initialization and cannot be
         dynamically changed. To add VLM optimizer states, we must rebuild the
         entire engine. This method:
-        1. Extracts all model weights (including frozen VLM) via module_state_dict()
-        2. Unfreezes VLM parameters (requires_grad=True, .train())
-        3. Switches VLM forward mode and enables gradient checkpointing
-        4. Rebuilds DeepSpeed engine with VLM group included
-        5. Restores model weights directly via load_state_dict()
+        1. Extracts all model weights (including frozen VLM) via named_parameters()
+        2. Destroys old engine (removes ZeRO-2 gradient hooks from parameters)
+        3. Unfreezes VLM parameters (requires_grad=True, .train())
+        4. Switches VLM forward mode and enables gradient checkpointing
+        5. Rebuilds DeepSpeed engine with VLM group included
+        6. Restores model weights directly via data.copy_()
+        7. Replaces trainer references and re-configures checkpointing
 
         This approach avoids the save_checkpoint/load_checkpoint roundtrip which
         breaks when exclude_frozen_parameters=True (the saved checkpoint lacks
         VLM params, so the new engine can't load them). For ZeRO-2, parameters
-        are NOT partitioned across ranks, so module_state_dict() returns complete
+        are NOT partitioned across ranks, so named_parameters() returns complete
         weights on each rank — no disk I/O needed.
+
+        The old engine must be destroyed before rebuilding to remove ZeRO-2's
+        register_post_accumulate_grad_hook from parameters; otherwise both old
+        and new hooks fire during backward, causing double gradient reduction.
         """
         import deepspeed
         _log(f"Unfreezing VLM for DeepSpeed at step {self.global_step}")
@@ -1207,15 +1213,22 @@ class LoLAV07Trainer:
             state_dict = {k: v.clone() for k, v in self.model_engine.module.named_parameters()}
         _log(f"Extracted {len(state_dict)} param tensors from old engine for weight restoration")
 
+        # 2. Destroy old engine to remove ZeRO-2 gradient hooks from parameters.
+        #    Without this, the old hooks remain on parameters and the new engine
+        #    adds its own hooks, causing double gradient reduction:
+        #    "The parameter X has already been reduced. Gradient computed twice."
+        self.model_engine.destroy()
+        _log("Destroyed old DeepSpeed engine (removed gradient hooks)")
+
         self._vlm_unfrozen = True
         self._vlm_delayed_unfreeze = False
 
-        # 2. Unfreeze VLM parameters
+        # 3. Unfreeze VLM parameters
         for param in self.policy.vlm.parameters():
             param.requires_grad = True
         self.policy.vlm.train()
 
-        # 3. Switch VLM forward mode: hook → output_hidden_states
+        # 4. Switch VLM forward mode: hook → output_hidden_states
         if hasattr(self.policy, '_vlm_forward_mode') and self.policy._vlm_forward_mode == "hook":
             if hasattr(self.policy, '_hook_handles'):
                 for handle in self.policy._hook_handles:
@@ -1224,7 +1237,7 @@ class LoLAV07Trainer:
             self.policy._vlm_forward_mode = "output_hidden_states"
             _log("VLM forward mode switched from hook to output_hidden_states")
 
-        # 4. Enable VLM gradient checkpointing
+        # 5. Enable VLM gradient checkpointing
         if self.config.gradient_checkpointing:
             ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
             self.policy.vlm.gradient_checkpointing_enable()
@@ -1236,7 +1249,7 @@ class LoLAV07Trainer:
                     module._gradient_checkpointing_func = ds_fn
             _log("VLM gradient checkpointing enabled with DeepSpeed checkpointing func")
 
-        # 5. Rebuild DeepSpeed engine with VLM group included
+        # 6. Rebuild DeepSpeed engine with VLM group included
         encoder_lr_mult = self.config.encoder_lr_mult
         vlm_lr_mult = self.config.vlm_lr_mult
         base_lr = self.learning_rate
@@ -1296,7 +1309,7 @@ class LoLAV07Trainer:
             dist_init_required=False,
         )
 
-        # 6. Restore model weights directly (no disk I/O, no checkpoint format mismatch)
+        # 7. Restore model weights directly (no disk I/O, no checkpoint format mismatch)
         #    DeepSpeed.initialize() may modify parameter objects (e.g. flatten for ZeRO-3),
         #    so we restore by name matching on the module's state_dict.
         current_state = dict(model_engine.module.named_parameters())
@@ -1310,7 +1323,7 @@ class LoLAV07Trainer:
         unexpected = len(current_state) - restored
         _log(f"Weight restoration: {restored} params restored, {missing} missing, {unexpected} unexpected")
 
-        # 7. Replace trainer references
+        # 8. Replace trainer references
         self.model = model_engine
         self.model_engine = model_engine
         self.optimizer = optimizer
