@@ -1175,30 +1175,44 @@ class LoLAV07Trainer:
         _log(f"VLM unfrozen: {trainable_count:,} trainable params")
 
     def _unfreeze_vlm_deepspeed(self):
-        """Unfreeze VLM for DeepSpeed: save model weights, rebuild engine, load weights back.
+        """Unfreeze VLM for DeepSpeed: extract weights, rebuild engine, restore weights.
 
         DeepSpeed ZeRO partitioning is set at engine initialization and cannot be
         dynamically changed. To add VLM optimizer states, we must rebuild the
         entire engine. This method:
-        1. Saves a checkpoint (model weights only) before rebuilding
+        1. Extracts all model weights (including frozen VLM) via module_state_dict()
         2. Unfreezes VLM parameters (requires_grad=True, .train())
         3. Switches VLM forward mode and enables gradient checkpointing
         4. Rebuilds DeepSpeed engine with VLM group included
-        5. Loads model weights back from checkpoint
+        5. Restores model weights directly via load_state_dict()
+
+        This approach avoids the save_checkpoint/load_checkpoint roundtrip which
+        breaks when exclude_frozen_parameters=True (the saved checkpoint lacks
+        VLM params, so the new engine can't load them). For ZeRO-2, parameters
+        are NOT partitioned across ranks, so module_state_dict() returns complete
+        weights on each rank — no disk I/O needed.
         """
-        import tempfile
         import deepspeed
         _log(f"Unfreezing VLM for DeepSpeed at step {self.global_step}")
+
+        # 1. Extract all model weights BEFORE any changes (includes frozen VLM params)
+        #    For ZeRO-2, parameters are NOT partitioned, so this is a simple dict copy.
+        #    For ZeRO-3, use model_engine._consolidated_16bit_state_dict() instead.
+        if self.deepspeed_zero_stage >= 3:
+            state_dict = self.model_engine._consolidated_16bit_state_dict()
+        else:
+            state_dict = {k: v.clone() for k, v in self.model_engine.module.named_parameters()}
+        _log(f"Extracted {len(state_dict)} param tensors from old engine for weight restoration")
 
         self._vlm_unfrozen = True
         self._vlm_delayed_unfreeze = False
 
-        # 1. Unfreeze VLM parameters
+        # 2. Unfreeze VLM parameters
         for param in self.policy.vlm.parameters():
             param.requires_grad = True
         self.policy.vlm.train()
 
-        # 2. Switch VLM forward mode: hook → output_hidden_states
+        # 3. Switch VLM forward mode: hook → output_hidden_states
         if hasattr(self.policy, '_vlm_forward_mode') and self.policy._vlm_forward_mode == "hook":
             if hasattr(self.policy, '_hook_handles'):
                 for handle in self.policy._hook_handles:
@@ -1207,7 +1221,7 @@ class LoLAV07Trainer:
             self.policy._vlm_forward_mode = "output_hidden_states"
             _log("VLM forward mode switched from hook to output_hidden_states")
 
-        # 3. Enable VLM gradient checkpointing
+        # 4. Enable VLM gradient checkpointing
         if self.config.gradient_checkpointing:
             ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
             self.policy.vlm.gradient_checkpointing_enable()
@@ -1218,15 +1232,6 @@ class LoLAV07Trainer:
                 if hasattr(module, '_gradient_checkpointing_func'):
                     module._gradient_checkpointing_func = ds_fn
             _log("VLM gradient checkpointing enabled with DeepSpeed checkpointing func")
-
-        # 4. Save model weights to temporary checkpoint (for restoring after rebuild)
-        tmp_dir = tempfile.mkdtemp(prefix="vlm_unfreeze_")
-        self.model_engine.save_checkpoint(
-            save_dir=tmp_dir,
-            tag="pre_unfreeze",
-            exclude_frozen_parameters=True,
-        )
-        _log(f"Saved pre-unfreeze checkpoint to {tmp_dir}/pre_unfreeze")
 
         # 5. Rebuild DeepSpeed engine with VLM group included
         encoder_lr_mult = self.config.encoder_lr_mult
@@ -1288,19 +1293,19 @@ class LoLAV07Trainer:
             dist_init_required=False,
         )
 
-        # 6. Load model weights back from checkpoint
-        load_path, _ = model_engine.load_checkpoint(
-            load_dir=tmp_dir,
-            tag="pre_unfreeze",
-            load_optimizer_states=False,  # New optimizer, don't load old states
-            load_lr_scheduler_states=False,  # New scheduler, don't load old states
-        )
-        if load_path is None:
-            _log("WARNING: Failed to load pre-unfreeze model weights, VLM weights may be random")
-
-        # Clean up temporary checkpoint
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # 6. Restore model weights directly (no disk I/O, no checkpoint format mismatch)
+        #    DeepSpeed.initialize() may modify parameter objects (e.g. flatten for ZeRO-3),
+        #    so we restore by name matching on the module's state_dict.
+        current_state = dict(model_engine.module.named_parameters())
+        restored, missing, unexpected = 0, 0, 0
+        for name, saved_tensor in state_dict.items():
+            if name in current_state:
+                current_state[name].data.copy_(saved_tensor.data)
+                restored += 1
+            else:
+                missing += 1
+        unexpected = len(current_state) - restored
+        _log(f"Weight restoration: {restored} params restored, {missing} missing, {unexpected} unexpected")
 
         # 7. Replace trainer references
         self.model = model_engine
