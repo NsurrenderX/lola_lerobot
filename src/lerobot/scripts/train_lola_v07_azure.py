@@ -837,6 +837,9 @@ class LoLAV07Trainer:
         # VLM dynamic unfreezing state
         self._vlm_unfrozen = False
         self._vlm_delayed_unfreeze = False
+        # For DeepSpeed: engine rebuild mid-step invalidates activation checkpointing
+        # closures, so unfreeze is deferred to the step boundary
+        self._pending_deepspeed_unfreeze = False
         if self.train_vlm and self.config.vlm_unfreeze_v_loss_threshold > 0:
             self._vlm_delayed_unfreeze = True
 
@@ -1454,7 +1457,13 @@ class LoLAV07Trainer:
                 v_loss_val = v_loss_tensor.item()
             if v_loss_val < self.config.vlm_unfreeze_v_loss_threshold:
                 if self.strategy == "deepspeed":
-                    self._unfreeze_vlm_deepspeed()
+                    # Defer unfreeze to after this step's backward+optimizer.
+                    # Engine rebuild mid-step invalidates DeepSpeed's activation
+                    # checkpointing closures (checkpoint_pack/checkpoint_unpack
+                    # captured by autograd graph reference old engine's parameter
+                    # objects). Rebuilding after step completes avoids stale graph.
+                    self._pending_deepspeed_unfreeze = True
+                    _log(f"VLM unfreeze triggered at step {self.global_step}, deferred to step boundary")
                 else:
                     self._unfreeze_vlm()
         t_model_fwd = time.monotonic() - t2
@@ -1640,6 +1649,13 @@ class LoLAV07Trainer:
                     self.scheduler.step()
 
                 self.global_step += 1
+
+                # Deferred DeepSpeed VLM unfreeze: engine rebuild happens at step
+                # boundary (after backward+optimizer, before next forward) to avoid
+                # invalidating the current step's autograd graph.
+                if self._pending_deepspeed_unfreeze:
+                    self._pending_deepspeed_unfreeze = False
+                    self._unfreeze_vlm_deepspeed()
 
                 # Optimizer state dtype diagnostic (all strategies, step 10)
                 if self.global_step == 10 and self.is_main_process:
