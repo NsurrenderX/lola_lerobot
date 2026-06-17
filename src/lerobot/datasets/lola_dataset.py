@@ -90,6 +90,8 @@ class LoLADataset(LeRobotDataset):
         hist_action_token_drop_rate: float = 0.0,
         max_transition_len: int = 64,
         completed_tasks_history_len: int = 5,
+        # Stats mode for z-score normalization
+        stats_mode: str = "original",  # "original" or "incremental"
     ):
         """
         Args:
@@ -106,6 +108,7 @@ class LoLADataset(LeRobotDataset):
             force_cache_sync: 是否强制同步缓存
             download_videos: 是否下载视频
             video_backend: 视频后端
+            stats_mode: stats模式，"original"使用原始stats，"incremental"使用包含transition数据的增量stats
         """
         super().__init__(
             repo_id=repo_id,
@@ -139,17 +142,26 @@ class LoLADataset(LeRobotDataset):
         self.completed_tasks_history_len = completed_tasks_history_len
 
         # Z-score normalization stats (computed from dataset metadata)
+        # stats_mode: "original" uses default stats keys, "incremental" uses _incremental keys
+        self.stats_mode = stats_mode
         self._action_mean = None
         self._action_std = None
         if self.norm_action == "zscore":
-            if "action" in self.meta.stats:
+            action_key = "action_incremental" if stats_mode == "incremental" else "action"
+            if action_key in self.meta.stats:
                 import numpy as np
-                _mean = self.meta.stats["action"]["mean"]
-                _std = self.meta.stats["action"]["std"]
+                _mean = self.meta.stats[action_key]["mean"]
+                _std = self.meta.stats[action_key]["std"]
                 self._action_mean = torch.tensor(_mean, dtype=torch.float32) if isinstance(_mean, np.ndarray) else _mean.float()
                 self._action_std = torch.tensor(_std, dtype=torch.float32) if isinstance(_std, np.ndarray) else _std.float()
             else:
-                raise ValueError("z-score normalization requires 'action' stats in dataset metadata")
+                if stats_mode == "incremental":
+                    raise ValueError(
+                        f"z-score normalization with stats_mode='incremental' requires '{action_key}' stats "
+                        f"in dataset metadata. Run compute_incremental_stats.py first to compute incremental stats."
+                    )
+                else:
+                    raise ValueError("z-score normalization requires 'action' stats in dataset metadata")
             if self.gripper_dim_indices_abs is None:
                 raise ValueError("z-score normalization requires gripper_dim_indices_abs to separate arm/gripper dims")
 
@@ -164,14 +176,22 @@ class LoLADataset(LeRobotDataset):
         self._state_mean = None
         self._state_std = None
         if self.norm_action == "zscore" and self.history_type == "state":
-            if "observation.state" in self.meta.stats:
+            state_key = "observation.state_incremental" if stats_mode == "incremental" else "observation.state"
+            if state_key in self.meta.stats:
                 import numpy as np
-                _s_mean = self.meta.stats["observation.state"]["mean"]
-                _s_std = self.meta.stats["observation.state"]["std"]
+                _s_mean = self.meta.stats[state_key]["mean"]
+                _s_std = self.meta.stats[state_key]["std"]
                 self._state_mean = torch.tensor(_s_mean, dtype=torch.float32) if isinstance(_s_mean, np.ndarray) else _s_mean.float()
                 self._state_std = torch.tensor(_s_std, dtype=torch.float32) if isinstance(_s_std, np.ndarray) else _s_std.float()
             else:
-                raise ValueError("z-score normalization with history_type='state' requires 'observation.state' stats in dataset metadata")
+                if stats_mode == "incremental":
+                    raise ValueError(
+                        f"z-score normalization with stats_mode='incremental' and history_type='state' "
+                        f"requires '{state_key}' stats in dataset metadata. "
+                        f"Run compute_incremental_stats.py first to compute incremental stats."
+                    )
+                else:
+                    raise ValueError("z-score normalization with history_type='state' requires 'observation.state' stats in dataset metadata")
 
         # 获取action维度
         if "action" in self.features:
@@ -220,6 +240,7 @@ class LoLADataset(LeRobotDataset):
         print(f"[LoLADataset] action_chunk_size: {action_chunk_size}")
         print(f"[LoLADataset] history_padding_side: {history_padding_side}")
         print(f"[LoLADataset] action_dim: {self.action_dim}")
+        print(f"[LoLADataset] stats_mode: {self.stats_mode}")
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
         """Override parent _query_videos to pass seek_mode from init-time scan."""

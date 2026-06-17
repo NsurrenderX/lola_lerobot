@@ -243,11 +243,12 @@ class LolaVLMFeatureExtractor(nn.Module):
         return vlm_emb, empty_emb
 
 class LolaConditionEmbedder(nn.Module):
-    """融合 Timestep 与空 Token 生成 Modulation 条件"""
+    """融合 Timestep 与空 Token（以及可选的 State）生成 Modulation 条件"""
     def __init__(self, config: LoLAConfig):
         super().__init__()
         self.min_period = config.min_period
         self.max_period = config.max_period
+        self.use_state_condition = config.use_state_condition
         self.time_mlp = nn.Sequential(
             nn.Linear(256, config.dit_hidden_size),
             nn.SiLU(),
@@ -258,12 +259,22 @@ class LolaConditionEmbedder(nn.Module):
             nn.SiLU(),
             nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
         )
+        if self.use_state_condition:
+            self.state_mlp = nn.Sequential(
+                nn.Linear(config.state_dim, config.dit_hidden_size),
+                nn.SiLU(),
+                nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
+            )
 
-    def forward(self, timestep: torch.Tensor, empty_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, timestep: torch.Tensor, empty_emb: torch.Tensor, state_emb: torch.Tensor = None) -> torch.Tensor:
         time_emb = create_sinusoidal_pos_embedding(timestep, 256, self.min_period, self.max_period).to(empty_emb.dtype)
         t_feat = self.time_mlp(time_emb)
         c_feat = self.cond_mlp(empty_emb)
-        return t_feat + c_feat # [B, 1536]
+        temb = t_feat + c_feat
+        if state_emb is not None and self.use_state_condition:
+            s_feat = self.state_mlp(state_emb)
+            temb = temb + s_feat
+        return temb # [B, dit_hidden_size]
 
 # ----------------------------------------------------------------------
 # 2. Dual-Expert Transformer Blocks
@@ -709,6 +720,7 @@ class LoLADiT(nn.Module):
         return compute_multiaxis_rope(all_coords)
 
     def forward(self, target_actions, hist_actions, vlm_features, empty_emb, timestep,
+                state_emb=None,
                 hist_actions_mask=None, vlm_attention_mask=None, return_chunks: bool = False,
                 use_gradient_checkpointing: bool = False, joint_attention_kwargs: dict = None):
         b = target_actions.shape[0]
@@ -730,7 +742,7 @@ class LoLADiT(nn.Module):
         arm_target = arm_target + self.arm_target_modality_emb
         grip_target = grip_target + self.grip_target_modality_emb
 
-        temb = self.cond_embedder(timestep, empty_emb)
+        temb = self.cond_embedder(timestep, empty_emb, state_emb)
 
         # Per-stream modulation for double-stream blocks
         temb_mod_ctx_vlm_d = self.ctx_vlm_double_modulation(temb)
@@ -892,7 +904,7 @@ class LoLAPytorch(nn.Module):
         return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
-                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None):
+                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None):
         """
         训练时的前向传播，实现 x-pred + v-loss 的 Flow Matching
 
@@ -960,6 +972,7 @@ class LoLAPytorch(nn.Module):
         # 注意：DiT 在 chunk 空间操作，输入输出都是 [B, num_chunks, dit_hidden_size]
         pred_x0_chunks = self.dit(
             x_t, hist_chunks, vlm_features, empty_emb, time,
+            state_emb=state_emb,
             hist_actions_mask=hist_chunks_mask,
             vlm_attention_mask=vlm_attention_mask,
             return_chunks=True,
@@ -1018,7 +1031,7 @@ class LoLAPytorch(nn.Module):
         }
 
     @torch.no_grad()
-    def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None):
+    def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None, state_emb=None):
         """推理阶段：欧拉积分去噪 (Dual-Token 版本)"""
         b = hist_actions.shape[0]
         device = hist_actions.device
@@ -1056,6 +1069,7 @@ class LoLAPytorch(nn.Module):
                 vlm_features=vlm_features,
                 empty_emb=empty_emb,
                 timestep=expanded_time,
+                state_emb=state_emb,
                 hist_actions_mask=hist_chunks_mask,
                 return_chunks=True,
                 use_gradient_checkpointing=False,
@@ -1614,8 +1628,21 @@ class LoLAPolicy(PreTrainedPolicy):
         target_actions = self.prepare_target_actions(batch)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
 
-        # Extract VLM attention_mask for DiT (to fix vlm_mask bug)
+        # Extract VLM attention-mask for DiT (to fix vlm_mask bug)
         vlm_attention_mask = batch.get("attention_mask", None) or batch.get("observation.language.attention_mask", None)
+
+        # State conditioning: extract observation.state when enabled
+        state_emb = None
+        if self.config.use_state_condition:
+            state_tensor = batch.get("observation.state", None)
+            if state_tensor is not None:
+                if state_tensor.ndim == 3:
+                    # [B, n_obs_steps, max_state_dim] -> [B, state_dim]
+                    state_emb = state_tensor[:, -1, :self.config.state_dim]
+                else:
+                    # [B, max_state_dim] -> [B, state_dim]
+                    state_emb = state_tensor[:, :self.config.state_dim]
+                state_emb = state_emb.to(self.dtype)
 
         # 转换为正确的精度
         hist_actions = hist_actions.to(self.dtype)
@@ -1632,6 +1659,7 @@ class LoLAPolicy(PreTrainedPolicy):
             target_actions=target_actions,
             hist_actions_mask=hist_actions_mask,
             vlm_attention_mask=vlm_attention_mask,
+            state_emb=state_emb,
         )
 
         loss = losses["total_loss"]
@@ -1656,10 +1684,22 @@ class LoLAPolicy(PreTrainedPolicy):
             hist_actions_mask = hist_actions_mask.to(self.dtype)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
 
+        # State conditioning: extract observation.state when enabled
+        state_emb = None
+        if self.config.use_state_condition:
+            state_tensor = batch.get("observation.state", None)
+            if state_tensor is not None:
+                if state_tensor.ndim == 3:
+                    state_emb = state_tensor[:, -1, :self.config.state_dim]
+                else:
+                    state_emb = state_tensor[:, :self.config.state_dim]
+                state_emb = state_emb.to(self.dtype)
+
         actions = self.model.sample_actions(
             hidden_states_all_layers=hidden_states_all_layers,
             hist_actions=hist_actions,
             hist_actions_mask=hist_actions_mask,
+            state_emb=state_emb,
         )
         return actions
 

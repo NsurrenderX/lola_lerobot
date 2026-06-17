@@ -559,6 +559,8 @@ def create_lola_dataset(
     completed_tasks_use_ann: bool = True,
     completed_tasks_history_len: int = 5,
     max_transition_len: int = 64,
+    # Stats mode for z-score normalization
+    stats_mode: str = "original",
 ) -> LeRobotDataset | LoLADataset:
     """
     创建 LoLA 训练用的数据集。
@@ -641,6 +643,7 @@ def create_lola_dataset(
             completed_tasks_history_len=completed_tasks_history_len,
             hist_action_token_drop_rate=config.hist_action_token_drop_rate,
             max_transition_len=max_transition_len,
+            stats_mode=stats_mode,
         )
     else:
         # 使用标准 LeRobotDataset
@@ -657,8 +660,9 @@ def create_lola_dataset(
         if norm_action == "zscore":
             from lerobot.datasets.robovlm_dataset import normalize_action_zscore
             import numpy as np
-            _mean = dataset_stats["action"]["mean"]
-            _std = dataset_stats["action"]["std"]
+            action_key = "action_incremental" if stats_mode == "incremental" else "action"
+            _mean = dataset_stats[action_key]["mean"]
+            _std = dataset_stats[action_key]["std"]
             action_mean = torch.tensor(_mean, dtype=torch.float32) if isinstance(_mean, np.ndarray) else _mean.float()
             action_std = torch.tensor(_std, dtype=torch.float32) if isinstance(_std, np.ndarray) else _std.float()
             dataset = _ZScoreActionDataset(dataset, action_mean, action_std, gripper_dim_indices_abs)
@@ -999,6 +1003,8 @@ def main():
                         help="State dimension (auto-detected from dataset if not provided)")
     parser.add_argument("--state_encoder_mode", type=str, default="unified", choices=["unified", "separated"],
                         help="State encoder mode: 'unified' (single MLP → 2*hidden, split) or 'separated' (arm/grip separate MLPs)")
+    parser.add_argument("--use_state_condition", action="store_true", default=False,
+                        help="Add observation.state to DiT modulation signal (temb) as conditioning (effective with both history_type='action' and 'state')")
 
     # V2: Text template + completed tasks + transition masking
     parser.add_argument("--task_text_template_version", type=str, default="raw", choices=["raw", "v1_with_completed"],
@@ -1076,6 +1082,9 @@ def main():
                         help="RoboVLM 归一化下界")
     parser.add_argument("--norm_max", type=float, default=0.65,
                         help="RoboVLM 归一化上界")
+    parser.add_argument("--stats_mode", type=str, default="original",
+                        choices=["original", "incremental"],
+                        help="Stats模式: 'original'使用annotation-only stats, 'incremental'使用包含所有Calvin帧(含transition)的增量stats")
 
     # DeepSpeed 参数
     parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
@@ -1184,6 +1193,7 @@ def main():
         history_type=args.history_type,
         state_dim=state_dim,
         state_encoder_mode=args.state_encoder_mode,
+        use_state_condition=args.use_state_condition,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
@@ -1261,6 +1271,7 @@ def main():
         completed_tasks_use_ann=config.completed_tasks_use_ann,
         completed_tasks_history_len=config.completed_tasks_history_len,
         max_transition_len=config.max_transition_len,
+        stats_mode=args.stats_mode,
     )
     print("Done.\n Train Data Example:")
     for key, value in train_dataset[0].items():
@@ -1311,6 +1322,7 @@ def main():
             transition_mask_rate=config.transition_mask_rate,
             completed_tasks_use_ann=config.completed_tasks_use_ann,
             max_transition_len=config.max_transition_len,
+            stats_mode=args.stats_mode,
         )
         val_batch_size = args.val_batch_size or args.batch_size
         val_loader = DataLoader(

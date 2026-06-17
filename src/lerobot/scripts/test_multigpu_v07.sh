@@ -75,6 +75,7 @@ HISTORY_PADDING_SIDE="left"
 HISTORY_TYPE="state"
 STATE_DIM="7"
 STATE_ENCODER_MODE="unified"
+USE_STATE_CONDITION=false
 
 # DataLoader 参数
 NUM_WORKERS=8
@@ -93,6 +94,8 @@ VLM_MAX_LENGTH=""
 NORM_MODE="zscore"
 NORM_MIN=-0.65
 NORM_MAX=0.65
+# Stats模式 (original=annotation-only stats, incremental=包含所有Calvin帧的增量stats)
+STATS_MODE="original"
 
 # 运行训练
 cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_v07_multigpu.py \
@@ -136,6 +139,7 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_v07_mul
     --norm_mode ${NORM_MODE} \
     --norm_min ${NORM_MIN} \
     --norm_max ${NORM_MAX} \
+    --stats_mode ${STATS_MODE} \
     --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
     --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE}"
 
@@ -158,6 +162,9 @@ if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history"
 fi
 cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ "$USE_STATE_CONDITION" = true ]; then
+    cmd="${cmd} --use_state_condition"
+fi
 if [ -n "$STATE_DIM" ]; then
     cmd="${cmd} --state_dim ${STATE_DIM}"
 fi

@@ -71,6 +71,7 @@ HISTORY_PADDING_SIDE="left"
 HISTORY_TYPE="action"
 STATE_DIM=""
 STATE_ENCODER_MODE="unified"
+USE_STATE_CONDITION=false
 
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
@@ -112,6 +113,8 @@ USE_SPECIAL_TOKENS=false
 NORM_MODE="zscore"
 NORM_MIN=-0.65
 NORM_MAX=0.65
+# Stats模式 (original=annotation-only stats, incremental=包含所有Calvin帧的增量stats)
+STATS_MODE="original"
 
 # Wandb 参数
 WANDB_PROJECT="lola-azure-calvin"
@@ -272,6 +275,10 @@ while [[ $# -gt 0 ]]; do
             STATE_ENCODER_MODE="$2"
             shift 2
             ;;
+        --use_state_condition)
+            USE_STATE_CONDITION=true
+            shift
+            ;;
 
         # LoLA 模型配置参数
         --no_gradient_checkpointing)
@@ -394,6 +401,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --norm_max)
             NORM_MAX="$2"
+            shift 2
+            ;;
+        --stats_mode)
+            STATS_MODE="$2"
             shift 2
             ;;
 
@@ -526,6 +537,7 @@ if [ "$NNODES" -eq 1 ]; then
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
         --norm_max ${NORM_MAX} \
+        --stats_mode ${STATS_MODE} \
         --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
         --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
         --deepspeed_zero_stage ${DEEPSPEED_ZERO_STAGE} \
@@ -573,6 +585,7 @@ else
         --norm_mode ${NORM_MODE} \
         --norm_min ${NORM_MIN} \
         --norm_max ${NORM_MAX} \
+        --stats_mode ${STATS_MODE} \
         --deepspeed_reduce_bucket_size ${DEEPSPEED_REDUCE_BUCKET_SIZE} \
         --deepspeed_allgather_bucket_size ${DEEPSPEED_ALLGATHER_BUCKET_SIZE} \
         --deepspeed_zero_stage ${DEEPSPEED_ZERO_STAGE} \
@@ -608,6 +621,9 @@ fi
 
 # 历史类型参数
 cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ "$USE_STATE_CONDITION" = true ]; then
+    cmd="${cmd} --use_state_condition"
+fi
 if [ -n "$STATE_DIM" ]; then
     cmd="${cmd} --state_dim ${STATE_DIM}"
 fi

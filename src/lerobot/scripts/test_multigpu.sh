@@ -60,6 +60,7 @@ HISTORY_PADDING_SIDE="left"
 HISTORY_TYPE="state"
 STATE_DIM="7"
 STATE_ENCODER_MODE="unified"
+USE_STATE_CONDITION=false
 
 # DataLoader 参数
 NUM_WORKERS=8
@@ -135,6 +136,9 @@ if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history"
 fi
 cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ "$USE_STATE_CONDITION" = true ]; then
+    cmd="${cmd} --use_state_condition"
+fi
 if [ -n "$STATE_DIM" ]; then
     cmd="${cmd} --state_dim ${STATE_DIM}"
 fi

@@ -370,7 +370,7 @@ class LoLAV07Pytorch(nn.Module):
         return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
-                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None,
+                hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None,
                 n_transition_chunks=0, n_transition_chunks_batch=None):
         """Training forward with Latent Flow Matching.
 
@@ -576,6 +576,7 @@ class LoLAV07Pytorch(nn.Module):
 
             pred_z0_dit = self.dit(
                 z_t_dit, hist_actions_for_dit, vlm_stream, empty_emb, time,
+                state_emb=state_emb,
                 hist_actions_mask=None,  # mask is passed via joint_attention_kwargs
                 vlm_attention_mask=None,
                 return_chunks=True,
@@ -586,6 +587,7 @@ class LoLAV07Pytorch(nn.Module):
             # No special tokens: use standard DiT forward (unchanged)
             pred_z0_dit = self.dit(
                 z_t_dit, hist_chunks, vlm_features, empty_emb, time,
+                state_emb=state_emb,
                 hist_actions_mask=hist_chunks_mask,
                 vlm_attention_mask=vlm_attention_mask,
                 return_chunks=True,
@@ -663,6 +665,7 @@ class LoLAV07Pytorch(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None,
+                       state_emb=None,
                        n_transition_chunks=None):
         """Inference: Euler integration in latent space.
 
@@ -824,6 +827,7 @@ class LoLAV07Pytorch(nn.Module):
                     vlm_features=vlm_stream,
                     empty_emb=empty_emb,
                     timestep=expanded_time,
+                    state_emb=state_emb,
                     hist_actions_mask=None,
                     vlm_attention_mask=None,
                     return_chunks=True,
@@ -837,6 +841,7 @@ class LoLAV07Pytorch(nn.Module):
                     vlm_features=vlm_stream,
                     empty_emb=empty_emb,
                     timestep=expanded_time,
+                    state_emb=state_emb,
                     hist_actions_mask=hist_chunks_mask_for_dit,
                     vlm_attention_mask=vlm_attention_mask_for_dit,
                     return_chunks=True,
@@ -1172,6 +1177,19 @@ class LoLAV07Policy(PreTrainedPolicy):
         else:
             n_transition_chunks_batch = torch.tensor([0], dtype=torch.long, device=self.device)
 
+        # State conditioning: extract observation.state when enabled
+        state_emb = None
+        if self.config.use_state_condition:
+            state_tensor = batch.get("observation.state", None)
+            if state_tensor is not None:
+                if state_tensor.ndim == 3:
+                    # [B, n_obs_steps, max_state_dim] -> [B, state_dim]
+                    state_emb = state_tensor[:, -1, :self.config.state_dim]
+                else:
+                    # [B, max_state_dim] -> [B, state_dim]
+                    state_emb = state_tensor[:, :self.config.state_dim]
+                state_emb = state_emb.to(self.dtype)
+
         # v07: do NOT convert hist_actions/target_actions to self.dtype here;
         # LoLAV07Pytorch.forward() handles FP32 isolation for encoders internally.
         if hist_actions_mask is not None:
@@ -1186,6 +1204,7 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask=hist_actions_mask,
             vlm_attention_mask=vlm_attention_mask,
             time=time,
+            state_emb=state_emb,
             n_transition_chunks=max_n_tc,
             n_transition_chunks_batch=n_transition_chunks_batch,
         )
@@ -1218,10 +1237,22 @@ class LoLAV07Policy(PreTrainedPolicy):
         else:
             n_transition_chunks = None  # default: auto-detect 0
 
+        # State conditioning: extract observation.state when enabled
+        state_emb = None
+        if self.config.use_state_condition:
+            state_tensor = batch.get("observation.state", None)
+            if state_tensor is not None:
+                if state_tensor.ndim == 3:
+                    state_emb = state_tensor[:, -1, :self.config.state_dim]
+                else:
+                    state_emb = state_tensor[:, :self.config.state_dim]
+                state_emb = state_emb.to(self.dtype)
+
         actions = self.model.sample_actions(
             hidden_states_all_layers=hidden_states_all_layers,
             hist_actions=hist_actions,
             hist_actions_mask=hist_actions_mask,
+            state_emb=state_emb,
             n_transition_chunks=n_transition_chunks,
         )
         return actions

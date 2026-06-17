@@ -71,6 +71,7 @@ HISTORY_PADDING_SIDE="left"
 HISTORY_TYPE="action"
 STATE_DIM=""
 STATE_ENCODER_MODE="unified"
+USE_STATE_CONDITION=false
 
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
@@ -256,6 +257,10 @@ while [[ $# -gt 0 ]]; do
         --state_encoder_mode)
             STATE_ENCODER_MODE="$2"
             shift 2
+            ;;
+        --use_state_condition)
+            USE_STATE_CONDITION=true
+            shift
             ;;
 
         # LoLA 模型配置参数
@@ -539,6 +544,9 @@ fi
 
 # 历史类型参数
 cmd="${cmd} --history_type ${HISTORY_TYPE} --state_encoder_mode ${STATE_ENCODER_MODE}"
+if [ "$USE_STATE_CONDITION" = true ]; then
+    cmd="${cmd} --use_state_condition"
+fi
 if [ -n "$STATE_DIM" ]; then
     cmd="${cmd} --state_dim ${STATE_DIM}"
 fi

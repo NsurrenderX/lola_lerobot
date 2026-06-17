@@ -54,7 +54,8 @@ class LoLAConfig(PreTrainedConfig):
     dit_arm_ffn_mult: float = 4.0              # Arm 专家 FFN 扩展比 (6D rotation + 3D translation)
     dit_grip_ffn_mult: float = 2.0             # Gripper 专家 FFN 扩展比 (binary open/close)
     dit_ctx_ffn_mult: float = 4.0              # Context 共享 FFN 扩展比 (cross-modal interaction)
-    
+    use_state_condition: bool = False           # Add observation.state to DiT modulation signal (temb), projected to dit_hidden_size
+
     # ==========================
     # 4. Flow Matching Settings
     # ==========================
@@ -169,6 +170,18 @@ class LoLAConfig(PreTrainedConfig):
 
         if self.task_text_template_version not in ("raw", "v1_with_completed"):
             raise ValueError(f"Invalid task_text_template_version: {self.task_text_template_version}, must be 'raw' or 'v1_with_completed'")
+
+        # Warn if use_state_condition is enabled with history_type="state"
+        # (state_encoder already processes state in context streams, temb-level state may be redundant)
+        if self.use_state_condition and self.history_type == "state":
+            import warnings
+            warnings.warn(
+                f"use_state_condition=True with history_type='state': state_encoder already provides "
+                f"historical state context in the DiT streams. Adding state to temb provides a current-state "
+                f"signal which is semantically different, but this combination may be redundant in practice.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if not (0.0 <= self.transition_mask_rate <= 1.0):
             raise ValueError(f"transition_mask_rate must be in [0.0, 1.0], got {self.transition_mask_rate}")

@@ -1449,6 +1449,8 @@ def main():
                         help="State dimension (auto-detected from dataset if not provided)")
     parser.add_argument("--state_encoder_mode", type=str, default="unified", choices=["unified", "separated"],
                         help="State encoder mode: 'unified' (single MLP → 2*hidden, split) or 'separated' (arm/grip separate MLPs)")
+    parser.add_argument("--use_state_condition", action="store_true", default=False,
+                        help="Add observation.state to DiT modulation signal (temb) as conditioning (effective with both history_type='action' and 'state')")
 
     # LoLA 模型配置参数
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
@@ -1653,6 +1655,7 @@ def main():
         history_type=args.history_type,
         state_dim=state_dim,
         state_encoder_mode=args.state_encoder_mode,
+        use_state_condition=args.use_state_condition,
         gradient_checkpointing=gradient_checkpointing,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
