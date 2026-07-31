@@ -143,12 +143,23 @@ class LolaEmptyTokenProcessor(ObservationProcessorStep):
         if OBS_LANGUAGE_ATTENTION_MASK in observation:
             attention_mask = observation[OBS_LANGUAGE_ATTENTION_MASK]  # [B, seq_len]
             new_attention = torch.ones(
-                (batch_size, 1), 
-                dtype=attention_mask.dtype, 
+                (batch_size, 1),
+                dtype=attention_mask.dtype,
                 device=attention_mask.device
             )
             new_observation[OBS_LANGUAGE_ATTENTION_MASK] = torch.cat([attention_mask, new_attention], dim=1)
-        
+
+        # Extend mm_token_type_ids accordingly (Cosmos3-Nano / Qwen3-VL processors emit
+        # this for M-RoPE; 0 = text token, matching the appended empty token's type)
+        if "mm_token_type_ids" in observation:
+            mm_types = observation["mm_token_type_ids"]  # [B, seq_len]
+            text_type = torch.zeros(
+                (batch_size, 1),
+                dtype=mm_types.dtype,
+                device=mm_types.device
+            )
+            new_observation["mm_token_type_ids"] = torch.cat([mm_types, text_type], dim=1)
+
         return new_observation
     
     def transform_features(
@@ -380,8 +391,32 @@ class LolaQwenProcessor(ObservationProcessorStep):
             self.qwen_processor = AutoProcessor.from_pretrained(processor_name, local_files_only=True)
         else:
             self.qwen_processor = AutoProcessor.from_pretrained(processor_name)
-        self.qwen_processor.image_processor.max_pixels = max_image_pixels
-        self.qwen_processor.image_processor.min_pixels = min_image_pixels
+        self._set_image_pixel_limits(max_image_pixels, min_image_pixels)
+
+    def _set_image_pixel_limits(self, max_image_pixels: int, min_image_pixels: int):
+        """Apply per-image pixel limits to the VLM image processor.
+
+        transformers>=5.x Qwen2VLImageProcessor (used by both Qwen3.5 and
+        Cosmos3-Nano) stores pixel limits in a `size` SizeDict
+        (shortest_edge/longest_edge); setting `.max_pixels`/`.min_pixels`
+        attributes post-init is a silent no-op there. Older processors used
+        real max_pixels/min_pixels attributes — handle all three forms.
+        """
+        img_proc = self.qwen_processor.image_processor
+        size = getattr(img_proc, "size", None)
+        if isinstance(size, dict):
+            img_proc.size = {
+                **size,
+                "longest_edge": max_image_pixels,
+                "shortest_edge": min_image_pixels,
+            }
+        elif size is not None and hasattr(size, "longest_edge"):
+            # SizeDict (transformers>=5.x): mutate in place
+            size.longest_edge = max_image_pixels
+            size.shortest_edge = min_image_pixels
+        else:
+            img_proc.max_pixels = max_image_pixels
+            img_proc.min_pixels = min_image_pixels
     
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
@@ -498,6 +533,10 @@ class LolaQwenProcessor(ObservationProcessorStep):
             new_observation["pixel_values"] = inputs["pixel_values"]
         if "image_grid_thw" in inputs:
             new_observation["image_grid_thw"] = inputs["image_grid_thw"]
+        # Cosmos3-Nano / Qwen3-VL processors emit mm_token_type_ids, required by the
+        # model's M-RoPE position computation (0=text, 1=image, 2=video)
+        if "mm_token_type_ids" in inputs:
+            new_observation["mm_token_type_ids"] = inputs["mm_token_type_ids"]
 
         # Clean up temporary image storage
         for key in ['_lola_images', '_lola_images_per_item', 'camera_valid_mask']:

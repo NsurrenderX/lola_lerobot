@@ -918,10 +918,14 @@ class LoLAV07Trainer:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5VisionBlock
+        from lerobot.policies.lola.vlm_backbone import get_vlm_backbone
         from diffusers.models.transformers.transformer_flux2 import Flux2TransformerBlock, Flux2SingleTransformerBlock
         from lerobot.policies.lola.modeling_lola import LolaVLMFeatureExtractor, LoLADualExpertDoubleBlock, LoLADualExpertSingleBlock
         from lerobot.policies.lola_v07.modeling_lola_v07 import LolaV07ActionEncoder, LolaV07StateEncoder
+
+        # VLM layer classes depend on the backbone (Qwen3_5DecoderLayer/Qwen3_5VisionBlock
+        # for qwen3_5, Qwen3VLTextDecoderLayer/Qwen3VLVisionBlock for cosmos3_nano)
+        vlm_wrap_classes = get_vlm_backbone(self.config.vlm_backbone).get_fsdp_wrap_classes()
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
@@ -932,8 +936,7 @@ class LoLAV07Trainer:
         auto_wrap_policy = lambda module, recurse, nonwrapped_numel: transformer_auto_wrap_policy(
             module, recurse, nonwrapped_numel,
             transformer_layer_cls={
-                Qwen3_5DecoderLayer,
-                Qwen3_5VisionBlock,
+                *vlm_wrap_classes,
                 Flux2TransformerBlock,
                 Flux2SingleTransformerBlock,
                 LolaVLMFeatureExtractor,
@@ -1981,6 +1984,9 @@ def main():
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
 
     # 模型参数
+    parser.add_argument("--vlm_backbone", type=str, default="qwen3_5",
+                        choices=["qwen3_5", "cosmos3_nano"],
+                        help="VLM backbone: 'qwen3_5' (Qwen3.5-4B) or 'cosmos3_nano' (Cosmos3-Nano Reasoner)")
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/")
     parser.add_argument("--train_vlm", action="store_true")
     parser.add_argument("--ckpt_dir", type=str, default="/data_16T/deepseek/checkpoints/lola")
@@ -2018,6 +2024,13 @@ def main():
                         help="VLM 学习率（仅 train_vlm=True 时生效）")
     parser.add_argument("--vlm_extract_layers", type=int, nargs="+", default=[8, 16, 24],
                         help="VLM 提取层索引")
+    parser.add_argument("--vlm_bridge_mode", type=str, default="legacy",
+                        choices=["legacy", "transformer"],
+                        help="VLM 桥接器: 'legacy' (concat 方阵, 兼容旧 checkpoint) 或 'transformer' (LolaVLMContextBridge, 降维+多层Transformer, ~0.63B)")
+    parser.add_argument("--vlm_bridge_width", type=int, default=2048,
+                        help="transformer 桥接器宽度 (仅 vlm_bridge_mode=transformer 生效)")
+    parser.add_argument("--vlm_bridge_layers", type=int, default=8,
+                        help="transformer 桥接器层数 (仅 vlm_bridge_mode=transformer 生效)")
     parser.add_argument("--vlm_unfreeze_v_loss_threshold", type=float, default=0.3,
                         help="v_loss threshold for dynamic VLM unfreezing (0 = disabled, only works with train_vlm=True)")
     parser.add_argument("--vlm_lr_mult", type=float, default=1.5,
@@ -2177,6 +2190,8 @@ def main():
         _log(f"Learning Rate: {args.learning_rate}")
         _log(f"Max Steps: {args.max_steps or 'N/A (epoch-based)'}")
         _log(f"Max Epochs: {args.max_epochs or 'N/A (step-based)'}")
+        _log(f"VLM Backbone: {args.vlm_backbone}")
+        _log(f"VLM Bridge: {args.vlm_bridge_mode}" + (f" (width={args.vlm_bridge_width}, layers={args.vlm_bridge_layers})" if args.vlm_bridge_mode == "transformer" else ""))
         _log(f"VLM Path: {args.vlm_path}")
         _log(f"Train VLM: {args.train_vlm}")
         _log("=" * 60)
@@ -2216,7 +2231,7 @@ def main():
     # 创建 LoLA 配置
     gradient_checkpointing = not args.no_gradient_checkpointing
     config = LoLAV07Config(
-        vlm_model_name="Qwen/Qwen3.5-4B",
+        vlm_backbone=args.vlm_backbone,
         vlm_path=args.vlm_path,
         action_dim=action_dim,
         action_chunk_size=args.action_chunk_size,
@@ -2237,6 +2252,9 @@ def main():
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
         vlm_extract_layers=tuple(args.vlm_extract_layers),
+        vlm_bridge_mode=args.vlm_bridge_mode,
+        vlm_bridge_width=args.vlm_bridge_width,
+        vlm_bridge_layers=args.vlm_bridge_layers,
         vlm_unfreeze_v_loss_threshold=args.vlm_unfreeze_v_loss_threshold,
         vlm_lr_mult=args.vlm_lr_mult,
         use_special_tokens=args.use_special_tokens,

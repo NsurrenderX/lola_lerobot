@@ -1,5 +1,9 @@
 #!/bin/bash
-# LoLA Azure 分布式训练脚本
+# LoLA Azure 分布式训练脚本 (V07-C: Cosmos3-Nano Reasoner VLM 变体)
+#
+# 与 test_azure_v07.sh 的唯一区别: VLM backbone 从 Qwen3.5-4B 换成 Cosmos3-Nano。
+# 前置条件: 需先将 Cosmos3-Nano 模型文件同步到 Azure 存储 (VLM_PATH 指向的位置),
+#           建议预转换 reasoner-only 权重以加快每个 rank 的加载速度。
 #
 # 此脚本用于在 Azure ML 上运行分布式训练。
 # Azure ML 会为每个节点运行一次此脚本，并自动传入以下参数：
@@ -10,7 +14,7 @@
 #   --master_port: 主节点端口
 #
 # 使用方法:
-#   bash test_azure.sh --nnodes $NODES --nproc_per_node $GPUS \
+#   bash test_azure_v07c.sh --nnodes $NODES --nproc_per_node $GPUS \
 #       --node_rank $AZUREML_CR_NODE_RANK \
 #       --master_addr $AZ_BATCHAI_JOB_MASTER_NODE_IP \
 #       --master_port 9901
@@ -56,8 +60,9 @@ DATASET_REPO_ID=""
 DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3"
 
 # 模型参数
-VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
-CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
+VLM_BACKBONE="cosmos3_nano"
+VLM_PATH="/mnt/wangxiaofa/cosmos3/Cosmos3-Nano/"  # 需先同步模型文件到此路径
+CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-v07c"
 TRAIN_VLM=false
 ACTION_DIM=14
 ACTION_CHUNK_SIZE=10
@@ -79,8 +84,8 @@ COMPILE_MODEL=false
 COMPILE_MODE="max-autotune"
 VLM_LR=1e-6
 VLM_EXTRACT_LAYERS="8 16 24"
-# VLM 桥接器: legacy = 兼容旧 checkpoint; transformer = LolaVLMContextBridge (~0.63B, 新训练推荐)
-VLM_BRIDGE_MODE="legacy"
+# VLM 桥接器: transformer = LolaVLMContextBridge (降维2048+8层Transformer, ~0.63B, 替代1.77B legacy 方阵)
+VLM_BRIDGE_MODE="transformer"
 VLM_BRIDGE_WIDTH=2048
 VLM_BRIDGE_LAYERS=8
 MAX_IMAGE_PIXELS=230400
@@ -219,6 +224,10 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         # 模型参数
+        --vlm_backbone)
+            VLM_BACKBONE="$2"
+            shift 2
+            ;;
         --vlm_path)
             VLM_PATH="$2"
             shift 2
@@ -505,6 +514,8 @@ echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Norm mode: ${NORM_MODE}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
+echo "  - VLM backbone: ${VLM_BACKBONE}"
+echo "  - VLM bridge: ${VLM_BRIDGE_MODE} (width=${VLM_BRIDGE_WIDTH}, layers=${VLM_BRIDGE_LAYERS})"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - DeepSpeed config: ${DEEPSPEED_CONFIG:-default}"
 echo "  - DeepSpeed ZeRO stage: ${DEEPSPEED_ZERO_STAGE}"
@@ -524,6 +535,7 @@ if [ "$NNODES" -eq 1 ]; then
         --learning_rate ${LEARNING_RATE} \
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --vlm_backbone ${VLM_BACKBONE} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
         --action_dim ${ACTION_DIM} \
@@ -575,6 +587,7 @@ else
         --learning_rate ${LEARNING_RATE} \
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --vlm_backbone ${VLM_BACKBONE} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
         --action_dim ${ACTION_DIM} \

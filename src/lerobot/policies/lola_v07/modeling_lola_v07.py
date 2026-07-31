@@ -20,7 +20,8 @@ import torch.nn.functional as F
 
 from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
 from lerobot.policies.lola.modeling_lola import (
-    LolaVLMFeatureExtractor,
+    LolaVLMContextBridge,
+    build_vlm_bridge,
     LoLADiT,
     LoLAPolicy,
 )
@@ -313,7 +314,7 @@ class LoLAV07Pytorch(nn.Module):
         grip_btl = config.grip_bottleneck_dim
 
         # VLM Bridge and DiT (reused from lola)
-        self.vlm_bridge = LolaVLMFeatureExtractor(config)
+        self.vlm_bridge = build_vlm_bridge(config)
 
         # Encoders with Bottleneck (FP32)
         self.action_encoder = LolaV07ActionEncoder(config).float()
@@ -369,6 +370,12 @@ class LoLAV07Pytorch(nn.Module):
             return self._checkpoint_fn(func, *args, **kwargs, **self._checkpoint_fn_kwargs)
         return func(*args, **kwargs)
 
+    def _run_vlm_bridge(self, hidden_states_all_layers, vlm_attention_mask=None):
+        """统一的桥接器调用入口: transformer 模式透传 attention_mask, legacy 模式忽略."""
+        if isinstance(self.vlm_bridge, LolaVLMContextBridge):
+            return self.vlm_bridge(hidden_states_all_layers, attention_mask=vlm_attention_mask)
+        return self.vlm_bridge(hidden_states_all_layers)
+
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
                 hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None,
                 n_transition_chunks=0, n_transition_chunks_batch=None):
@@ -384,7 +391,7 @@ class LoLAV07Pytorch(nn.Module):
         device = target_actions.device
 
         # 1. VLM features (BF16, unchanged)
-        vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
+        vlm_features, empty_emb = self._run_vlm_bridge(hidden_states_all_layers, vlm_attention_mask)
         target_dtype = vlm_features.dtype
 
         # 2. History encoding (force FP32 to survive DeepSpeed BF16 autocast)
@@ -675,7 +682,7 @@ class LoLAV07Pytorch(nn.Module):
         b = hist_actions.shape[0]
         device = hist_actions.device
 
-        vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
+        vlm_features, empty_emb = self._run_vlm_bridge(hidden_states_all_layers)
         target_dtype = vlm_features.dtype
 
         # History encoding (force FP32 to survive DeepSpeed BF16 autocast)
@@ -912,24 +919,19 @@ class LoLAV07Policy(PreTrainedPolicy):
         # Core model
         self.model = LoLAV07Pytorch(config)
 
-        # VLM loading
-        from transformers import Qwen3_5Model
+        # VLM loading — backbone resolved via registry (config.vlm_backbone)
+        from lerobot.policies.lola.vlm_backbone import get_vlm_backbone
+        vlm_spec = get_vlm_backbone(self.config.vlm_backbone)
         if self.config.vlm_path is not None:
-            self.vlm = Qwen3_5Model.from_pretrained(
+            self.vlm = vlm_spec.load_model(
                 self.config.vlm_path,
-                torch_dtype=self._dtype,
-                device_map=None,
-                low_cpu_mem_usage=True,
+                dtype=self._dtype,
                 local_files_only=True,
-                attn_implementation="sdpa",
             )
         else:
-            self.vlm = Qwen3_5Model.from_pretrained(
+            self.vlm = vlm_spec.load_model(
                 self.config.vlm_model_name,
-                torch_dtype=self._dtype,
-                device_map=None,
-                low_cpu_mem_usage=True,
-                attn_implementation="sdpa",
+                dtype=self._dtype,
             )
 
         # Remove unused VLM layers
@@ -1103,6 +1105,9 @@ class LoLAV07Policy(PreTrainedPolicy):
 
         pixel_values = batch.get("pixel_values", None)
         image_grid_thw = batch.get("image_grid_thw", None)
+        # mm_token_type_ids is required by Cosmos3-Nano (Qwen3-VL) M-RoPE when
+        # image_grid_thw is passed; Qwen3.5's processor never emits it.
+        mm_token_type_ids = batch.get("mm_token_type_ids", None)
         attention_mask = (
             batch.get("attention_mask", None)
             or batch.get("observation.language.attention_mask", None)
@@ -1128,6 +1133,8 @@ class LoLAV07Policy(PreTrainedPolicy):
                 forward_kwargs["pixel_values"] = pixel_values
             if image_grid_thw is not None:
                 forward_kwargs["image_grid_thw"] = image_grid_thw
+            if mm_token_type_ids is not None:
+                forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
             if attention_mask is not None:
                 forward_kwargs["attention_mask"] = attention_mask
 

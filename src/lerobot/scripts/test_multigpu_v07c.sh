@@ -1,6 +1,8 @@
 #!/bin/bash
-# LoLA V07 多卡分布式训练测试脚本（非流式）
-# 使用 LoLADataset (--load_full_history) 进行训练
+# LoLA V07-C 多卡分布式训练测试脚本（Cosmos3-Nano Reasoner VLM 变体）
+# 与 test_multigpu_v07.sh 的唯一区别: VLM backbone 从 Qwen3.5-4B 换成 Cosmos3-Nano
+# 注意: Cosmos3 reasoner (hidden 4096, 36层) 参数量约为 Qwen3.5-4B 的 2 倍,
+#       如 OOM 请先降低 BATCH_SIZE; train_vlm 解冻后显存开销也会显著增大
 
 eval "$(conda shell.bash hook)"
 conda activate lerobot-gcr3
@@ -23,7 +25,8 @@ DATASET_REPO_ID="calvin_task_ABC_D_training_v4"
 DATASET_ROOT="/data_6t_2/lerobot_v30/calvin_task_ABC_D_training_v4/"
 
 # 模型参数
-VLM_PATH="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/"
+VLM_BACKBONE="cosmos3_nano"
+VLM_PATH="/data_6t_1/cosmos3/Cosmos3-Nano/"
 ACTION_DIM=7
 ACTION_CHUNK_SIZE=8
 PRED_CHUNK_SIZE=40
@@ -33,7 +36,7 @@ N_OBS_STEPS=1
 TRAIN_VLM=false
 VLM_LR=1e-6
 VLM_EXTRACT_LAYERS="8 16 24"
-# VLM 桥接器: legacy = 兼容旧 checkpoint; transformer = LolaVLMContextBridge (~0.63B, 新训练推荐)
+# VLM 桥接器: transformer = LolaVLMContextBridge (降维2048+8层Transformer, ~0.63B, 替代1.77B legacy 方阵)
 VLM_BRIDGE_MODE="transformer"
 VLM_BRIDGE_WIDTH=2048
 VLM_BRIDGE_LAYERS=8
@@ -70,7 +73,7 @@ VLM_LR_MULT=1.5
 # Special tokens
 USE_SPECIAL_TOKENS=true
 
-CKPT_DIR="/data_16T/deepseek/checkpoints/lola_v07"
+CKPT_DIR="/data_16T/deepseek/checkpoints/lola_v07c"
 
 # 历史 action 加载参数
 LOAD_FULL_HISTORY=true
@@ -112,6 +115,7 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_v07_mul
     --learning_rate ${LEARNING_RATE} \
     --precision ${PRECISION} \
     --log_every_n_steps ${LOG_EVERY_N_STEPS} \
+    --vlm_backbone ${VLM_BACKBONE} \
     --vlm_path ${VLM_PATH} \
     --action_dim ${ACTION_DIM} \
     --action_chunk_size ${ACTION_CHUNK_SIZE} \

@@ -8,6 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -22,8 +23,7 @@ from diffusers.models.embeddings import apply_rotary_emb
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.lola.configuration_lola import LoLAConfig
-
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+from lerobot.policies.lola.vlm_backbone import get_vlm_backbone
 
 # ----------------------------------------------------------------------
 # Helper Functions
@@ -239,8 +239,152 @@ class LolaVLMFeatureExtractor(nn.Module):
 
         empty_fused = self.empty_token_proj(empty_token) + self.empty_token_shortcut(empty_token)
         empty_emb = self.empty_token_out_proj(empty_fused) # [B, 1536]
-        
+
         return vlm_emb, empty_emb
+
+
+# ----------------------------------------------------------------------
+# VLM 桥接器 (Transformer 模式): 降维投影 + 多层双向 Transformer 上下文重表达
+# ----------------------------------------------------------------------
+def _build_rope_cos_sin(seq_len: int, head_dim: int, device, dtype, base: float = 10000.0):
+    """标准 RoPE 的 cos/sin 缓存, 返回 [seq_len, head_dim] (half-split 约定)"""
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)            # [L, head_dim//2]
+    emb = torch.cat([freqs, freqs], dim=-1)             # [L, head_dim]
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x: [B, H, L, head_dim]; cos/sin: [L, head_dim]"""
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    half = x.shape[-1] // 2
+    x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+    return x * cos + x_rot * sin
+
+
+class LolaVLMContextBridgeBlock(nn.Module):
+    """Pre-LN Transformer block: 双向 MHA (RoPE) + SwiGLU FFN"""
+    def __init__(self, width: int, num_heads: int, ffn_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = width // num_heads
+        self.ln1 = nn.LayerNorm(width, eps=1e-6)
+        self.q_proj = nn.Linear(width, width, bias=False)
+        self.k_proj = nn.Linear(width, width, bias=False)
+        self.v_proj = nn.Linear(width, width, bias=False)
+        self.o_proj = nn.Linear(width, width, bias=False)
+        self.ln2 = nn.LayerNorm(width, eps=1e-6)
+        self.gate_proj = nn.Linear(width, ffn_dim, bias=False)
+        self.up_proj = nn.Linear(width, ffn_dim, bias=False)
+        self.down_proj = nn.Linear(ffn_dim, width, bias=False)
+
+    def forward(self, x, cos, sin, key_padding_mask=None):
+        b, l, _ = x.shape
+        h = self.ln1(x)
+        q = self.q_proj(h).view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=key_padding_mask)
+        o = o.transpose(1, 2).reshape(b, l, -1)
+        x = x + self.o_proj(o)
+        h = self.ln2(x)
+        x = x + self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h))
+        return x
+
+
+class LolaVLMContextBridge(nn.Module):
+    """新型 VLM 桥接器: concat 降维 + 多层双向 Transformer 重新表达 VLM 上下文特征.
+
+    与 LolaVLMFeatureExtractor 接口完全一致:
+        输入: 各层 hidden states 字典 (key 为层编号)
+        输出: (vlm_emb [B, SeqLen-1, dit_hidden], empty_emb [B, dit_hidden])
+
+    设计要点:
+    - 参数花在跨 token 注意力 (上下文重表达) 而非逐 token 的 concat² 方阵上;
+    - empty token 不再单独设分支, 作为序列最后一个位置共享整条管线,
+      其对全序列的注意力读出即天然的全局 pooling;
+    - 支持 attention_mask (左 padding 场景防止 attend 到 pad 位置);
+    - 输出最后一层 zero-init, 训练初期近似 shortcut 线性直通, 保证稳定.
+    """
+    def __init__(self, config: LoLAConfig):
+        super().__init__()
+        self.extract_layers = [layer_idx for layer_idx in config.vlm_extract_layers]
+
+        concat_dim = config.vlm_hidden_size * len(self.extract_layers)
+        width = config.vlm_bridge_width
+        d_out = config.dit_hidden_size
+        num_heads = config.vlm_bridge_num_heads
+        ffn_dim = int(width * config.vlm_bridge_ffn_ratio)
+
+        self.input_proj = nn.Linear(concat_dim, width)
+        self.input_norm = nn.LayerNorm(width, eps=1e-6)
+        self.blocks = nn.ModuleList(
+            [LolaVLMContextBridgeBlock(width, num_heads, ffn_dim) for _ in range(config.vlm_bridge_layers)]
+        )
+        self.final_norm = nn.LayerNorm(width, eps=1e-6)
+        self.output_proj = nn.Sequential(
+            nn.Linear(width, d_out),
+            nn.LayerNorm(d_out, eps=1e-6),
+            nn.SiLU(),
+            nn.Linear(d_out, d_out),
+        )
+        self.shortcut = nn.Linear(concat_dim, d_out)
+
+        # zero-init 输出最后一层: 初期 ≈ shortcut 直通
+        nn.init.zeros_(self.output_proj[-1].weight)
+        nn.init.zeros_(self.output_proj[-1].bias)
+
+        self.head_dim = width // num_heads
+        self.gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
+
+    def _block_forward(self, block, x, cos, sin, key_padding_mask):
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                block, x, cos, sin, key_padding_mask, use_reentrant=False
+            )
+        return block(x, cos, sin, key_padding_mask)
+
+    def forward(self, hidden_states_all_layers: Dict[int, torch.Tensor],
+                attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states_all_layers: Dict[int, Tensor] 仅包含所需层的 hidden_states
+            attention_mask: [B, SeqLen] (1=valid, 含 empty token), 可选
+
+        Returns:
+            vlm_emb: [B, SeqLen-1, dit_hidden_size]
+            empty_emb: [B, dit_hidden_size]
+        """
+        selected_hiddens = [hidden_states_all_layers[i] for i in self.extract_layers]
+        stacked_features = torch.cat(selected_hiddens, dim=-1)  # [B, SeqLen, concat_dim]
+        b, seq_len, _ = stacked_features.shape
+
+        x = self.input_norm(self.input_proj(stacked_features))
+        cos, sin = _build_rope_cos_sin(seq_len, self.head_dim, x.device, x.dtype)
+
+        key_padding_mask = None
+        if attention_mask is not None:
+            # SDPA bool mask: True = 允许参与注意力 (broadcast 到 [B, H, L, L])
+            key_padding_mask = attention_mask.bool()[:, None, None, :]
+
+        for block in self.blocks:
+            x = self._block_forward(block, x, cos, sin, key_padding_mask)
+
+        x = self.final_norm(x)
+        out = self.output_proj(x) + self.shortcut(stacked_features)  # [B, SeqLen, dit_hidden]
+
+        return out[:, :-1], out[:, -1]
+
+
+def build_vlm_bridge(config: LoLAConfig) -> nn.Module:
+    """按 config.vlm_bridge_mode 构造 VLM 桥接器 (接口一致, 可互换)"""
+    if getattr(config, "vlm_bridge_mode", "legacy") == "transformer":
+        return LolaVLMContextBridge(config)
+    return LolaVLMFeatureExtractor(config)
 
 class LolaConditionEmbedder(nn.Module):
     """融合 Timestep 与空 Token（以及可选的 State）生成 Modulation 条件"""
@@ -871,7 +1015,7 @@ class LoLAPytorch(nn.Module):
     def __init__(self, config: LoLAConfig):
         super().__init__()
         self.config = config
-        self.vlm_bridge = LolaVLMFeatureExtractor(config)
+        self.vlm_bridge = build_vlm_bridge(config)
         self.action_encoder = LolaActionEncoder(config)
         self.state_encoder = LolaStateEncoder(config) if config.history_type == "state" else None
         self.dit = LoLADiT(config)
@@ -903,6 +1047,12 @@ class LoLAPytorch(nn.Module):
             return self._checkpoint_fn(func, *args, **kwargs, **self._checkpoint_fn_kwargs)
         return func(*args, **kwargs)
 
+    def _run_vlm_bridge(self, hidden_states_all_layers, vlm_attention_mask=None):
+        """统一的桥接器调用入口: transformer 模式透传 attention_mask, legacy 模式忽略."""
+        if isinstance(self.vlm_bridge, LolaVLMContextBridge):
+            return self.vlm_bridge(hidden_states_all_layers, attention_mask=vlm_attention_mask)
+        return self.vlm_bridge(hidden_states_all_layers)
+
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
                 hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None):
         """
@@ -916,7 +1066,7 @@ class LoLAPytorch(nn.Module):
         device = target_actions.device
 
         # 1. 获取基础特征
-        vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
+        vlm_features, empty_emb = self._run_vlm_bridge(hidden_states_all_layers, vlm_attention_mask)
         hist_chunks = self.state_encoder(hist_actions) if self.state_encoder is not None else self.action_encoder(hist_actions)
         target_chunks = self.action_encoder(target_actions)
 
@@ -1036,7 +1186,7 @@ class LoLAPytorch(nn.Module):
         b = hist_actions.shape[0]
         device = hist_actions.device
 
-        vlm_features, empty_emb = self.vlm_bridge(hidden_states_all_layers)
+        vlm_features, empty_emb = self._run_vlm_bridge(hidden_states_all_layers)
         hist_chunks = self.state_encoder(hist_actions) if self.state_encoder is not None else self.action_encoder(hist_actions)
         hist_chunks_mask = None
         if hist_actions_mask is not None:
@@ -1126,28 +1276,25 @@ class LoLAPolicy(PreTrainedPolicy):
         # VLM 加载策略：
         # 对于分布式训练（DeepSpeed/FSDP），VLM 需要特殊处理
         # 方案：先加载到 CPU，然后让分布式策略管理设备分配
+        # Backbone 由 config.vlm_backbone 决定（见 policies/lola/vlm_backbone.py）
+        vlm_spec = get_vlm_backbone(self.config.vlm_backbone)
         if self.config.vlm_path is not None:
-            self.vlm = Qwen3_5Model.from_pretrained(
+            self.vlm = vlm_spec.load_model(
                 self.config.vlm_path,
-                torch_dtype=self._dtype,
-                device_map=None,  # 不自动分配，让分布式策略管理
-                low_cpu_mem_usage=True,
+                dtype=self._dtype,
                 local_files_only=True,
-                attn_implementation="sdpa",
             )
         else:
-            self.vlm = Qwen3_5Model.from_pretrained(
+            self.vlm = vlm_spec.load_model(
                 self.config.vlm_model_name,
-                torch_dtype=self._dtype,
-                device_map=None,
-                low_cpu_mem_usage=True,
-                attn_implementation="sdpa",
+                dtype=self._dtype,
             )
 
         # Remove unused VLM parameters to fix DDP find_unused_parameters=False error.
-        # LoLA only extracts hidden_states from layers 8/16/24, so layers 24-31,
+        # LoLA only extracts hidden_states from layers 8/16/24, so layers 24+,
         # final norm, and lm_head are dead branches with zero gradients.
-        # Qwen3_5Model (vs Qwen3_5ForConditionalGeneration) already eliminates lm_head.
+        # Backbone loaders (vlm_backbone.py) use base model classes that already
+        # eliminate lm_head (Qwen3_5Model / Cosmos3OmniModel).
         last_extract_layer = max(self.config.vlm_extract_layers)
         lang_model = self.vlm.language_model
         for i in range(len(lang_model.layers) - 1, last_extract_layer - 1, -1):
@@ -1397,6 +1544,9 @@ class LoLAPolicy(PreTrainedPolicy):
         # 2. 提取视觉输入（如果有）
         pixel_values = batch.get("pixel_values", None)
         image_grid_thw = batch.get("image_grid_thw", None)
+        # mm_token_type_ids is required by Cosmos3-Nano (Qwen3-VL) M-RoPE when
+        # image_grid_thw is passed; Qwen3.5's processor never emits it.
+        mm_token_type_ids = batch.get("mm_token_type_ids", None)
         attention_mask = batch.get("attention_mask", None) or batch.get("observation.language.attention_mask", None)
 
         # 3. 调用 Qwen3.5 获取 hidden_states
@@ -1417,6 +1567,7 @@ class LoLAPolicy(PreTrainedPolicy):
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                     attention_mask=attention_mask,
+                    mm_token_type_ids=mm_token_type_ids,
                 )
             elif self._vlm_forward_mode == "output_hidden_states":
                 # output_hidden_states mode: compatible with torch.compile + FSDP.
@@ -1432,6 +1583,8 @@ class LoLAPolicy(PreTrainedPolicy):
                     forward_kwargs["pixel_values"] = pixel_values
                 if image_grid_thw is not None:
                     forward_kwargs["image_grid_thw"] = image_grid_thw
+                if mm_token_type_ids is not None:
+                    forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
                 if attention_mask is not None:
                     forward_kwargs["attention_mask"] = attention_mask
 
@@ -1457,6 +1610,8 @@ class LoLAPolicy(PreTrainedPolicy):
                     forward_kwargs["pixel_values"] = pixel_values
                 if image_grid_thw is not None:
                     forward_kwargs["image_grid_thw"] = image_grid_thw
+                if mm_token_type_ids is not None:
+                    forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
                 if attention_mask is not None:
                     forward_kwargs["attention_mask"] = attention_mask
 
@@ -1476,7 +1631,7 @@ class LoLAPolicy(PreTrainedPolicy):
 
         return hidden_states_all_layers, input_ids
 
-    def _vlm_split_forward(self, input_ids, pixel_values=None, image_grid_thw=None, attention_mask=None):
+    def _vlm_split_forward(self, input_ids, pixel_values=None, image_grid_thw=None, attention_mask=None, mm_token_type_ids=None):
         """Split VLM forward into segments at extract layers, avoiding hooks.
 
         Instead of registering forward hooks on decoder layers (which causes graph breaks
@@ -1489,6 +1644,13 @@ class LoLAPolicy(PreTrainedPolicy):
 
         This makes the entire VLM forward visible to torch.compile as a single graph.
         """
+        if not get_vlm_backbone(self.config.vlm_backbone).supports_split_forward:
+            raise RuntimeError(
+                f"VLM backbone '{self.config.vlm_backbone}' does not support 'split' forward "
+                f"mode: _vlm_split_forward inlines Qwen3.5 vision encoder internals "
+                f"(fast_pos_embed_interpolate, merger, etc.) that do not exist on this "
+                f"backbone's vision tower. Use 'hook' or 'output_hidden_states' mode instead."
+            )
         vlm_model = self.vlm  # Qwen3_5Model
         lang_model = vlm_model.language_model  # Qwen3_5TextModel
 

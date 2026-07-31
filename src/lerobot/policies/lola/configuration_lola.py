@@ -30,11 +30,21 @@ class LoLAConfig(PreTrainedConfig):
     # ==========================
     # 1. VLM Settings
     # ==========================
-    vlm_model_name: str = "Qwen/Qwen3.5-4B" # Qwen3.5-4B
+    vlm_backbone: str = "qwen3_5"          # VLM backbone: "qwen3_5" or "cosmos3_nano" (see policies/lola/vlm_backbone.py)
+    vlm_model_name: str | None = None      # None → backbone default (qwen3_5: "Qwen/Qwen3.5-4B", cosmos3_nano: "nvidia/Cosmos3-Nano")
     vlm_path: str | None = None
-    vlm_extract_layers: tuple = (8, 16, 24)
-    vlm_hidden_size: int = 2560                # Qwen3.5 提供的 hidden_size
-    empty_token_id: int = 248044               # 使用 Qwen3.5 的 eos_token 作为空 Token
+    vlm_extract_layers: tuple | None = None  # None → backbone default (8, 16, 24)
+    vlm_hidden_size: int | None = None     # None → backbone default (qwen3_5: 2560, cosmos3_nano: 4096)
+    empty_token_id: int | None = None      # None → backbone default (qwen3_5: 248044, cosmos3_nano: 151645)
+
+    # VLM → DiT 桥接器 ("vlm_bridge")
+    # "legacy": LolaVLMFeatureExtractor (concat→concat 大方阵, 兼容旧 checkpoint)
+    # "transformer": LolaVLMContextBridge (降维 + 多层双向 Transformer 上下文重表达, ~0.63B)
+    vlm_bridge_mode: str = "legacy"
+    vlm_bridge_width: int = 2048           # transformer 模式的桥接宽度
+    vlm_bridge_layers: int = 8             # transformer 模式的层数
+    vlm_bridge_ffn_ratio: float = 4.0      # SwiGLU FFN 扩展比
+    vlm_bridge_num_heads: int = 0          # 0 → 自动 width // 128
 
     # ==========================
     # 2. Action Encoding Settings
@@ -155,12 +165,33 @@ class LoLAConfig(PreTrainedConfig):
         self.arm_dim = self.action_dim - len(self.gripper_dim_indices_abs)
         self.gripper_dim = len(self.gripper_dim_indices_abs)
 
-        # Validate configuration
-        if self.vlm_model_name not in ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-2B"]:
-            raise ValueError(f"Invalid vlm_model_name: {self.vlm_model_name}")
+        # Resolve VLM backbone defaults (None → backbone-specific value from registry)
+        from lerobot.policies.lola.vlm_backbone import get_vlm_backbone
+        vlm_spec = get_vlm_backbone(self.vlm_backbone)  # raises ValueError on unknown backbone
+        if self.vlm_model_name is None:
+            self.vlm_model_name = vlm_spec.default_model_name
+        if self.vlm_extract_layers is None:
+            self.vlm_extract_layers = vlm_spec.default_extract_layers
+        if self.vlm_hidden_size is None:
+            self.vlm_hidden_size = vlm_spec.default_hidden_size
+        if self.empty_token_id is None:
+            self.empty_token_id = vlm_spec.default_empty_token_id
 
+        # Validate configuration
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.vlm_bridge_mode not in ("legacy", "transformer"):
+            raise ValueError(
+                f"Invalid vlm_bridge_mode: {self.vlm_bridge_mode}, must be 'legacy' or 'transformer'"
+            )
+        if self.vlm_bridge_num_heads == 0:
+            if self.vlm_bridge_width % 128 != 0:
+                raise ValueError(
+                    f"vlm_bridge_width ({self.vlm_bridge_width}) must be divisible by 128 when "
+                    "vlm_bridge_num_heads=0 (auto)"
+                )
+            self.vlm_bridge_num_heads = self.vlm_bridge_width // 128
 
         if self.history_type not in ("action", "state"):
             raise ValueError(f"Invalid history_type: {self.history_type}, must be 'action' or 'state'")

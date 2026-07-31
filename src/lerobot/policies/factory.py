@@ -30,7 +30,7 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.policies.groot.configuration_groot import GrootConfig
+GrootConfig = None
 from lerobot.policies.lola.configuration_lola import LoLAConfig
 from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
 from lerobot.policies.robovlm.configuration_robovlm import RoboVLMConfig
@@ -350,13 +350,13 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif isinstance(policy_cfg, GrootConfig):
-        from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+    # elif isinstance(policy_cfg, GrootConfig):
+    #     from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
 
-        processors = make_groot_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
+    #     processors = make_groot_pre_post_processors(
+    #         config=policy_cfg,
+    #         dataset_stats=kwargs.get("dataset_stats"),
+    #     )
 
     elif isinstance(policy_cfg, LoLAConfig):
         from lerobot.policies.lola.processor_lola import make_lola_pre_post_processors
