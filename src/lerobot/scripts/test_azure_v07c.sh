@@ -33,7 +33,7 @@ fi
 
 # Ensure kernel cache directory exists (avoids "Specified kernel cache directory
 # could not be created" warning from torch.cuda on first CUDA JIT compile)
-mkdir -p /root/.cache/torch/kernels
+# mkdir -p /root/.cache/torch/kernels
 
 # ----------------------------------------------------------------------
 # 默认参数（可被命令行参数覆盖）
