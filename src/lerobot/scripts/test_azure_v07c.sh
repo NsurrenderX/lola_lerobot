@@ -24,13 +24,18 @@ set -e
 # 环境变量设置
 export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
 export TOKENIZERS_PARALLELISM=false
-export PATH=/opt/conda/envs/lerobot/bin:$PATH
-conda run --name lerobot which python
+# /home/aiscuser/.conda/envs/lerobot/bin/ for gcr
+export PATH=/home/aiscuser/.conda/envs/lerobot/bin/:/opt/conda/envs/lerobot/bin:$PATH
+# conda run --name lerobot which python
 # Add conda env lib to LD_LIBRARY_PATH so torchcodec can find ffmpeg shared libs
 # Also ensures conda's newer libstdc++ is used (avoids CXXABI_1.3.15 not found error)
-if [ -d "/opt/conda/envs/lerobot/lib" ]; then
-    export LD_LIBRARY_PATH="/opt/conda/envs/lerobot/lib:${LD_LIBRARY_PATH:-}"
+if [ -d "/home/aiscuser/.conda/envs/lerobot/lib" ]; then
+    export LD_LIBRARY_PATH="/home/aiscuser/.conda/envs/lerobot/lib:${LD_LIBRARY_PATH:-}"
 fi
+
+# if [ -d "/opt/conda/envs/lerobot/lib" ]; then
+#     export LD_LIBRARY_PATH="/opt/conda/envs/lerobot/lib:${LD_LIBRARY_PATH:-}"
+# fi
 
 # Ensure kernel cache directory exists (avoids "Specified kernel cache directory
 # could not be created" warning from torch.cuda on first CUDA JIT compile)
@@ -526,10 +531,12 @@ echo "========================================"
 # 启动训练
 # 使用 torchrun 来管理多 GPU，每个节点运行一次
 # 单节点时使用简化命令，多节点时使用完整参数
+# /home/aiscuser/.conda/envs/lerobot/bin for gcr
+# /opt/conda/envs/lerobot/bin for kubenets
 # ----------------------------------------------------------------------
 if [ "$NNODES" -eq 1 ]; then
     # 单节点：使用简化的 torchrun 命令
-    cmd="/opt/conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
+    cmd="/home/aiscuser/.conda/envs/lerobot/bin/torchrun --nproc_per_node=${NPROC_PER_NODE} \
         src/lerobot/scripts/train_lola_v07_azure.py \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
@@ -576,7 +583,7 @@ if [ "$NNODES" -eq 1 ]; then
         --wandb_project ${WANDB_PROJECT}"
 else
     # 多节点：使用完整的分布式参数
-    cmd="/opt/conda/envs/lerobot/bin/torchrun \
+    cmd="/home/aiscuser/.conda/envs/lerobot/bin/torchrun \
         --nnodes=${NNODES} \
         --nproc_per_node=${NPROC_PER_NODE} \
         --node_rank=${NODE_RANK} \
