@@ -24,6 +24,8 @@ set -e
 # 环境变量设置
 export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
 export TOKENIZERS_PARALLELISM=false
+# 消除 allocator 碎片导致的虚高显存水位 (ZeRO-3 分片下大量小碎片场景效果显著)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # /home/aiscuser/.conda/envs/lerobot/bin/ for gcr
 export PATH=/home/aiscuser/.conda/envs/lerobot/bin/:/opt/conda/envs/lerobot/bin:$PATH
 # conda run --name lerobot which python
@@ -142,7 +144,9 @@ NUM_WORKERS=8
 
 # DeepSpeed 参数
 DEEPSPEED_CONFIG=""
-DEEPSPEED_ZERO_STAGE=2
+# ZeRO-3: 参数/梯度/优化器全分片, 40GB 级显卡全解冻训练 8B VLM 的必需项
+# (ZeRO-2 参数+梯度全量复制, 静态即 ~39GB, 40GB 卡放不下; 80GB+ 卡可改回 2)
+DEEPSPEED_ZERO_STAGE=3
 DEEPSPEED_REDUCE_BUCKET_SIZE=5e7
 DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
 

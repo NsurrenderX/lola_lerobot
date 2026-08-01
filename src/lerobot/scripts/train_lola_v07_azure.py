@@ -55,6 +55,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+# 调试开关: LOLA_DETECT_ANOMALY=1 时开启 autograd anomaly detection (定位 backward 错误来源)
+if os.environ.get("LOLA_DETECT_ANOMALY") == "1":
+    torch.autograd.set_detect_anomaly(True)
+
 try:
     import wandb
     HAS_WANDB = True
@@ -445,13 +449,22 @@ def get_deepspeed_config(
         "allgather_bucket_size": allgather_bucket_size,
         "reduce_bucket_size": reduce_bucket_size,
     }
-    if zero_stage >= 2:
+    if zero_stage == 2:
         zero_optimization.update({
             "overlap_comm": False,
             "reduce_scatter": True,
             "contiguous_gradients": False,
             "round_robin_gradients": True,
         })
+    # ZeRO-3: DeepSpeed 0.18 默认值即合理
+    # (prefetch_bucket=5e7, max_live_parameters=1e9,
+    #  gather_16bit_weights_on_model_save=False 即按 rank 分片保存, resume 需相同 world size);
+    # ZeRO-2 专属的 round_robin_gradients 等键不能传给 stage 3。
+    # 例外: param_persistence_threshold 必须为 0 — DS 0.18 的 ZeRO-3 load_state_dict
+    # 末尾会对 persistent(小)参数执行 partition(), 破坏其梯度账目, resume 后第一次
+    # backward 即崩 ("size of tensor a (0) ... at AccumulateGrad"); 置 0 禁用该路径。
+    if zero_stage >= 3:
+        zero_optimization["param_persistence_threshold"] = 0
 
     return {
         "bf16": {"enabled": True},
@@ -477,6 +490,35 @@ def get_deepspeed_config(
             "synchronize_checkpoint_boundary": False,
         },
     }
+
+
+def peek_deepspeed_checkpoint_vlm_unfrozen(ckpt_path: str) -> bool:
+    """Peek a DeepSpeed checkpoint's client_state for vlm_unfrozen WITHOUT loading the engine.
+
+    用于 resume 场景: 如果 checkpoint 保存时 VLM 已解冻, 训练引擎必须在加载前就以
+    "VLM 可训练" 的结构构建 (否则优化器分组不匹配, 加载会失败或退化为丢失 Adam 矩
+    的重建)。client_state 由 save_checkpoint 合并进每个 rank 的 model_states 文件,
+    读任意一个即可。
+
+    Returns:
+        True if the checkpoint was saved with VLM unfrozen, False otherwise (or on any error).
+    """
+    try:
+        # ckpt_path 可能是 tag 目录本身或其父目录
+        if os.path.exists(os.path.join(ckpt_path, "latest")):
+            tag = open(os.path.join(ckpt_path, "latest")).read().strip()
+            tag_dir = os.path.join(ckpt_path, tag)
+        else:
+            tag_dir = ckpt_path
+        if not os.path.isdir(tag_dir):
+            return False
+        for fname in sorted(os.listdir(tag_dir)):
+            if fname.endswith("model_states.pt"):
+                state = torch.load(os.path.join(tag_dir, fname), map_location="cpu", weights_only=False)
+                return bool(state.get("vlm_unfrozen", False))
+    except Exception as e:
+        _log(f"peek_deepspeed_checkpoint_vlm_unfrozen({ckpt_path}) failed: {e}")
+    return False
 
 
 # ----------------------------------------------------------------------
@@ -777,6 +819,7 @@ class LoLAV07Trainer:
         deepspeed_reduce_bucket_size: float = 5e7,
         deepspeed_allgather_bucket_size: float = 5e7,
         deepspeed_zero_stage: int = 2,
+        resume_vlm_unfrozen: bool = False,
         training_args: dict | None = None,
         dataset_metadata: dict | None = None,
     ):
@@ -847,6 +890,13 @@ class LoLAV07Trainer:
         if self.train_vlm and self.config.vlm_unfreeze_v_loss_threshold > 0:
             self._vlm_delayed_unfreeze = True
 
+        # Resume 一个 VLM 已解冻的 checkpoint: 引擎必须从一开始就以 VLM 可训练的结构
+        # 构建 (优化器分组匹配, Adam 矩无损恢复), 跳过延迟解冻的冻结阶段
+        self._resume_vlm_unfrozen = resume_vlm_unfrozen
+        if resume_vlm_unfrozen and self.train_vlm:
+            self._vlm_unfrozen = True
+            self._vlm_delayed_unfreeze = False
+
     def setup_model(self):
         # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
         torch.backends.cuda.enable_cudnn_sdp(True)
@@ -881,6 +931,14 @@ class LoLAV07Trainer:
             for param in self.policy.vlm.parameters():
                 param.requires_grad = False
             self.policy.vlm.eval()
+
+        # Resume from a checkpoint saved with VLM unfrozen: engine must be built with
+        # VLM trainable from the start so optimizer groups match the checkpoint
+        if self.train_vlm and self._resume_vlm_unfrozen:
+            _log("Resume with VLM unfrozen: VLM trainable from engine construction")
+            for param in self.policy.vlm.parameters():
+                param.requires_grad = True
+            self.policy.vlm.train()
 
         # 打印参数统计
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
@@ -1060,8 +1118,17 @@ class LoLAV07Trainer:
         _log(f"DeepSpeed ZeRO-{self.deepspeed_zero_stage} initialized: {trainable_count:,} trainable params")
 
     def _configure_deepspeed_checkpointing(self):
-        """Replace PyTorch checkpointing with DeepSpeed's in LoLA model."""
+        """Replace PyTorch checkpointing with DeepSpeed's in LoLA model.
+
+        注意: DeepSpeed 的 non_reentrant_checkpoint 与 ZeRO-3 的参数分片不兼容
+        (backward recompute 时 param.grad 视图失配: "size of tensor a (0) ..."),
+        ZeRO-3 下必须保留 PyTorch 默认 checkpoint (实测 fwd/bwd/step 正常)。
+        """
         if not self.config.gradient_checkpointing:
+            return
+        if self.deepspeed_zero_stage >= 3:
+            _log("ZeRO-3: keeping PyTorch default activation checkpointing "
+                 "(deepspeed non_reentrant_checkpoint is incompatible with ZeRO-3 sharding)")
             return
 
         _log("Configuring DeepSpeed activation checkpointing for DiT...")
@@ -1190,19 +1257,21 @@ class LoLAV07Trainer:
         DeepSpeed ZeRO partitioning is set at engine initialization and cannot be
         dynamically changed. To add VLM optimizer states, we must rebuild the
         entire engine. This method:
-        1. Extracts all model weights (including frozen VLM) via named_parameters()
-        2. Destroys old engine (removes ZeRO-2 gradient hooks from parameters)
+        1. Extracts all model weights (including frozen VLM)
+           - ZeRO-2: clone to CPU pinned memory (avoids a +16GB GPU transient spike)
+           - ZeRO-3: params are sharded, clone/copy_ won't work → save/load checkpoint
+             roundtrip with exclude_frozen_parameters=False (frozen VLM shards included)
+        2. Destroys old engine (removes ZeRO gradient hooks from parameters)
         3. Unfreezes VLM parameters (requires_grad=True, .train())
         4. Switches VLM forward mode and enables gradient checkpointing
         5. Rebuilds DeepSpeed engine with VLM group included
-        6. Restores model weights directly via data.copy_()
+        6. Restores model weights (ZeRO-2: copy_ from CPU; ZeRO-3: load_checkpoint weights-only)
         7. Replaces trainer references and re-configures checkpointing
 
-        This approach avoids the save_checkpoint/load_checkpoint roundtrip which
-        breaks when exclude_frozen_parameters=True (the saved checkpoint lacks
-        VLM params, so the new engine can't load them). For ZeRO-2, parameters
-        are NOT partitioned across ranks, so named_parameters() returns complete
-        weights on each rank — no disk I/O needed.
+        For ZeRO-2 the save/load roundtrip breaks when exclude_frozen_parameters=True
+        (the saved checkpoint lacks VLM params, so the new engine can't load them),
+        and parameters are NOT partitioned across ranks, so named_parameters() returns
+        complete weights on each rank — no disk I/O needed.
 
         The old engine must be destroyed before rebuilding to remove ZeRO-2's
         register_post_accumulate_grad_hook from parameters; otherwise both old
@@ -1212,13 +1281,28 @@ class LoLAV07Trainer:
         _log(f"Unfreezing VLM for DeepSpeed at step {self.global_step}")
 
         # 1. Extract all model weights BEFORE any changes (includes frozen VLM params)
-        #    For ZeRO-2, parameters are NOT partitioned, so this is a simple dict copy.
-        #    For ZeRO-3, use model_engine._consolidated_16bit_state_dict() instead.
+        zero3_roundtrip_dir = None
         if self.deepspeed_zero_stage >= 3:
-            state_dict = self.model_engine._consolidated_16bit_state_dict()
+            # ZeRO-3: parameters are partitioned (ds_tensor shards), so clone()/copy_()
+            # of full weights is impossible. Save a temporary full checkpoint
+            # (exclude_frozen_parameters=False → frozen VLM shards are included via
+            # frozen_param_fragments) and reload weights into the rebuilt engine.
+            zero3_roundtrip_dir = os.path.join(self.ckpt_dir, f"_unfreeze_tmp_step{self.global_step}")
+            self.model_engine.save_checkpoint(
+                save_dir=zero3_roundtrip_dir,
+                tag="unfreeze",
+                exclude_frozen_parameters=False,
+            )
+            state_dict = None
+            _log(f"Saved temporary ZeRO-3 roundtrip checkpoint: {zero3_roundtrip_dir}")
         else:
-            state_dict = {k: v.clone() for k, v in self.model_engine.module.named_parameters()}
-        _log(f"Extracted {len(state_dict)} param tensors from old engine for weight restoration")
+            # ZeRO-2: clone to CPU pinned memory. The previous GPU-side clone caused a
+            # +P*2 bytes transient spike per rank (16GB+ for cosmos) at the unfreeze step.
+            state_dict = {
+                k: v.detach().to("cpu", copy=True).pin_memory()
+                for k, v in self.model_engine.module.named_parameters()
+            }
+            _log(f"Extracted {len(state_dict)} param tensors from old engine for weight restoration (CPU pinned)")
 
         # 2. Destroy old engine to remove ZeRO-2 gradient hooks from parameters.
         #    Without this, the old hooks remain on parameters and the new engine
@@ -1226,6 +1310,33 @@ class LoLAV07Trainer:
         #    "The parameter X has already been reduced. Gradient computed twice."
         self.model_engine.destroy()
         _log("Destroyed old DeepSpeed engine (removed gradient hooks)")
+
+        # 2b. Release the old engine's optimizer memory BEFORE building the new
+        #     engine. destroy() only removes hooks — ~P*12 bytes of GPU state
+        #     (fp32 masters, Adam m/v, grad buffers) stays pinned by reference
+        #     chains gc won't reclaim on its own:
+        #     - param._z3_optimizer (stage3._link_all_hp_params): module params
+        #       pin the old stage3 optimizer (new engine re-links at init)
+        #     - param.grad views pin the flat grad buffer
+        #     - engine.optimizer/basic_optimizer (FusedAdam.state holds m/v)
+        #     - the graph loss tensor's backward-hook manager (loss detached at
+        #       the call site before this method runs)
+        for p in self.policy.parameters():
+            if hasattr(p, "_z3_optimizer"):
+                p._z3_optimizer = None
+            if p.grad is not None:
+                p.grad = None
+        self.model_engine.optimizer = None
+        self.model_engine.lr_scheduler = None
+        self.model_engine.basic_optimizer = None
+        self.model_engine = None
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log("Released old engine optimizer memory")
 
         self._vlm_unfrozen = True
         self._vlm_delayed_unfreeze = False
@@ -1246,15 +1357,20 @@ class LoLAV07Trainer:
 
         # 5. Enable VLM gradient checkpointing
         if self.config.gradient_checkpointing:
-            ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
             self.policy.vlm.gradient_checkpointing_enable()
-            vlm = self.policy.vlm
-            if hasattr(vlm, '_gradient_checkpointing_func'):
-                vlm._gradient_checkpointing_func = ds_fn
-            for module in vlm.modules():
-                if hasattr(module, '_gradient_checkpointing_func'):
-                    module._gradient_checkpointing_func = ds_fn
-            _log("VLM gradient checkpointing enabled with DeepSpeed checkpointing func")
+            if self.deepspeed_zero_stage < 3:
+                # ZeRO-2 下可用 DeepSpeed checkpoint func; ZeRO-3 必须保留 PyTorch 默认
+                # (ds non_reentrant_checkpoint + ZeRO-3 分片 → backward param.grad 视图失配)
+                ds_fn = deepspeed.checkpointing.non_reentrant_checkpoint
+                vlm = self.policy.vlm
+                if hasattr(vlm, '_gradient_checkpointing_func'):
+                    vlm._gradient_checkpointing_func = ds_fn
+                for module in vlm.modules():
+                    if hasattr(module, '_gradient_checkpointing_func'):
+                        module._gradient_checkpointing_func = ds_fn
+                _log("VLM gradient checkpointing enabled with DeepSpeed checkpointing func")
+            else:
+                _log("VLM gradient checkpointing enabled (PyTorch default, ZeRO-3 compatible)")
 
         # 6. Rebuild DeepSpeed engine with VLM group included
         encoder_lr_mult = self.config.encoder_lr_mult
@@ -1319,16 +1435,39 @@ class LoLAV07Trainer:
         # 7. Restore model weights directly (no disk I/O, no checkpoint format mismatch)
         #    DeepSpeed.initialize() may modify parameter objects (e.g. flatten for ZeRO-3),
         #    so we restore by name matching on the module's state_dict.
-        current_state = dict(model_engine.module.named_parameters())
-        restored, missing, unexpected = 0, 0, 0
-        for name, saved_tensor in state_dict.items():
-            if name in current_state:
-                current_state[name].data.copy_(saved_tensor.data)
-                restored += 1
-            else:
-                missing += 1
-        unexpected = len(current_state) - restored
-        _log(f"Weight restoration: {restored} params restored, {missing} missing, {unexpected} unexpected")
+        # 7. Restore model weights (no permanent disk I/O, no checkpoint format mismatch)
+        #    DeepSpeed.initialize() may modify parameter objects (e.g. flatten for ZeRO-3),
+        #    so ZeRO-2 restores by name matching on the module's state_dict;
+        #    ZeRO-3 reloads the temporary roundtrip checkpoint (weights only).
+        if self.deepspeed_zero_stage >= 3:
+            load_path, _ = model_engine.load_checkpoint(
+                load_dir=zero3_roundtrip_dir,
+                tag="unfreeze",
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+                load_module_strict=False,
+            )
+            if load_path is None:
+                raise RuntimeError(f"ZeRO-3 unfreeze roundtrip reload failed from {zero3_roundtrip_dir}")
+            _log("ZeRO-3 roundtrip weights reloaded into rebuilt engine")
+            # cleanup temporary checkpoint
+            import shutil
+            dist.barrier()
+            if self.is_main_process:
+                shutil.rmtree(zero3_roundtrip_dir, ignore_errors=True)
+            dist.barrier()
+        else:
+            current_state = dict(model_engine.module.named_parameters())
+            restored, missing, unexpected = 0, 0, 0
+            for name, saved_tensor in state_dict.items():
+                if name in current_state:
+                    current_state[name].data.copy_(saved_tensor.data)
+                    restored += 1
+                else:
+                    missing += 1
+            unexpected = len(current_state) - restored
+            _log(f"Weight restoration: {restored} params restored, {missing} missing, {unexpected} unexpected")
+            del state_dict
 
         # 8. Replace trainer references
         self.model = model_engine
@@ -1675,6 +1814,16 @@ class LoLAV07Trainer:
                 # invalidating the current step's autograd graph.
                 if self._pending_deepspeed_unfreeze:
                     self._pending_deepspeed_unfreeze = False
+                    # Detach loss outputs to break the autograd-graph → backward-hook
+                    # manager → bound-method → old-engine reference chain. The graph
+                    # loss tensor pins the entire old engine + optimizer GPU state
+                    # (register_output_backward_hooks binds engine methods to it),
+                    # and the rebuilt engine would OOM while both coexist.
+                    loss = loss.detach()
+                    loss_dict = {
+                        k: (v.detach() if torch.is_tensor(v) else v)
+                        for k, v in loss_dict.items()
+                    }
                     self._unfreeze_vlm_deepspeed()
 
                 # Optimizer state dtype diagnostic (all strategies, step 10)
@@ -1895,13 +2044,28 @@ class LoLAV07Trainer:
         """加载 checkpoint"""
         vlm_unfrozen = False
         if self.strategy == "deepspeed":
+            # --resume 支持两种形式: 含 latest 文件的 run 目录, 或具体的 tag 目录 (step_XXXXXX)
+            if os.path.exists(os.path.join(ckpt_path, "latest")):
+                load_dir, load_tag = ckpt_path, None
+            else:
+                load_dir, load_tag = os.path.dirname(ckpt_path), os.path.basename(ckpt_path)
             load_path, client_state = self.model.load_checkpoint(
-                load_dir=ckpt_path,
+                load_dir=load_dir,
+                tag=load_tag,
                 load_optimizer_states=True,
                 load_lr_scheduler_states=True,
+                # exclude_frozen_parameters=True 保存的 checkpoint 不含冻结 VLM 权重
+                # (VLM 权重已由 policy 初始化时从 vlm_path 加载), 必须非严格加载
+                load_module_strict=False,
             )
             if load_path is None:
                 raise ValueError(f"Failed to load DeepSpeed checkpoint from {ckpt_path}")
+            # ZeRO-3 load_checkpoint 会在部分参数上留下 0 尺寸的过期 .grad 视图,
+            # 导致下一次 backward 的 AccumulateGrad 广播失配
+            # ("size of tensor a (0) ...")。清空为 None, 让首次 backward 走标准新建路径。
+            if self.deepspeed_zero_stage >= 3:
+                for param in self.model_engine.module.parameters():
+                    param.grad = None
             self.global_step = client_state.get("step", 0)
             self.current_epoch = client_state.get("epoch", 0)
             vlm_unfrozen = client_state.get("vlm_unfrozen", False)
@@ -1947,12 +2111,19 @@ class LoLAV07Trainer:
             vlm_unfrozen = checkpoint.get("vlm_unfrozen", False)
 
         # Restore VLM unfreezing state: if VLM was unfrozen before checkpoint,
-        # we need to unfreeze it again (optimizer/scheduler rebuilt with VLM group)
-        if vlm_unfrozen and self.train_vlm:
+        # we need to unfreeze it again (optimizer/scheduler rebuilt with VLM group).
+        # 仅在引擎仍按"冻结 VLM"结构构建时才需要重建 (即 resume 时未经 peek 预知);
+        # 若已通过 resume_vlm_unfrozen 以 VLM 可训练结构构建, 则优化器状态已随
+        # load_checkpoint 无损恢复, 只需同步标志位。
+        if vlm_unfrozen and self.train_vlm and self._vlm_delayed_unfreeze:
+            _log("Checkpoint has vlm_unfrozen=True but engine was built with frozen VLM; "
+                 "rebuilding engine (VLM optimizer moments will restart)")
             if self.strategy == "deepspeed":
                 self._unfreeze_vlm_deepspeed()
             else:
                 self._unfreeze_vlm()
+        elif vlm_unfrozen and self.train_vlm:
+            self._vlm_unfrozen = True
 
         _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
@@ -2090,7 +2261,7 @@ def main():
     # DeepSpeed 参数
     parser.add_argument("--deepspeed_config", type=str, default=None,
                         help="Path to custom DeepSpeed config JSON. Default: ZeRO config tuned for B200.")
-    parser.add_argument("--deepspeed_zero_stage", type=int, default=2, choices=[1, 2],
+    parser.add_argument("--deepspeed_zero_stage", type=int, default=2, choices=[1, 2, 3],
                         help="DeepSpeed ZeRO stage: 1 (optimizer partitioning) or 2 (optimizer+gradient partitioning). Default: 2")
     parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
                         help="DeepSpeed ZeRO reduce bucket size (default: 5e7 for B200 NVLink)")
@@ -2385,6 +2556,12 @@ def main():
         deepspeed_reduce_bucket_size=args.deepspeed_reduce_bucket_size,
         deepspeed_allgather_bucket_size=args.deepspeed_allgather_bucket_size,
         deepspeed_zero_stage=args.deepspeed_zero_stage,
+        # Resume 预检: checkpoint 保存时 VLM 已解冻 → 引擎从一开始就以 VLM 可训练构建,
+        # 优化器分组与 checkpoint 匹配, Adam 矩无损恢复
+        resume_vlm_unfrozen=(
+            peek_deepspeed_checkpoint_vlm_unfrozen(args.resume)
+            if args.resume and args.strategy == "deepspeed" else False
+        ),
         # Config saving
         training_args=vars(args),
         dataset_metadata={

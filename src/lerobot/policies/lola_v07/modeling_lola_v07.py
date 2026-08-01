@@ -502,6 +502,12 @@ class LoLAV07Pytorch(nn.Module):
             max_n_tc = n_transition_chunks  # already batch-max from Policy layer
             n_tc_batch = n_transition_chunks_batch  # [B] tensor for per-sample mask
 
+            # 提升 expand 到单次调用: 同一 Parameter 在计算图中只被消费一次
+            # (ZeRO-3 resume 后, 双重 AccumulateGrad 会命中 grad 分区视图的 shape 失配)
+            hist_start = self.dit.hist_start_emb.expand(b, -1, -1)
+            prev_task_end = self.dit.previous_task_end_emb.expand(b, -1, -1)
+            hist_end = self.dit.hist_end_emb.expand(b, -1, -1)
+
             if max_n_tc > 0:
                 # Split into transition and task chunks
                 arm_transition = arm_hist[:, :max_n_tc, :]
@@ -518,11 +524,11 @@ class LoLAV07Pytorch(nn.Module):
 
                 # Arm stream assembly
                 arm_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     arm_transition,
-                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    prev_task_end,
                     arm_task,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 arm_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
@@ -534,11 +540,11 @@ class LoLAV07Pytorch(nn.Module):
 
                 # Grip stream assembly (symmetric)
                 grip_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     grip_transition,
-                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    prev_task_end,
                     grip_task,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 grip_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
@@ -550,9 +556,9 @@ class LoLAV07Pytorch(nn.Module):
             else:
                 # No transition data: hist_start + all chunks + hist_end (no previous_task_end)
                 arm_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     arm_hist,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 arm_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
@@ -561,9 +567,9 @@ class LoLAV07Pytorch(nn.Module):
                 ], dim=1)
 
                 grip_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     grip_hist,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 grip_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
@@ -776,7 +782,7 @@ class LoLAV07Pytorch(nn.Module):
                 ], dim=1)
             else:
                 arm_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     arm_hist,
                     self.dit.hist_end_emb.expand(b, -1, -1),
                 ], dim=1)
@@ -786,7 +792,7 @@ class LoLAV07Pytorch(nn.Module):
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                 ], dim=1)
                 grip_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     grip_hist,
                     self.dit.hist_end_emb.expand(b, -1, -1),
                 ], dim=1)
@@ -1138,11 +1144,21 @@ class LoLAV07Policy(PreTrainedPolicy):
             if attention_mask is not None:
                 forward_kwargs["attention_mask"] = attention_mask
 
+            # 运行时冻结判定: delayed-unfreeze 期间 config.train_vlm=True 但 VLM
+            # 参数 requires_grad=False。冻结的 VLM 必须在 no_grad 下运行 — 否则
+            # ZeRO-3 的 PreBackwardFunctionForModule 会把 VLM 激活接进 autograd 图
+            # (rg=True 链路到 loss), 叠加训练循环 model.train() 递归打开的 HF
+            # 逐层 checkpoint, 每层保存 ZeRO-3 gather 的权重 (RMSNorm [4096] /
+            # qk-norm [128]), backward recompute 时参数已 release → CheckpointError
+            # ("Recomputed values ... different metadata", [4096]→[0])。
+            vlm_needs_grad = self.config.train_vlm and any(
+                p.requires_grad for p in self.vlm.parameters()
+            )
             if self._vlm_forward_mode == "hook":
                 self._captured_hidden_states = {}
                 self._in_vlm_forward = True
                 try:
-                    if not self.config.train_vlm:
+                    if not vlm_needs_grad:
                         with torch.no_grad():
                             self.vlm(**forward_kwargs)
                     else:
@@ -1151,7 +1167,7 @@ class LoLAV07Policy(PreTrainedPolicy):
                     self._in_vlm_forward = False
                 hidden_states_all_layers = self._captured_hidden_states
             else:
-                if not self.config.train_vlm:
+                if not vlm_needs_grad:
                     with torch.no_grad():
                         vlm_output = self.vlm(**forward_kwargs)
                 else:
