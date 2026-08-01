@@ -25,6 +25,7 @@ set -e
 export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
 export TOKENIZERS_PARALLELISM=false
 export PATH=/opt/conda/envs/lerobot/bin:$PATH
+conda run --name lerobot which python
 # Add conda env lib to LD_LIBRARY_PATH so torchcodec can find ffmpeg shared libs
 # Also ensures conda's newer libstdc++ is used (avoids CXXABI_1.3.15 not found error)
 if [ -d "/opt/conda/envs/lerobot/lib" ]; then
