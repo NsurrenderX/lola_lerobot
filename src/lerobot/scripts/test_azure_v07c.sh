@@ -511,6 +511,8 @@ while [[ $# -gt 0 ]]; do
             VLM_MAX_LENGTH="$2"
             shift 2
             ;;
+
+        # Localize IO
         --localize_io)
             LOCALIZE_IO=true
             shift
@@ -558,6 +560,15 @@ done
 # ----------------------------------------------------------------------
 # 本地化 IO 前置阶段: blob -> 节点本地 NVMe (训练开始前)
 # ----------------------------------------------------------------------
+# 规范化: 统一剥掉路径变量的结尾斜杠, 否则 _to_local 等拼接会产生 //
+# 双斜杠路径, 导致下载落点与训练读取路径不一致 (meta/info.json 找不到)
+MOUNT_PREFIX="${MOUNT_PREFIX%/}"
+LOCAL_MIRROR="${LOCAL_MIRROR%/}"
+DATASET_ROOT="${DATASET_ROOT%/}"
+VLM_PATH="${VLM_PATH%/}"
+CKPT_DIR="${CKPT_DIR%/}"
+RESUME="${RESUME%/}"
+
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WATCHER_PID=""
 
