@@ -2000,6 +2000,15 @@ class LoLAV07Trainer:
                 exclude_frozen_parameters=True,
             )
             ckpt_path = f"{ckpt_dir}/{tag}"
+            # 上传就绪标记: DS save_checkpoint 末尾有 dist.barrier(), 返回时本节点
+            # 分片已完整落盘。各节点 local_rank==0 落标记, 后台 watchdog
+            # (checkpoint_upload_watcher.py) 据此把 tag 目录异步上传至 blob,
+            # 训练本身只读写节点本地盘, 不触碰 blobfuse 挂载点。
+            if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+                try:
+                    open(os.path.join(ckpt_path, ".upload_ready"), "a").close()
+                except OSError:
+                    pass
         elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import save as save_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict
@@ -2023,6 +2032,11 @@ class LoLAV07Trainer:
                     {"scheduler_state_dict": self.scheduler.state_dict(), **extra_state},
                     os.path.join(ckpt_path, "scheduler.pt"),
                 )
+                # 上传就绪标记 (见 deepspeed 分支注释)
+                try:
+                    open(os.path.join(ckpt_path, ".upload_ready"), "a").close()
+                except OSError:
+                    pass
         else:
             # DDP checkpoint 保存
             state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()

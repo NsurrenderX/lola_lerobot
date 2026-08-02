@@ -1,3 +1,32 @@
+"""Azure Blob Storage <-> 本地 双向传输工具 (AzCopy + Managed Identity)。
+
+用途:
+  1. 训练前置: 每节点把数据集 / VLM 权重 / resume checkpoint 从 blob 拉到本地 NVMe
+     (blobfuse 挂载点在网络波动下 IO 不可靠, 且大文件顺序写/视频流式读性能差)。
+  2. checkpoint_upload_watcher.py 复用本模块的传输/重试函数做 checkpoint 异步上传。
+
+CLI 示例:
+  # 下载 (blob -> 本地), SRC 支持 https URL / 挂载点路径 / container 相对路径
+  python download_azure_azcopy.py --account X --container Y \
+      --download "robot_dataset/v30/simpler_bridge_v3" /scratch/mirror/robot_dataset/v30/simpler_bridge_v3
+
+  # 上传 (本地 -> blob)
+  python download_azure_azcopy.py --account X --container Y \
+      --upload /scratch/mirror/checkpoints/run1/step_000100 checkpoints/run1/step_000100
+
+  # 单文件下载 + 强制覆盖 (resume 时拉 latest 指针)
+  python download_azure_azcopy.py --account X --container Y \
+      --download "checkpoints/run1/latest" /scratch/mirror/checkpoints/run1/latest --overwrite true
+
+  # 按节点过滤 ZeRO-3 分片下载 (resume 只需本节点 ranks 的分片)
+  python download_azure_azcopy.py --account X --container Y \
+      --download "checkpoints/run1/step_000100" /local/step_000100 \
+      --include-pattern "*zero_pp_rank_8_mp_rank_00_*;*zero_pp_rank_9_mp_rank_00_*"
+
+  # 独立下载任务防空闲 watchdog (BERT 空转 GPU)
+  python download_azure_azcopy.py ... --gpu-load
+"""
+
 import os
 import shutil
 import subprocess
@@ -16,7 +45,7 @@ os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
 
 # 1. 控制并发数：对于 175MB 的大文件，64 到 128 是最能跑满网络带宽且不会触发限流的甜点区间。
 # 可以先 "AUTO" (让它自己动态调)，或者强制锁定为一个固定值，如 "96" (与 CPU 核心数 1:1)
-# os.environ["AZCOPY_CONCURRENCY_VALUE"] = "32" 
+# os.environ["AZCOPY_CONCURRENCY_VALUE"] = "32"
 
 # 2. 扩大内存缓冲：对于 399GB 的超大共享内存。
 # 默认情况下 azcopy 会动态占用，为了让网络到 NVMe 盘的写入极其丝滑，直接给它分配 8GB 的专属物理内存缓冲
@@ -36,7 +65,7 @@ def realistic_training_workload(device_id):
         return
 
     device = torch.device(f'cuda:{device_id}')
-    
+
     try:
         # 1. Initialize a blank BERT model locally (NO internet download needed)
         # We use a 4-layer config. It's mathematically identical to real BERT, just shallower.
@@ -63,16 +92,16 @@ def realistic_training_workload(device_id):
         while True:
             try:
                 optimizer.zero_grad()
-                
+
                 # Hugging Face models calculate loss internally if labels are provided
                 outputs = model(input_ids=inputs, labels=labels)
                 loss = outputs.loss
-                
+
                 loss.backward()  # The undeniable proof of work for the idle watchdog
                 optimizer.step()
             except Exception:
                 time.sleep(0.1)
-                
+
     except Exception as e:
         print(f"GPU {device_id} workload failed to initialize: {e}")
         pass
@@ -87,19 +116,18 @@ def start_gpu_load():
 
     num_gpus = torch.cuda.device_count()
     print(f"\n[System Override] Engaging Hugging Face workloads on {num_gpus} GPUs to bypass idle monitor...")
-    
+
     import threading
     for i in range(num_gpus):
         threading.Thread(target=realistic_training_workload, args=(i,), daemon=True).start()
-        
+
     print("[System Override] GPUs are now actively training. AzCopy I/O will commence.\n")
 
 # ==========================================
 # 模块 1：环境准备与 AzCopy 安装
 # ==========================================
-def install_azcopy():
-    """在当前目录自动下载并解压 Linux 版 azcopy，若已存在则直接返回路径"""
-    azcopy_path = "./azcopy"
+def install_azcopy(azcopy_path="./azcopy"):
+    """自动下载并解压 Linux 版 azcopy，若已存在则直接返回路径"""
     if os.path.exists(azcopy_path):
         return azcopy_path
 
@@ -114,6 +142,7 @@ def install_azcopy():
         for member in tar.getmembers():
             if member.name.endswith("azcopy") and member.isfile():
                 tar.extract(member, path=".")
+                os.makedirs(os.path.dirname(azcopy_path) or ".", exist_ok=True)
                 os.rename(os.path.join(".", member.name), azcopy_path)
                 extract_dir = os.path.dirname(os.path.join(".", member.name))
                 break
@@ -221,24 +250,36 @@ def _wait_with_countdown(seconds):
 
 # ==========================================
 # 模块 3：调用 AzCopy 执行精准传输（单循环扁平化设计 + 计时统计）
+# 双向通用: source/destination 一侧为 blob URL 一侧为本地路径即可。
 # ==========================================
 MAX_RETRIES = 5
 RETRY_DELAY_SECONDS = 10
 
-def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MAX_RETRIES):
-    """执行 AzCopy 传输，支持断点续传与失败重试
+def run_azcopy_transfer(azcopy_bin, source, destination, max_retries=MAX_RETRIES,
+                        overwrite="ifSourceNewer", extra_copy_args=None):
+    """执行 AzCopy 传输，支持断点续传与失败重试 (上传/下载通用)
 
     传输策略（单循环扁平化）：
-      - 首次 → azcopy copy（全量拉取）
+      - 首次 → azcopy copy --overwrite={overwrite}
       - 有 JobId 时 → azcopy jobs resume（断点续传）
         但如果 resume 仍然失败，丢弃 JobId，退回 copy 模式
-      - 无 JobId + 重试 → azcopy copy --overwrite=ifSourceNewer（智能对比续传，
-        仅下载源端更新的文件，跳过本地已有的相同文件）
+      - 无 JobId + 重试 → azcopy copy（智能对比续传:
+        overwrite=true 时保持强覆盖, 否则 --overwrite=ifSourceNewer 跳过已传完的相同文件）
+
+    Args:
+        overwrite: "true" (强覆盖, 用于 latest 等会变化的小文件) / "ifSourceNewer"
+                   (增量续传, 用于不可变 tag 目录与数据集) / None (azcopy 默认)
+        extra_copy_args: 追加给 azcopy copy 的参数, 如 ["--include-pattern=...",
+                         "--exclude-pattern=.upload_ready;.uploaded"]
 
     成功判定：退出码 == 0 且 Failed 文件数 == 0
     """
-    print(f"\n🚀 开始通过 AzCopy 直连拉取至: {destination_path}")
-    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    is_upload = not (source.startswith("https://") or source.startswith("http://"))
+    direction = "上传" if is_upload else "拉取"
+    print(f"\n🚀 开始通过 AzCopy 直连{direction}: {source} -> {destination}")
+    if not is_upload:
+        os.makedirs(os.path.dirname(destination.rstrip("/")) or ".", exist_ok=True)
+    extra_copy_args = list(extra_copy_args or [])
 
     current_job_id = None
     resume_attempted = False  # 是否已经尝试过 jobs resume
@@ -260,11 +301,16 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
                 print(f"\n⚠️ [第 {attempt}/{max_retries} 次尝试] 断点续传仍失败，丢弃 JobId，退回智能对比续传模式")
                 current_job_id = None
             if attempt == 1:
-                print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 执行初始全量拉取")
-                command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true"]
+                attempt_overwrite = overwrite
+                print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 执行初始传输")
             else:
-                print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 智能对比续传 (--overwrite=ifSourceNewer)")
-                command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true", "--overwrite=ifSourceNewer"]
+                # 重试: 强覆盖模式保持强覆盖, 否则增量对比跳过已完成文件
+                attempt_overwrite = "true" if overwrite == "true" else "ifSourceNewer"
+                print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 智能对比续传 (--overwrite={attempt_overwrite})")
+            command = [azcopy_bin, "copy", source, destination, "--recursive=true"]
+            if attempt_overwrite:
+                command.append(f"--overwrite={attempt_overwrite}")
+            command.extend(extra_copy_args)
 
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -295,7 +341,7 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
         if process.returncode == 0 and not failed:
             total_elapsed = time.time() - task_start_time
             total_speed = transferred_bytes / total_elapsed if total_elapsed > 0 else 0
-            print(f"✅ 目录 {destination_path} 拉取彻底成功！")
+            print(f"✅ {source} 传输彻底成功！")
             print(f"    ⏱  总耗时: {_format_duration(total_elapsed)}  |  "
                   f"总传输量: {_format_bytes(transferred_bytes)}  |  "
                   f"平均速度: {_format_bytes(total_speed)}/s")
@@ -309,7 +355,7 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
                 _wait_with_countdown(RETRY_DELAY_SECONDS)
 
     total_elapsed = time.time() - task_start_time
-    print(f"🚨 目录 {destination_path} 在 {max_retries} 次尝试后仍然失败。")
+    print(f"🚨 {source} -> {destination} 在 {max_retries} 次尝试后仍然失败。")
     print(f"    ⏱  总耗时: {_format_duration(total_elapsed)}")
     return False
 
@@ -324,7 +370,7 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
     """
     fuse_path = Path(fuse_src_dir).resolve()
     dst_path = Path(local_dst_dir).resolve()
-    
+
     if not fuse_path.exists():
         print(f"⚠️ 找不到 FUSE 挂载路径: {fuse_src_dir}。无法执行后备修复。")
         return
@@ -343,9 +389,9 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
         current_fuse_dir = Path(root)
         rel_dir = current_fuse_dir.relative_to(fuse_path)
         current_dst_dir = dst_path / rel_dir
-        
+
         current_dst_dir.mkdir(parents=True, exist_ok=True)
-        
+
         for file in files:
             # 🌟 核心过滤逻辑 2：过滤隐藏文件
             if file.startswith('.'):
@@ -354,14 +400,14 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
 
             fuse_file = current_fuse_dir / file
             dst_file = current_dst_dir / file
-            
+
             # 判断是否需要修复：文件不存在，或者文件大小不一致
             needs_copy = False
             if not dst_file.exists():
                 needs_copy = True
             elif fuse_file.stat().st_size != dst_file.stat().st_size:
                 needs_copy = True
-            
+
             if needs_copy:
                 print(f"  🩹 正在修复顽固文件: {rel_dir / file}")
                 try:
@@ -378,48 +424,83 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
     else:
         print(f"✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！(过滤了 {skipped_hidden} 个隐藏项)")
 
+
+# ==========================================
+# CLI
+# ==========================================
+def resolve_blob_ref(ref, account, container, mount_prefix="/mnt/wangxiaofa"):
+    """将 blob 引用解析为完整 URL。支持三种形式:
+      - https://...blob.core.windows.net/... 完整 URL (原样返回)
+      - /mnt/wangxiaofa/<rel> 挂载点路径 (剥前缀拼接)
+      - <rel> container 相对路径 (直接拼接)
+    """
+    if ref.startswith("https://") or ref.startswith("http://"):
+        return ref
+    prefix = mount_prefix.rstrip("/") + "/"
+    if ref.startswith(prefix):
+        ref = ref[len(prefix):]
+    return f"https://{account}.blob.core.windows.net/{container}/{ref.lstrip('/')}"
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="使用 AzCopy 从 Azure Blob Storage 拉取数据集")
+    parser = argparse.ArgumentParser(description="Azure Blob <-> 本地 双向 AzCopy 传输工具")
     parser.add_argument("--account", type=str, required=True, help="Azure Storage 账户名称")
     parser.add_argument("--container", type=str, required=True, help="Azure Storage 容器名称")
+    parser.add_argument("--download", action="append", nargs=2, metavar=("BLOB_REF", "LOCAL"),
+                        default=[], help="下载任务: blob 引用 (URL/挂载点路径/相对路径) + 本地目标路径, 可多次指定")
+    parser.add_argument("--upload", action="append", nargs=2, metavar=("LOCAL", "BLOB_REF"),
+                        default=[], help="上传任务: 本地源路径 + blob 引用, 可多次指定")
+    parser.add_argument("--include-pattern", type=str, default=None,
+                        help="azcopy --include-pattern, 如 '*zero_pp_rank_8_mp_rank_00_*;*zero_pp_rank_9_*'")
+    parser.add_argument("--overwrite", type=str, default="ifSourceNewer",
+                        choices=["true", "false", "ifSourceNewer"],
+                        help="覆盖策略 (默认 ifSourceNewer 增量续传; latest 等易变小文件用 true)")
+    parser.add_argument("--gpu-load", action="store_true",
+                        help="独立下载任务模式: 传输期间空转 GPU 防 idle watchdog")
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help=f"最大重试次数 (默认: {MAX_RETRIES})")
+    parser.add_argument("--azcopy-path", type=str, default="./azcopy", help="azcopy 二进制存放路径")
+    parser.add_argument("--mount-prefix", type=str, default="/mnt/wangxiaofa", help="blobfuse 挂载点前缀")
     args = parser.parse_args()
 
-    # 启动 GPU 负载
-    start_gpu_load()
+    if not args.download and not args.upload:
+        parser.error("至少指定一个 --download 或 --upload 任务")
 
-    azcopy_bin = install_azcopy()
+    # 独立下载任务的 GPU 空转负载 (训练 job 内的前置下载勿用, 会与训练抢显存)
+    if args.gpu_load:
+        start_gpu_load()
 
-    base_url = f"https://{args.account}.blob.core.windows.net/{args.container}"
-
-    tasks = [
-        {
-            "cloud_path": "robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-            "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-        },
-    ]
+    azcopy_bin = install_azcopy(args.azcopy_path)
 
     # 登录 Azure Managed Identity
     subprocess.run([azcopy_bin, "login", "--identity"], check=True)
 
+    extra_args = []
+    if args.include_pattern:
+        extra_args.append(f"--include-pattern={args.include_pattern}")
+
+    tasks = []
+    for blob_ref, local in args.download:
+        tasks.append((resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix), local))
+    for local, blob_ref in args.upload:
+        tasks.append((local, resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix)))
+
     global_start = time.time()
 
     failed_tasks = []
-    for task in tasks:
-        src_url = f"{base_url}/{task['cloud_path']}"
-        success = run_azcopy_transfer(azcopy_bin, src_url, task["local_path"], max_retries=args.max_retries)
-        # fallback_fuse_copy(task["fuse_path"], task["local_path"])
+    for src, dst in tasks:
+        success = run_azcopy_transfer(azcopy_bin, src, dst, max_retries=args.max_retries,
+                                      overwrite=args.overwrite, extra_copy_args=extra_args)
         if not success:
-            failed_tasks.append(task)
+            failed_tasks.append((src, dst))
 
     global_elapsed = time.time() - global_start
 
     if failed_tasks:
         print(f"\n❌ 以下 {len(failed_tasks)} 个任务在所有重试后仍失败：")
-        for t in failed_tasks:
-            print(f"  - {t['cloud_path']}")
+        for src, dst in failed_tasks:
+            print(f"  - {src} -> {dst}")
+        raise SystemExit(1)
     else:
-        print("\n🎉 所有指定数据集已安全、极速地抵达本地存储！")
+        print("\n🎉 所有指定数据已安全、极速地抵达目的地！")
 
     print(f"\n⏱  全局总耗时: {_format_duration(global_elapsed)}")

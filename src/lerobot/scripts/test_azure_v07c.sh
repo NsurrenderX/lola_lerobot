@@ -159,6 +159,23 @@ VLM_MAX_LENGTH=""
 RESUME=""
 
 # ----------------------------------------------------------------------
+# 本地化 IO: 数据集/ckpt 走节点本地 NVMe, blob 只做异步持久化
+# (blobfuse 挂载点网络波动时 torch.save 大文件会 IO 错误, 曾崩 ZeRO-3 分片保存)
+# 开启后: 启动时 azcopy 把数据集/VLM/resume ckpt 拉到 LOCAL_MIRROR; 训练只读写
+# 本地盘; 后台 checkpoint_upload_watcher 把带 .upload_ready 标记的 ckpt 异步传回 blob。
+# 以下均可由同名命令行参数覆盖 (--storage_account 等), 账户名不写进仓库,
+# 由启动命令透传 (AMLT job 命令行或环境变量)。
+# ----------------------------------------------------------------------
+LOCALIZE_IO=${LOCALIZE_IO:-true}
+STORAGE_ACCOUNT=${STORAGE_ACCOUNT:-""}      # LOCALIZE_IO=true 时必填 (--storage_account 透传)
+STORAGE_CONTAINER=${STORAGE_CONTAINER:-""}  # LOCALIZE_IO=true 时必填 (--storage_container 透传)
+MOUNT_PREFIX=${MOUNT_PREFIX:-/mnt/wangxiaofa}
+LOCAL_MIRROR=${LOCAL_MIRROR:-/scratch/lola_mirror}
+LOCALIZE_VLM=${LOCALIZE_VLM:-true}          # false 则 VLM 权重不从 blob 预下载, 启动时直接读挂载点
+UPLOAD_KEEP_LAST=${UPLOAD_KEEP_LAST:-2}          # 本地保留的已上传 ckpt 数
+UPLOAD_DRAIN_TIMEOUT=${UPLOAD_DRAIN_TIMEOUT:-7200}  # 训练结束后等上传排空的最长秒数
+
+# ----------------------------------------------------------------------
 # 解析命令行参数
 # ----------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -494,6 +511,42 @@ while [[ $# -gt 0 ]]; do
             VLM_MAX_LENGTH="$2"
             shift 2
             ;;
+        --localize_io)
+            LOCALIZE_IO=true
+            shift
+            ;;
+        --no_localize_io)
+            LOCALIZE_IO=false
+            shift
+            ;;
+        --storage_account)
+            STORAGE_ACCOUNT="$2"
+            shift 2
+            ;;
+        --storage_container)
+            STORAGE_CONTAINER="$2"
+            shift 2
+            ;;
+        --mount_prefix)
+            MOUNT_PREFIX="$2"
+            shift 2
+            ;;
+        --local_mirror)
+            LOCAL_MIRROR="$2"
+            shift 2
+            ;;
+        --no_localize_vlm)
+            LOCALIZE_VLM=false
+            shift
+            ;;
+        --upload_keep_last)
+            UPLOAD_KEEP_LAST="$2"
+            shift 2
+            ;;
+        --upload_drain_timeout)
+            UPLOAD_DRAIN_TIMEOUT="$2"
+            shift 2
+            ;;
 
         *)
             echo "Unknown argument: $1"
@@ -501,6 +554,122 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# ----------------------------------------------------------------------
+# 本地化 IO 前置阶段: blob -> 节点本地 NVMe (训练开始前)
+# ----------------------------------------------------------------------
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WATCHER_PID=""
+
+_rel_under_mount() { local p="${1%/}"; echo "${p#$MOUNT_PREFIX/}"; }
+_to_local() { echo "$LOCAL_MIRROR/$(_rel_under_mount "$1")"; }
+_to_blob() { echo "https://${STORAGE_ACCOUNT}.blob.core.windows.net/${STORAGE_CONTAINER}/$(_rel_under_mount "$1")"; }
+_is_mount_path() { [ "${1#$MOUNT_PREFIX/}" != "$1" ]; }
+
+_azcopy_transfer() {
+    /home/aiscuser/.conda/envs/lerobot/bin/python "${SCRIPTS_DIR}/download_azure_azcopy.py" \
+        --account "${STORAGE_ACCOUNT}" --container "${STORAGE_CONTAINER}" \
+        --mount-prefix "${MOUNT_PREFIX}" --azcopy-path "${LOCAL_MIRROR}/bin/azcopy" "$@"
+}
+
+if [ "$LOCALIZE_IO" = true ]; then
+    if [ -z "$STORAGE_ACCOUNT" ] || [ -z "$STORAGE_CONTAINER" ]; then
+        echo "ERROR: LOCALIZE_IO=true 需要 --storage_account 和 --storage_container (或同名环境变量)"
+        exit 1
+    fi
+    mkdir -p "${LOCAL_MIRROR}/bin"
+    echo "========================================"
+    echo "Localized IO: blob -> node-local NVMe mirror"
+    echo "  - Mirror root: ${LOCAL_MIRROR}"
+    echo "  - Blob base: https://${STORAGE_ACCOUNT}.blob.core.windows.net/${STORAGE_CONTAINER}"
+    echo "========================================"
+
+    # 1. 数据集本地化 (幂等: ifSourceNewer 跳过已有文件, 抢占重启后增量补齐)
+    if [ -n "$DATASET_ROOT" ] && _is_mount_path "$DATASET_ROOT"; then
+        LOCAL_DATASET_ROOT=$(_to_local "$DATASET_ROOT")
+        echo "[localize] dataset: $DATASET_ROOT -> $LOCAL_DATASET_ROOT"
+        _azcopy_transfer --download "$DATASET_ROOT" "$LOCAL_DATASET_ROOT"
+        DATASET_ROOT="$LOCAL_DATASET_ROOT"
+    fi
+
+    # 2. VLM 权重本地化 (--no_localize_vlm 可跳过: 权重仅启动时读一次,
+    #    直接从挂载点读的失败风险限于启动阶段, 重试成本低)
+    if [ "$LOCALIZE_VLM" = true ] && [ -n "$VLM_PATH" ] && _is_mount_path "$VLM_PATH"; then
+        LOCAL_VLM_PATH=$(_to_local "$VLM_PATH")
+        echo "[localize] VLM: $VLM_PATH -> $LOCAL_VLM_PATH"
+        _azcopy_transfer --download "$VLM_PATH" "$LOCAL_VLM_PATH"
+        VLM_PATH="$LOCAL_VLM_PATH"
+    elif [ -n "$VLM_PATH" ] && _is_mount_path "$VLM_PATH"; then
+        echo "[localize] VLM 本地化已跳过 (LOCALIZE_VLM=false), 启动时直接读挂载点: $VLM_PATH"
+    fi
+
+    # 3. resume checkpoint 拉回本地 (ZeRO-3 只需本节点 ranks 的分片;
+    #    client_state 合并于每个 rank 的 model_states, peek 不受分片过滤影响)
+    if [ -n "$RESUME" ] && _is_mount_path "$RESUME"; then
+        RESUME_LOCAL=$(_to_local "$RESUME")
+        RESUME_BLOB=$(_to_blob "$RESUME")
+        RESUME_BASE=$(basename "${RESUME%/}")
+        mkdir -p "$RESUME_LOCAL"
+        SHARD_PATTERNS=""
+        START_RANK=$((NODE_RANK * NPROC_PER_NODE))
+        END_RANK=$((START_RANK + NPROC_PER_NODE - 1))
+        for ((i=START_RANK; i<=END_RANK; i++)); do
+            SHARD_PATTERNS="${SHARD_PATTERNS}${SHARD_PATTERNS:+;}*zero_pp_rank_${i}_mp_rank_00_*"
+        done
+        if [[ "$RESUME_BASE" == step_* || "$RESUME_BASE" == final ]]; then
+            # 直接指向 tag 目录
+            RESUME_TAG_DIR_LOCAL="$RESUME_LOCAL"
+            RESUME_TAG_DIR_BLOB="$RESUME_BLOB"
+        else
+            # run 目录: 先拉 latest 指针确定 tag
+            echo "[localize] resume: fetch latest pointer from $RESUME_BLOB"
+            _azcopy_transfer --download "${RESUME_BLOB}/latest" "${RESUME_LOCAL}/latest" --overwrite true
+            RESUME_TAG=$(cat "${RESUME_LOCAL}/latest")
+            RESUME_TAG_DIR_LOCAL="${RESUME_LOCAL}/${RESUME_TAG}"
+            RESUME_TAG_DIR_BLOB="${RESUME_BLOB}/${RESUME_TAG}"
+        fi
+        echo "[localize] resume ckpt: $RESUME_TAG_DIR_BLOB -> $RESUME_TAG_DIR_LOCAL (shard filter: ranks ${START_RANK}-${END_RANK})"
+        _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS"
+        # 校验本节点分片齐全, 缺失则全量重下兜底
+        SHARDS_OK=true
+        for ((i=START_RANK; i<=END_RANK; i++)); do
+            if ! compgen -G "${RESUME_TAG_DIR_LOCAL}/zero_pp_rank_${i}_mp_rank_00_*model_states.pt" > /dev/null; then
+                SHARDS_OK=false
+                break
+            fi
+        done
+        if [ "$SHARDS_OK" != true ]; then
+            echo "[localize] WARN: 分片过滤下载不完整, 全量重下 tag 目录兜底"
+            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL"
+        fi
+        RESUME="$RESUME_LOCAL"
+    fi
+
+    # 4. ckpt 目录本地化 + 启动上传 watchdog (supervisor 循环, 崩溃自动重启)
+    if _is_mount_path "$CKPT_DIR"; then
+        CKPT_BLOB_BASE=$(_to_blob "$CKPT_DIR")
+        CKPT_DIR=$(_to_local "$CKPT_DIR")
+        mkdir -p "$CKPT_DIR"
+        echo "[localize] ckpt: local=$CKPT_DIR, async upload -> $CKPT_BLOB_BASE (keep_last=$UPLOAD_KEEP_LAST)"
+        (
+            while true; do
+                /home/aiscuser/.conda/envs/lerobot/bin/python "${SCRIPTS_DIR}/checkpoint_upload_watcher.py" \
+                    --local_root "$CKPT_DIR" --blob_base "$CKPT_BLOB_BASE" \
+                    --keep_last "$UPLOAD_KEEP_LAST" --drain_timeout "$UPLOAD_DRAIN_TIMEOUT" \
+                    --azcopy-path "${LOCAL_MIRROR}/bin/azcopy" \
+                    >> "${CKPT_DIR}/_watcher.log" 2>&1
+                rc=$?
+                if [ -f "${CKPT_DIR}/_upload_drain" ]; then
+                    echo "[supervisor] watcher exited rc=$rc after drain" >> "${CKPT_DIR}/_watcher.log"
+                    exit $rc
+                fi
+                echo "[supervisor] watcher exited rc=$rc unexpectedly, restarting in 10s" >> "${CKPT_DIR}/_watcher.log"
+                sleep 10
+            done
+        ) &
+        WATCHER_PID=$!
+    fi
+fi
 
 
 # 打印配置信息
@@ -732,6 +901,25 @@ if [ "$USE_SPECIAL_TOKENS" = true ]; then
 fi
 
 echo "Running: $cmd"
+# 训练失败也要走 drain: 已保存的 checkpoint 上传后才能用于 resume
+set +e
 eval $cmd
+TRAIN_EXIT=$?
+set -e
+
+# 等待 checkpoint 上传 watchdog 排空 (保证 final ckpt 落 blob 后 AMLT job 才结束,
+# 否则 job 结束节点回收, 本地未上传的 checkpoint 全部丢失)
+if [ -n "$WATCHER_PID" ]; then
+    echo "Training exited (code=$TRAIN_EXIT), waiting for checkpoint upload drain..."
+    touch "${CKPT_DIR}/_upload_drain"
+    wait $WATCHER_PID
+    WATCHER_EXIT=$?
+    if [ "$WATCHER_EXIT" -ne 0 ]; then
+        echo "ERROR: checkpoint 上传排空失败 (watcher exit=$WATCHER_EXIT), 有 checkpoint 未传到 blob!"
+        exit 1
+    fi
+    echo "All checkpoints uploaded to blob."
+fi
 
 echo "Training completed!"
+exit $TRAIN_EXIT
