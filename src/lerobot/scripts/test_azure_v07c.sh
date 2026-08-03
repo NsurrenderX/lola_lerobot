@@ -577,6 +577,17 @@ _to_local() { echo "$LOCAL_MIRROR/$(_rel_under_mount "$1")"; }
 _to_blob() { echo "https://${STORAGE_ACCOUNT}.blob.core.windows.net/${STORAGE_CONTAINER}/$(_rel_under_mount "$1")"; }
 _is_mount_path() { [ "${1#$MOUNT_PREFIX/}" != "$1" ]; }
 
+# 下载落地结构可观测性: 若训练仍报文件找不到, 从 ls 输出可直接看出 azcopy 实际落点
+_show_layout() {
+    local label="$1" dir="$2"
+    echo "[localize] ${label} 落地结构: $dir"
+    if [ -d "$dir" ]; then
+        ls -la "$dir" 2>&1 | sed 's/^/    /'
+    else
+        echo "    ⚠️ 目录不存在!"
+    fi
+}
+
 _azcopy_transfer() {
     /home/aiscuser/.conda/envs/lerobot/bin/python "${SCRIPTS_DIR}/download_azure_azcopy.py" \
         --account "${STORAGE_ACCOUNT}" --container "${STORAGE_CONTAINER}" \
@@ -596,10 +607,17 @@ if [ "$LOCALIZE_IO" = true ]; then
     echo "========================================"
 
     # 1. 数据集本地化 (幂等: ifSourceNewer 跳过已有文件, 抢占重启后增量补齐)
+    #    --dir: 目录传输, 抵消 azcopy 把源目录名嵌套进目标路径的语义
     if [ -n "$DATASET_ROOT" ] && _is_mount_path "$DATASET_ROOT"; then
         LOCAL_DATASET_ROOT=$(_to_local "$DATASET_ROOT")
         echo "[localize] dataset: $DATASET_ROOT -> $LOCAL_DATASET_ROOT"
-        _azcopy_transfer --download "$DATASET_ROOT" "$LOCAL_DATASET_ROOT"
+        _azcopy_transfer --download "$DATASET_ROOT" "$LOCAL_DATASET_ROOT" --dir
+        _show_layout "dataset" "$LOCAL_DATASET_ROOT"
+        if [ -f "$LOCAL_DATASET_ROOT/meta/info.json" ]; then
+            echo "[localize] ✅ meta/info.json 已就位"
+        else
+            echo "[localize] ⚠️ meta/info.json 未在预期位置: $LOCAL_DATASET_ROOT/meta/info.json (实际落点见上方 ls)"
+        fi
         DATASET_ROOT="$LOCAL_DATASET_ROOT"
     fi
 
@@ -608,7 +626,8 @@ if [ "$LOCALIZE_IO" = true ]; then
     if [ "$LOCALIZE_VLM" = true ] && [ -n "$VLM_PATH" ] && _is_mount_path "$VLM_PATH"; then
         LOCAL_VLM_PATH=$(_to_local "$VLM_PATH")
         echo "[localize] VLM: $VLM_PATH -> $LOCAL_VLM_PATH"
-        _azcopy_transfer --download "$VLM_PATH" "$LOCAL_VLM_PATH"
+        _azcopy_transfer --download "$VLM_PATH" "$LOCAL_VLM_PATH" --dir
+        _show_layout "VLM" "$LOCAL_VLM_PATH"
         VLM_PATH="$LOCAL_VLM_PATH"
     elif [ -n "$VLM_PATH" ] && _is_mount_path "$VLM_PATH"; then
         echo "[localize] VLM 本地化已跳过 (LOCALIZE_VLM=false), 启动时直接读挂载点: $VLM_PATH"
@@ -640,7 +659,8 @@ if [ "$LOCALIZE_IO" = true ]; then
             RESUME_TAG_DIR_BLOB="${RESUME_BLOB}/${RESUME_TAG}"
         fi
         echo "[localize] resume ckpt: $RESUME_TAG_DIR_BLOB -> $RESUME_TAG_DIR_LOCAL (shard filter: ranks ${START_RANK}-${END_RANK})"
-        _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS"
+        _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS" --dir
+        _show_layout "resume tag" "$RESUME_TAG_DIR_LOCAL"
         # 校验本节点分片齐全, 缺失则全量重下兜底
         SHARDS_OK=true
         for ((i=START_RANK; i<=END_RANK; i++)); do
@@ -651,7 +671,8 @@ if [ "$LOCALIZE_IO" = true ]; then
         done
         if [ "$SHARDS_OK" != true ]; then
             echo "[localize] WARN: 分片过滤下载不完整, 全量重下 tag 目录兜底"
-            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL"
+            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --dir
+            _show_layout "resume tag (全量兜底)" "$RESUME_TAG_DIR_LOCAL"
         fi
         RESUME="$RESUME_LOCAL"
     fi

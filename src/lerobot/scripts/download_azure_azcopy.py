@@ -256,7 +256,8 @@ MAX_RETRIES = 5
 RETRY_DELAY_SECONDS = 10
 
 def run_azcopy_transfer(azcopy_bin, source, destination, max_retries=MAX_RETRIES,
-                        overwrite="ifSourceNewer", extra_copy_args=None):
+                        overwrite="ifSourceNewer", extra_copy_args=None,
+                        dir_transfer=None):
     """执行 AzCopy 传输，支持断点续传与失败重试 (上传/下载通用)
 
     传输策略（单循环扁平化）：
@@ -271,14 +272,33 @@ def run_azcopy_transfer(azcopy_bin, source, destination, max_retries=MAX_RETRIES
                    (增量续传, 用于不可变 tag 目录与数据集) / None (azcopy 默认)
         extra_copy_args: 追加给 azcopy copy 的参数, 如 ["--include-pattern=...",
                          "--exclude-pattern=.upload_ready;.uploaded"]
+        dir_transfer: 目录传输。azcopy v10 拷贝目录时会把【源目录名】作为子目录
+                   塞进 destination (官方文档行为, 上传/下载对称), 因此这里把
+                   destination 上移一层 (父路径), 由 azcopy 重建叶子目录, 使内容
+                   恰好落在调用方指定的 destination 本身。
+                   None=自动判定 (上传按 os.path.isdir, 下载默认 False——
+                   blob 侧无法 stat, 目录下载必须显式传 True)
 
     成功判定：退出码 == 0 且 Failed 文件数 == 0
     """
     is_upload = not (source.startswith("https://") or source.startswith("http://"))
+    if dir_transfer is None:
+        dir_transfer = is_upload and os.path.isdir(source)
+    if dir_transfer:
+        leaf = source.rstrip("/").rsplit("/", 1)[-1]
+        if is_upload:
+            destination = destination.rstrip("/").rsplit("/", 1)[0]
+        else:
+            destination = os.path.dirname(destination.rstrip("/"))
+        print(f"📁 目录传输: azcopy 将在目标下重建叶子目录 {leaf}/ "
+              f"(目标已上移一层以抵消 azcopy 目录嵌套语义)")
     direction = "上传" if is_upload else "拉取"
     print(f"\n🚀 开始通过 AzCopy 直连{direction}: {source} -> {destination}")
     if not is_upload:
-        os.makedirs(os.path.dirname(destination.rstrip("/")) or ".", exist_ok=True)
+        # 目录下载: destination 已是父目录, 直接创建之; 文件下载: 创建其父目录
+        target_dir = destination.rstrip("/") if dir_transfer \
+            else os.path.dirname(destination.rstrip("/"))
+        os.makedirs(target_dir or ".", exist_ok=True)
     extra_copy_args = list(extra_copy_args or [])
 
     current_job_id = None
@@ -455,6 +475,9 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", type=str, default="ifSourceNewer",
                         choices=["true", "false", "ifSourceNewer"],
                         help="覆盖策略 (默认 ifSourceNewer 增量续传; latest 等易变小文件用 true)")
+    parser.add_argument("--dir", action="store_true",
+                        help="声明所有 --download 任务都是目录传输 (抵消 azcopy 目录嵌套语义; "
+                             "上传任务无需此 flag, 按 os.path.isdir 自动判定)")
     parser.add_argument("--gpu-load", action="store_true",
                         help="独立下载任务模式: 传输期间空转 GPU 防 idle watchdog")
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help=f"最大重试次数 (默认: {MAX_RETRIES})")
@@ -480,16 +503,19 @@ if __name__ == "__main__":
 
     tasks = []
     for blob_ref, local in args.download:
-        tasks.append((resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix), local))
+        tasks.append((resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix), local,
+                      True if args.dir else None))
     for local, blob_ref in args.upload:
-        tasks.append((local, resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix)))
+        tasks.append((local, resolve_blob_ref(blob_ref, args.account, args.container, args.mount_prefix),
+                      None))
 
     global_start = time.time()
 
     failed_tasks = []
-    for src, dst in tasks:
+    for src, dst, is_dir in tasks:
         success = run_azcopy_transfer(azcopy_bin, src, dst, max_retries=args.max_retries,
-                                      overwrite=args.overwrite, extra_copy_args=extra_args)
+                                      overwrite=args.overwrite, extra_copy_args=extra_args,
+                                      dir_transfer=is_dir)
         if not success:
             failed_tasks.append((src, dst))
 

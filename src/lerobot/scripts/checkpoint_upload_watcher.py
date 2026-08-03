@@ -144,6 +144,8 @@ def main():
             for run, run_dir, tag, tag_dir in pending:
                 blob_tag_url = f"{blob_base}/{run}/{tag}"
                 log(f"📤 上传 {run}/{tag} -> {blob_tag_url}")
+                # 目录上传: azcopy 会把 tag 目录名嵌套进目标前缀, run_azcopy_transfer
+                # 内部按 isdir 自动判定并把目标上移一层抵消, blob 落点即 blob_tag_url 本身
                 ok = run_azcopy_transfer(azcopy_bin, tag_dir, blob_tag_url,
                                          max_retries=args.max_retries,
                                          overwrite="ifSourceNewer",
