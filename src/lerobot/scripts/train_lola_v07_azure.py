@@ -1251,6 +1251,118 @@ class LoLAV07Trainer:
         trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         _log(f"VLM unfrozen: {trainable_count:,} trainable params")
 
+    def _exchange_zero3_roundtrip_shards(self, roundtrip_dir: str, tag: str):
+        """本地化 IO + 多节点下, ZeRO-3 解冻回环的跨节点分片互换。
+
+        背景: 本地化 IO 后每节点只把本机 ranks 的分片写到本地 NVMe, 但回环 load
+        (load_checkpoint → get_fp32_state_dict_from_zero_checkpoint) 要求目录下
+        齐 world_size 个 model/optim 分片 + latest 指针 (共享文件系统假设)。
+        本方法在各节点 local_rank==0 上:
+          1. azcopy 上传本机 tag 目录 (只含本机 ranks 分片) + latest 到 blob 临时目录
+          2. 上传 _done_node{i} 标记并轮询所有节点的标记 (blob 即汇合点)
+          3. azcopy 按分片过滤只下载缺失的远端 ranks 分片, 补齐本地目录
+          4. 校验 world_size 个分片齐全, 缺失则全量下载兜底
+        全程无 blobfuse 大文件写 (16 rank 并发 FUSE 写曾致 torch.save IO 崩溃),
+        azcopy 自带重试/断点续传; 失败即响亮报错, job 重试后 resume 会幂等重触发解冻。
+        由 LOLA_CKPT_BLOB_BASE 环境变量激活 (launcher 本地化 ckpt 时透传); 未设置
+        (非本地化运行, ckpt 在共享挂载点上) 或单节点时直接返回。
+        """
+        blob_base = os.environ.get("LOLA_CKPT_BLOB_BASE", "").rstrip("/")
+        if not blob_base:
+            return
+
+        import glob
+        import re
+        import subprocess
+
+        def _barrier():
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+
+        tag_dir = os.path.join(roundtrip_dir, tag)
+        # 本机分片 → ranks_per_node / 节点数 / 本节点编号 (无需额外环境变量)
+        local_ranks = sorted(
+            int(m.group(1))
+            for f in glob.glob(os.path.join(tag_dir, "zero_pp_rank_*_model_states.pt"))
+            if (m := re.search(r"zero_pp_rank_(\d+)_", f))
+        )
+        ranks_per_node = len(local_ranks)
+        if ranks_per_node == 0 or self.world_size % ranks_per_node != 0:
+            raise RuntimeError(
+                f"无法从 {tag_dir} 的本机分片推断节点拓扑 "
+                f"(found ranks={local_ranks}, world_size={self.world_size})")
+        nnodes = self.world_size // ranks_per_node
+        if nnodes <= 1:
+            return
+        node_idx = self.world_rank // ranks_per_node
+
+        if self.local_rank != 0:
+            _barrier()  # 等本节点 rank0 完成互换
+            return
+
+        # ---- 以下仅每节点 local_rank==0 ----
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from download_azure_azcopy import install_azcopy, run_azcopy_transfer
+
+        azcopy_bin = os.environ.get("LOLA_AZCOPY_BIN") or install_azcopy("/tmp/lola_azcopy/azcopy")
+        subprocess.run([azcopy_bin, "login", "--identity"], check=True)
+        blob_rt = f"{blob_base}/{os.path.basename(roundtrip_dir)}"
+        _log(f"[unfreeze] 跨节点分片互换: node {node_idx}/{nnodes}, "
+             f"本机 ranks={local_ranks} -> {blob_rt}")
+
+        # 1. 上传本机分片 (tag 目录整体) + latest 指针 (仅 global rank0 节点有)
+        ok = run_azcopy_transfer(azcopy_bin, tag_dir, f"{blob_rt}/{tag}", dir_transfer=True)
+        latest_local = os.path.join(roundtrip_dir, "latest")
+        if ok and os.path.isfile(latest_local):
+            ok = run_azcopy_transfer(azcopy_bin, latest_local, f"{blob_rt}/latest",
+                                     overwrite="true", max_retries=3)
+        # 2. done 标记 (必须在分片与 latest 之后上传, 作为对端可见的完成信号)
+        marker_local = os.path.join(roundtrip_dir, f"_done_node{node_idx}")
+        open(marker_local, "w").close()
+        ok = ok and run_azcopy_transfer(azcopy_bin, marker_local,
+                                        f"{blob_rt}/_done_node{node_idx}",
+                                        overwrite="true", max_retries=3)
+        if not ok:
+            raise RuntimeError(f"[unfreeze] 本机分片上传失败: {tag_dir} -> {blob_rt}")
+
+        # 3. 轮询全部节点的 done 标记 (单次尝试, 失败即未就绪)
+        poll_timeout = int(os.environ.get("LOLA_EXCHANGE_TIMEOUT", "1800"))
+        deadline = time.time() + poll_timeout
+        for i in range(nnodes):
+            murl = f"{blob_rt}/_done_node{i}"
+            dst = os.path.join(roundtrip_dir, f".poll_node{i}")
+            while subprocess.run([azcopy_bin, "copy", murl, dst, "--overwrite=true"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode != 0:
+                if time.time() > deadline:
+                    raise RuntimeError(
+                        f"[unfreeze] 等待节点 {i} 分片超时 ({poll_timeout}s): {murl}")
+                time.sleep(10)
+
+        # 4. 分片过滤下载远端 ranks (省一半流量) + latest 指针
+        remote_ranks = [r for r in range(self.world_size) if r not in set(local_ranks)]
+        pats = ";".join(f"*zero_pp_rank_{r}_mp_rank_00_*" for r in remote_ranks)
+        ok = run_azcopy_transfer(azcopy_bin, f"{blob_rt}/{tag}", tag_dir, dir_transfer=True,
+                                 extra_copy_args=[f"--include-pattern={pats}"])
+        if ok:
+            ok = run_azcopy_transfer(azcopy_bin, f"{blob_rt}/latest", latest_local,
+                                     overwrite="true", max_retries=3)
+
+        # 5. 校验 world_size 分片齐全, 缺失全量下载兜底
+        def _shards_complete():
+            return (len(glob.glob(os.path.join(tag_dir, "*_model_states.pt"))) >= self.world_size
+                    and len(glob.glob(os.path.join(tag_dir, "*_optim_states.pt"))) >= self.world_size)
+
+        if ok and not _shards_complete():
+            _log("[unfreeze] WARN: 分片过滤下载不完整, 全量下载兜底")
+            ok = run_azcopy_transfer(azcopy_bin, f"{blob_rt}/{tag}", tag_dir, dir_transfer=True)
+        if not ok or not _shards_complete():
+            raise RuntimeError(
+                f"[unfreeze] 分片互换后 {tag_dir} 仍不完整 "
+                f"(world_size={self.world_size}), 回环 load 必失败, 终止")
+        _log(f"[unfreeze] 分片互换完成: {tag_dir} 已齐 {self.world_size} 个分片")
+        _barrier()
+
     def _unfreeze_vlm_deepspeed(self):
         """Unfreeze VLM for DeepSpeed: extract weights, destroy old hooks, rebuild engine, restore weights.
 
@@ -1295,6 +1407,9 @@ class LoLAV07Trainer:
             )
             state_dict = None
             _log(f"Saved temporary ZeRO-3 roundtrip checkpoint: {zero3_roundtrip_dir}")
+            # 本地化 IO + 多节点: 本机只有本节点 ranks 的分片, 而回环 load 需要
+            # world_size 全量分片 → 经 blob 互换补齐 (无共享文件系统时)
+            self._exchange_zero3_roundtrip_shards(zero3_roundtrip_dir, tag="unfreeze")
         else:
             # ZeRO-2: clone to CPU pinned memory. The previous GPU-side clone caused a
             # +P*2 bytes transient spike per rank (16GB+ for cosmos) at the unfreeze step.
@@ -1456,6 +1571,18 @@ class LoLAV07Trainer:
             if self.is_main_process:
                 shutil.rmtree(zero3_roundtrip_dir, ignore_errors=True)
             dist.barrier()
+            # 分片互换在 blob 上的临时目录也一并清掉 (尽力而为, 失败无碍)
+            blob_base = os.environ.get("LOLA_CKPT_BLOB_BASE", "").rstrip("/")
+            if blob_base and self.local_rank == 0:
+                try:
+                    import subprocess
+                    azcopy_bin = os.environ.get("LOLA_AZCOPY_BIN") or "azcopy"
+                    subprocess.run(
+                        [azcopy_bin, "remove", f"{blob_base}/{os.path.basename(zero3_roundtrip_dir)}",
+                         "--recursive=true"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+                except Exception:
+                    pass
         else:
             current_state = dict(model_engine.module.named_parameters())
             restored, missing, unexpected = 0, 0, 0

@@ -682,6 +682,10 @@ if [ "$LOCALIZE_IO" = true ]; then
         CKPT_BLOB_BASE=$(_to_blob "$CKPT_DIR")
         CKPT_DIR=$(_to_local "$CKPT_DIR")
         mkdir -p "$CKPT_DIR"
+        # 透传给训练进程: ZeRO-3 解冻回环的跨节点分片互换经 blob 汇合
+        # (回环 load 需要 world_size 全量分片, 本地化后每节点只有本机分片)
+        export LOLA_CKPT_BLOB_BASE="$CKPT_BLOB_BASE"
+        export LOLA_AZCOPY_BIN="${LOCAL_MIRROR}/bin/azcopy"
         echo "[localize] ckpt: local=$CKPT_DIR, async upload -> $CKPT_BLOB_BASE (keep_last=$UPLOAD_KEEP_LAST)"
         (
             while true; do
