@@ -91,6 +91,9 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
+# resume 搜索 (同目录模块; run 集合目录 → 按训练配置匹配并选步数最多者)
+from resume_search import build_current_snapshot, make_serializable, resolve_resume_auto
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -1779,26 +1782,11 @@ class LoLAV07Trainer:
             _log(f"Checkpoint directory: {ckpt_dir}")
 
             # Save all training configurations as JSON
+            # (make_serializable 与 resume_search 共享, 保证写出的 training_config.json
+            #  与 resume 搜索重建的快照序列化方式一致, 可按值比较)
             import json
-            import dataclasses
-            from pathlib import Path
 
-            def _make_serializable(obj):
-                if isinstance(obj, (torch.dtype, torch.device)):
-                    return str(obj)
-                elif isinstance(obj, Path):
-                    return str(obj)
-                elif isinstance(obj, tuple):
-                    return list(obj)
-                elif isinstance(obj, dict):
-                    return {k: _make_serializable(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [_make_serializable(v) for v in obj]
-                elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-                    return _make_serializable(dataclasses.asdict(obj))
-                return obj
-
-            full_config = _make_serializable({
+            full_config = make_serializable({
                 "lola_config": self.config,
                 "distributed": self.dist_info,
                 "training_args": self.training_args,
@@ -2272,11 +2260,127 @@ class LoLAV07Trainer:
 # ----------------------------------------------------------------------
 # 主函数
 # ----------------------------------------------------------------------
-def main():
-    # 初始化分布式
-    dist_info = setup_distributed()
+def build_lola_config(args, dataset_metadata):
+    """从 args + 数据集元数据构建 LoLAV07Config。
 
-    # 参数解析
+    提取为独立函数, 供 trainer main() 与 resume_search CLI 共享 — resume 搜索
+    重建当前配置快照时, 必须与实际训练进程走同一条构建路径。
+
+    Returns:
+        (config, features, action_dim, state_dim)
+    """
+    features = dataset_to_policy_features(dataset_metadata.features)
+    if "action" in features:
+        action_dim = features["action"].shape[0]
+    else:
+        action_dim = args.action_dim
+
+    if "observation.state" in features:
+        state_dim = features["observation.state"].shape[0]
+    elif args.state_dim is not None:
+        state_dim = args.state_dim
+    else:
+        state_dim = action_dim  # fallback
+
+    _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
+    _log(f"Action dim: {action_dim}")
+
+    # Auto-compute vlm_max_length if static VLM padding is enabled but no override given
+    if args.static_vlm_padding and args.vlm_max_length is None:
+        args.vlm_max_length = compute_vlm_max_length(
+            dataset_metadata,
+            vlm_path=args.vlm_path,
+            min_image_pixels=args.min_image_pixels,
+            max_image_pixels=args.max_image_pixels,
+        )
+
+    gradient_checkpointing = not args.no_gradient_checkpointing
+    config = LoLAV07Config(
+        vlm_backbone=args.vlm_backbone,
+        vlm_path=args.vlm_path,
+        action_dim=action_dim,
+        action_chunk_size=args.action_chunk_size,
+        pred_chunk_size=args.pred_chunk_size,
+        n_obs_steps=args.n_obs_steps,
+        input_features={key: ft for key, ft in features.items() if ft.type != FeatureType.ACTION},
+        output_features={key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION},
+        train_vlm=args.train_vlm,
+        load_full_history=args.load_full_history,
+        max_history_length=args.max_history_length,
+        history_padding_side=args.history_padding_side,
+        history_type=args.history_type,
+        state_dim=state_dim,
+        state_encoder_mode=args.state_encoder_mode,
+        use_state_condition=args.use_state_condition,
+        gradient_checkpointing=gradient_checkpointing,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
+        vlm_lr=args.vlm_lr,
+        vlm_extract_layers=tuple(args.vlm_extract_layers),
+        vlm_bridge_mode=args.vlm_bridge_mode,
+        vlm_bridge_width=args.vlm_bridge_width,
+        vlm_bridge_layers=args.vlm_bridge_layers,
+        vlm_unfreeze_v_loss_threshold=args.vlm_unfreeze_v_loss_threshold,
+        vlm_lr_mult=args.vlm_lr_mult,
+        use_special_tokens=args.use_special_tokens,
+        max_image_pixels=args.max_image_pixels,
+        min_image_pixels=args.min_image_pixels,
+        gripper_loss_weight=args.gripper_loss_weight,
+        action_loss_weight=args.action_loss_weight,
+        gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
+        hist_action_token_drop_rate=args.hist_action_token_drop_rate,
+        static_vlm_padding=args.static_vlm_padding,
+        vlm_max_length=args.vlm_max_length,
+        # V2: text template + completed tasks + transition masking
+        task_text_template_version=args.task_text_template_version,
+        completed_tasks_use_ann=not args.no_completed_tasks_use_ann,
+        completed_tasks_history_len=args.completed_tasks_history_len,
+        transition_mask_rate=args.transition_mask_rate,
+        max_transition_len=args.max_transition_len,
+        # V07: Bottleneck dimensions
+        action_bottleneck_dim=args.action_bottleneck_dim,
+        grip_bottleneck_dim=args.grip_bottleneck_dim,
+        state_bottleneck_dim=args.state_bottleneck_dim,
+        state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
+        encoder_lr_mult=args.encoder_lr_mult,
+        warmup_pct=args.warmup_pct,
+    )
+
+    # 归一化模式
+    if args.norm_mode == "robovlm":
+        from lerobot.configs.types import NormalizationMode
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+    elif args.norm_mode == "zscore":
+        from lerobot.configs.types import NormalizationMode
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+
+    return config, features, action_dim, state_dim
+
+
+def build_dataset_metadata_snapshot(dataset_metadata, features):
+    """训练配置快照的数据集身份部分 (写入 training_config.json 与 resume 搜索共用)。"""
+    return {
+        "total_episodes": dataset_metadata.total_episodes,
+        "total_frames": dataset_metadata.total_frames,
+        "fps": dataset_metadata.fps,
+        "features": {k: {"shape": list(v.shape), "type": str(v.type)} for k, v in features.items()},
+    }
+
+
+def build_arg_parser():
+    """构建 trainer 的 argparse parser。
+
+    提取为函数供 resume_search CLI 复用 — resume 搜索重建当前配置快照时,
+    必须与实际训练进程使用同一套参数定义 (含默认值), 保证快照严格同源。
+    """
     parser = argparse.ArgumentParser(description="LoLA V07 Azure Distributed Training")
 
     # 数据集参数
@@ -2434,7 +2538,15 @@ def main():
                         choices=["original", "incremental"],
                         help="Stats模式: 'original'使用annotation-only stats, 'incremental'使用包含所有Calvin帧(含transition)的增量stats")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    # 初始化分布式
+    dist_info = setup_distributed()
+
+    # 参数解析
+    args = build_arg_parser().parse_args()
 
     # 检查数据集参数
     if args.dataset_repo_id is None and args.dataset_root is None:
@@ -2515,99 +2627,22 @@ def main():
         root=args.dataset_root,
     )
 
-    features = dataset_to_policy_features(dataset_metadata.features)
-    if "action" in features:
-        action_dim = features["action"].shape[0]
-    else:
-        action_dim = args.action_dim
+    # 创建 LoLA 配置 (build_lola_config 与 resume_search CLI 共享, 保证 resume
+    # 搜索用的配置快照与实际训练进程严格同源)
+    config, features, action_dim, state_dim = build_lola_config(args, dataset_metadata)
 
-    if "observation.state" in features:
-        state_dim = features["observation.state"].shape[0]
-    elif args.state_dim is not None:
-        state_dim = args.state_dim
-    else:
-        state_dim = action_dim  # fallback
-
-    _log(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
-    _log(f"Action dim: {action_dim}")
-
-    # Auto-compute vlm_max_length if static VLM padding is enabled but no override given
-    if args.static_vlm_padding and args.vlm_max_length is None:
-        args.vlm_max_length = compute_vlm_max_length(
-            dataset_metadata,
-            vlm_path=args.vlm_path,
-            min_image_pixels=args.min_image_pixels,
-            max_image_pixels=args.max_image_pixels,
+    # Resume 解析: --resume 支持三形态 — 具体 tag 目录 (step_XXXXXX/final) /
+    # 含 latest 指针的 run 目录 / run 集合目录。集合目录进入搜索模式: 读取各 run 的
+    # training_config.json, 与当前训练配置做语义匹配, 在匹配的 run 中选 latest
+    # 步数最多者 (匹配规则详见 resume_search.py 模块 docstring)
+    dataset_meta_snapshot = build_dataset_metadata_snapshot(dataset_metadata, features)
+    if args.resume and args.strategy == "deepspeed":
+        _resume_snapshot = build_current_snapshot(
+            args, config, dataset_meta_snapshot, dist_info["world_size"]
         )
-
-    # 创建 LoLA 配置
-    gradient_checkpointing = not args.no_gradient_checkpointing
-    config = LoLAV07Config(
-        vlm_backbone=args.vlm_backbone,
-        vlm_path=args.vlm_path,
-        action_dim=action_dim,
-        action_chunk_size=args.action_chunk_size,
-        pred_chunk_size=args.pred_chunk_size,
-        n_obs_steps=args.n_obs_steps,
-        input_features={key: ft for key, ft in features.items() if ft.type != FeatureType.ACTION},
-        output_features={key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION},
-        train_vlm=args.train_vlm,
-        load_full_history=args.load_full_history,
-        max_history_length=args.max_history_length,
-        history_padding_side=args.history_padding_side,
-        history_type=args.history_type,
-        state_dim=state_dim,
-        state_encoder_mode=args.state_encoder_mode,
-        use_state_condition=args.use_state_condition,
-        gradient_checkpointing=gradient_checkpointing,
-        compile_model=args.compile_model,
-        compile_mode=args.compile_mode,
-        vlm_lr=args.vlm_lr,
-        vlm_extract_layers=tuple(args.vlm_extract_layers),
-        vlm_bridge_mode=args.vlm_bridge_mode,
-        vlm_bridge_width=args.vlm_bridge_width,
-        vlm_bridge_layers=args.vlm_bridge_layers,
-        vlm_unfreeze_v_loss_threshold=args.vlm_unfreeze_v_loss_threshold,
-        vlm_lr_mult=args.vlm_lr_mult,
-        use_special_tokens=args.use_special_tokens,
-        max_image_pixels=args.max_image_pixels,
-        min_image_pixels=args.min_image_pixels,
-        gripper_loss_weight=args.gripper_loss_weight,
-        action_loss_weight=args.action_loss_weight,
-        gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")),
-        hist_action_token_drop_rate=args.hist_action_token_drop_rate,
-        static_vlm_padding=args.static_vlm_padding,
-        vlm_max_length=args.vlm_max_length,
-        # V2: text template + completed tasks + transition masking
-        task_text_template_version=args.task_text_template_version,
-        completed_tasks_use_ann=not args.no_completed_tasks_use_ann,
-        completed_tasks_history_len=args.completed_tasks_history_len,
-        transition_mask_rate=args.transition_mask_rate,
-        max_transition_len=args.max_transition_len,
-        # V07: Bottleneck dimensions
-        action_bottleneck_dim=args.action_bottleneck_dim,
-        grip_bottleneck_dim=args.grip_bottleneck_dim,
-        state_bottleneck_dim=args.state_bottleneck_dim,
-        state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
-        encoder_lr_mult=args.encoder_lr_mult,
-        warmup_pct=args.warmup_pct,
-    )
-
-    # 归一化模式
-    if args.norm_mode == "robovlm":
-        from lerobot.configs.types import NormalizationMode
-        config.normalization_mapping = {
-            "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.IDENTITY,
-            "ACTION": NormalizationMode.IDENTITY,
-        }
-    elif args.norm_mode == "zscore":
-        from lerobot.configs.types import NormalizationMode
-        config.normalization_mapping = {
-            "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.IDENTITY,
-        }
+        args.resume = resolve_resume_auto(args.resume, _resume_snapshot, log=_log)
+        if args.resume is None:
+            _log("Resume disabled: 搜索模式未找到匹配的 checkpoint, 从头开始训练")
 
     # 创建数据集
     _log("Creating dataset...")
@@ -2703,14 +2738,9 @@ def main():
             peek_deepspeed_checkpoint_vlm_unfrozen(args.resume)
             if args.resume and args.strategy == "deepspeed" else False
         ),
-        # Config saving
+        # Config saving (dataset_meta_snapshot 与 resume 搜索的匹配快照同源)
         training_args=vars(args),
-        dataset_metadata={
-            "total_episodes": dataset_metadata.total_episodes,
-            "total_frames": dataset_metadata.total_frames,
-            "fps": dataset_metadata.fps,
-            "features": {k: {"shape": list(v.shape), "type": str(v.type)} for k, v in features.items()},
-        },
+        dataset_metadata=dataset_meta_snapshot,
     )
 
     # Wandb 已在 main() 开头提前初始化，同步 trainer 的 use_wandb 标记

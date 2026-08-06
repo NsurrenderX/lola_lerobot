@@ -178,6 +178,9 @@ UPLOAD_DRAIN_TIMEOUT=${UPLOAD_DRAIN_TIMEOUT:-7200}  # 训练结束后等上传�
 # ----------------------------------------------------------------------
 # 解析命令行参数
 # ----------------------------------------------------------------------
+# 保留原始参数: resume 搜索模式的 helper (resume_search.py) 需要用与训练进程
+# 完全相同的参数重建当前配置快照 (launcher 私有 flag 会被 parse_known_args 忽略)
+LAUNCH_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
     case $1 in
         # Azure 分布式参数
@@ -651,30 +654,60 @@ if [ "$LOCALIZE_IO" = true ]; then
             RESUME_TAG_DIR_LOCAL="$RESUME_LOCAL"
             RESUME_TAG_DIR_BLOB="$RESUME_BLOB"
         else
-            # run 目录: 先拉 latest 指针确定 tag
-            echo "[localize] resume: fetch latest pointer from $RESUME_BLOB"
-            _azcopy_transfer --download "${RESUME_BLOB}/latest" "${RESUME_LOCAL}/latest" --overwrite true
-            RESUME_TAG=$(cat "${RESUME_LOCAL}/latest")
-            RESUME_TAG_DIR_LOCAL="${RESUME_LOCAL}/${RESUME_TAG}"
-            RESUME_TAG_DIR_BLOB="${RESUME_BLOB}/${RESUME_TAG}"
-        fi
-        echo "[localize] resume ckpt: $RESUME_TAG_DIR_BLOB -> $RESUME_TAG_DIR_LOCAL (shard filter: ranks ${START_RANK}-${END_RANK})"
-        _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS" --dir
-        _show_layout "resume tag" "$RESUME_TAG_DIR_LOCAL"
-        # 校验本节点分片齐全, 缺失则全量重下兜底
-        SHARDS_OK=true
-        for ((i=START_RANK; i<=END_RANK; i++)); do
-            if ! compgen -G "${RESUME_TAG_DIR_LOCAL}/zero_pp_rank_${i}_mp_rank_00_*model_states.pt" > /dev/null; then
-                SHARDS_OK=false
-                break
+            # run 目录或 run 集合目录: 统一下载元数据 (latest + training_config.json,
+            # 均为小文件, 一次拉完; 集合目录下每个 run 各一份)
+            echo "[localize] resume: fetch metadata (latest + training_config.json) from $RESUME_BLOB"
+            _azcopy_transfer --download "$RESUME_BLOB" "$RESUME_LOCAL" --include-pattern "latest;training_config.json" --overwrite true --dir
+            _show_layout "resume metadata" "$RESUME_LOCAL"
+            if [ -f "${RESUME_LOCAL}/latest" ]; then
+                : # run 目录: latest 指针已在元数据下载中就位
+            elif ! compgen -G "${RESUME_LOCAL}/*/training_config.json" > /dev/null; then
+                echo "[localize] resume: $RESUME_BLOB 下未找到任何 checkpoint 元数据 (新实验或路径无内容) — 从头开始训练 (resume 已禁用)"
+                RESUME=""
+            else
+                # 集合目录 → 搜索模式: 按训练配置匹配 run, 选 latest 步数最多者
+                # (helper stdout 仅输出选中的 run 目录名, 候选表在 stderr; 空 = 无匹配)
+                echo "[localize] resume 搜索模式: 在 $RESUME_LOCAL 下按训练配置匹配 run"
+                RUN_NAME=$(/home/aiscuser/.conda/envs/lerobot/bin/python "${SCRIPTS_DIR}/resume_search.py" \
+                    --resolve_parent "$RESUME_LOCAL" \
+                    --local_dataset_root "${LOCAL_DATASET_ROOT:-$DATASET_ROOT}" \
+                    --world_size "$((NNODES * NPROC_PER_NODE))" \
+                    -- "${LAUNCH_ARGS[@]}")
+                if [ -n "$RUN_NAME" ]; then
+                    echo "[localize] resume 搜索命中: ${RUN_NAME}"
+                    RESUME_LOCAL="${RESUME_LOCAL}/${RUN_NAME}"
+                    RESUME_BLOB="${RESUME_BLOB}/${RUN_NAME}"
+                else
+                    echo "[localize] resume 搜索: 未找到配置匹配的 checkpoint — 从头开始训练 (resume 已禁用)"
+                    RESUME=""
+                fi
             fi
-        done
-        if [ "$SHARDS_OK" != true ]; then
-            echo "[localize] WARN: 分片过滤下载不完整, 全量重下 tag 目录兜底"
-            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --dir
-            _show_layout "resume tag (全量兜底)" "$RESUME_TAG_DIR_LOCAL"
+            if [ -n "$RESUME" ]; then
+                # run 目录: 读出 latest 指针指向的 tag
+                RESUME_TAG=$(cat "${RESUME_LOCAL}/latest")
+                RESUME_TAG_DIR_LOCAL="${RESUME_LOCAL}/${RESUME_TAG}"
+                RESUME_TAG_DIR_BLOB="${RESUME_BLOB}/${RESUME_TAG}"
+            fi
         fi
-        RESUME="$RESUME_LOCAL"
+        if [ -n "$RESUME" ]; then
+            echo "[localize] resume ckpt: $RESUME_TAG_DIR_BLOB -> $RESUME_TAG_DIR_LOCAL (shard filter: ranks ${START_RANK}-${END_RANK})"
+            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS" --dir
+            _show_layout "resume tag" "$RESUME_TAG_DIR_LOCAL"
+            # 校验本节点分片齐全, 缺失则全量重下兜底
+            SHARDS_OK=true
+            for ((i=START_RANK; i<=END_RANK; i++)); do
+                if ! compgen -G "${RESUME_TAG_DIR_LOCAL}/zero_pp_rank_${i}_mp_rank_00_*model_states.pt" > /dev/null; then
+                    SHARDS_OK=false
+                    break
+                fi
+            done
+            if [ "$SHARDS_OK" != true ]; then
+                echo "[localize] WARN: 分片过滤下载不完整, 全量重下 tag 目录兜底"
+                _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --dir
+                _show_layout "resume tag (全量兜底)" "$RESUME_TAG_DIR_LOCAL"
+            fi
+            RESUME="$RESUME_LOCAL"
+        fi
     fi
 
     # 4. ckpt 目录本地化 + 启动上传 watchdog (supervisor 循环, 崩溃自动重启)

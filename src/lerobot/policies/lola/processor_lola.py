@@ -494,14 +494,18 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 messages.append([{"role": "user", "content": content}])
 
             self.qwen_processor.tokenizer.padding_side = 'left'
+            # transformers >= 5.x: tokenizer kwargs must go through processor_kwargs
+            # (flat **kwargs still work for BC but spam a warning every call)
+            text_kwargs = {"padding": "max_length" if self.static_vlm_padding else True}
+            if self.static_vlm_padding:
+                text_kwargs["max_length"] = self.vlm_max_length
             inputs = self.qwen_processor.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
                 return_tensors="pt",
-                padding="max_length" if self.static_vlm_padding else True,
-                max_length=self.vlm_max_length if self.static_vlm_padding else None,
+                processor_kwargs={"text_kwargs": text_kwargs},
             )
         else:
             # Single-item mode (inference)
@@ -520,8 +524,7 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 add_generation_prompt=True,
                 return_dict=True,
                 return_tensors="pt",
-                padding="max_length" if self.static_vlm_padding else True,
-                max_length=self.vlm_max_length if self.static_vlm_padding else None,
+                processor_kwargs={"text_kwargs": text_kwargs},
             )
 
         # Extract outputs
