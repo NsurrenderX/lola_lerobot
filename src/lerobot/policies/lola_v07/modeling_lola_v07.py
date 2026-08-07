@@ -955,8 +955,11 @@ class LoLAV07Policy(PreTrainedPolicy):
             self.model.state_encoder = self.model.state_encoder.float()
 
         # Gradient checkpointing
+        # VLM 是激活大头, GC 必须保留; DiT (256D bottleneck, 激活 ~1GB) 默认不做 GC,
+        # 避免 backward 里一次完整重算 — 由 config.dit_gradient_checkpointing 单独控制。
         if config.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+            if getattr(config, "dit_gradient_checkpointing", False):
+                self.model.gradient_checkpointing_enable()
             if config.train_vlm:
                 self.vlm.gradient_checkpointing_enable()
 

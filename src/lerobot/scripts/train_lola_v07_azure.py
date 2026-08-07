@@ -432,9 +432,12 @@ def get_deepspeed_config(
     train_vlm: bool = False,
     batch_size: int = 4,
     world_size: int = 1,
-    reduce_bucket_size: float = 5e7,
+    reduce_bucket_size: float = 5e8,
     allgather_bucket_size: float = 5e7,
     zero_stage: int = 2,
+    stage3_prefetch_bucket_size: float = 5e8,
+    stage3_max_live_parameters: float = 2e9,
+    stage3_max_reuse_distance: float = 2e9,
 ):
     """Generate default DeepSpeed ZeRO config for B200 GPUs (~183GB each).
 
@@ -459,15 +462,27 @@ def get_deepspeed_config(
             "contiguous_gradients": False,
             "round_robin_gradients": True,
         })
-    # ZeRO-3: DeepSpeed 0.18 默认值即合理
-    # (prefetch_bucket=5e7, max_live_parameters=1e9,
-    #  gather_16bit_weights_on_model_save=False 即按 rank 分片保存, resume 需相同 world size);
+    # ZeRO-3: 通信参数针对 A100-40G PCIe 拓扑调优 (2026-08-07, 依据 log_multiepoch.txt
+    # 实测: 解冻后 6.5s/step, 通信为瓶颈)。
+    #   - prefetch_bucket 5e7→5e8: 默认值在 ~8GB VLM 参数上产生大量小 allgather,
+    #     预取与计算重叠差; 放大后单次传输更大、次数更少。
+    #   - max_live_parameters / max_reuse_distance 1e9→2e9: 放宽后 fwd 已 gather 的
+    #     参数更可能保留到 bwd 复用, 减少重复 gather。代价是 gather 态 bf16 参数驻留
+    #     上限 ~4GB (2e9 参数), 实测 40G 卡 reserved 余量 ~16GB, 可承受。
+    #   - reduce_bucket_size 默认 5e7→5e8 (见函数签名): ZeRO-3 用它做梯度
+    #     reduce-scatter 分桶 (stage3.py:1351), DS 自带默认就是 5e8, 之前的 5e7
+    #     是给 ZeRO-2/NVLink 调的值。
+    #   - gather_16bit_weights_on_model_save=False (默认) 即按 rank 分片保存,
+    #     resume 需相同 world size。
     # ZeRO-2 专属的 round_robin_gradients 等键不能传给 stage 3。
     # 例外: param_persistence_threshold 必须为 0 — DS 0.18 的 ZeRO-3 load_state_dict
     # 末尾会对 persistent(小)参数执行 partition(), 破坏其梯度账目, resume 后第一次
     # backward 即崩 ("size of tensor a (0) ... at AccumulateGrad"); 置 0 禁用该路径。
     if zero_stage >= 3:
         zero_optimization["param_persistence_threshold"] = 0
+        zero_optimization["stage3_prefetch_bucket_size"] = stage3_prefetch_bucket_size
+        zero_optimization["stage3_max_live_parameters"] = stage3_max_live_parameters
+        zero_optimization["stage3_max_reuse_distance"] = stage3_max_reuse_distance
 
     return {
         "bf16": {"enabled": True},
@@ -819,7 +834,7 @@ class LoLAV07Trainer:
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
         deepspeed_config_path: str | None = None,
-        deepspeed_reduce_bucket_size: float = 5e7,
+        deepspeed_reduce_bucket_size: float = 5e8,
         deepspeed_allgather_bucket_size: float = 5e7,
         deepspeed_zero_stage: int = 2,
         resume_vlm_unfrozen: bool = False,
@@ -2313,6 +2328,7 @@ def build_lola_config(args, dataset_metadata):
         state_encoder_mode=args.state_encoder_mode,
         use_state_condition=args.use_state_condition,
         gradient_checkpointing=gradient_checkpointing,
+        dit_gradient_checkpointing=args.dit_gradient_checkpointing,
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
@@ -2432,6 +2448,9 @@ def build_arg_parser():
                         help="启用梯度检查点（默认开启）")
     parser.add_argument("--no_gradient_checkpointing", action="store_true",
                         help="关闭梯度检查点")
+    parser.add_argument("--dit_gradient_checkpointing", action="store_true",
+                        help="对 DiT 也启用梯度检查点 (默认关闭: DiT 激活仅 ~1GB, GC 重算不划算; "
+                             "VLM 的 GC 不受此开关影响, 显存 OOM 时再打开)")
     parser.add_argument("--compile_model", action="store_true",
                         help="启用 torch.compile 优化")
     parser.add_argument("--compile_mode", type=str, default="max-autotune",
@@ -2508,8 +2527,9 @@ def build_arg_parser():
                         help="Path to custom DeepSpeed config JSON. Default: ZeRO config tuned for B200.")
     parser.add_argument("--deepspeed_zero_stage", type=int, default=2, choices=[1, 2, 3],
                         help="DeepSpeed ZeRO stage: 1 (optimizer partitioning) or 2 (optimizer+gradient partitioning). Default: 2")
-    parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e7,
-                        help="DeepSpeed ZeRO reduce bucket size (default: 5e7 for B200 NVLink)")
+    parser.add_argument("--deepspeed_reduce_bucket_size", type=float, default=5e8,
+                        help="DeepSpeed ZeRO reduce bucket size (default: 5e8; ZeRO-3 用它做梯度 "
+                             "reduce-scatter 分桶, 5e7 是早年给 ZeRO-2/NVLink 调的值)")
     parser.add_argument("--deepspeed_allgather_bucket_size", type=float, default=5e7,
                         help="DeepSpeed ZeRO allgather bucket size (default: 5e7 for B200 NVLink)")
 

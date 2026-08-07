@@ -58,6 +58,7 @@ LOLA_CONFIG_EXCLUDE_KEYS = frozenset({
     "compile_model",
     "compile_mode",
     "gradient_checkpointing",
+    "dit_gradient_checkpointing",
 })
 
 # training_args 比较白名单: 影响训练语义或 checkpoint 兼容性的键。

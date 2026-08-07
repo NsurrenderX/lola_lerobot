@@ -75,6 +75,8 @@ USE_STATE_CONDITION=false
 
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
+# DiT 梯度检查点 (默认关: DiT 激活仅 ~1GB, GC 重算不划算; VLM GC 不受影响)
+DIT_GRADIENT_CHECKPOINTING=false
 COMPILE_MODEL=false
 COMPILE_MODE="max-autotune"
 VLM_LR=1e-6
@@ -132,7 +134,8 @@ NUM_WORKERS=8
 # DeepSpeed 参数
 DEEPSPEED_CONFIG=""
 DEEPSPEED_ZERO_STAGE=2
-DEEPSPEED_REDUCE_BUCKET_SIZE=5e7
+# reduce bucket 默认 5e8 (2026-08-07 ZeRO-3 通信调优; 旧值 5e7 是给 ZeRO-2/NVLink 调的)
+DEEPSPEED_REDUCE_BUCKET_SIZE=5e8
 DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
 
 # Static padding 参数
@@ -287,6 +290,10 @@ while [[ $# -gt 0 ]]; do
         # LoLA 模型配置参数
         --no_gradient_checkpointing)
             GRADIENT_CHECKPOINTING=false
+            shift
+            ;;
+        --dit_gradient_checkpointing)
+            DIT_GRADIENT_CHECKPOINTING=true
             shift
             ;;
         --compile_model)
@@ -658,6 +665,9 @@ fi
 # 梯度检查点 & compile
 if [ "$GRADIENT_CHECKPOINTING" = false ]; then
     cmd="${cmd} --no_gradient_checkpointing"
+fi
+if [ "$DIT_GRADIENT_CHECKPOINTING" = true ]; then
+    cmd="${cmd} --dit_gradient_checkpointing"
 fi
 if [ "$COMPILE_MODEL" = true ]; then
     cmd="${cmd} --compile_model --compile_mode ${COMPILE_MODE}"

@@ -19,6 +19,12 @@ class LoLAV07Config(LoLAConfig):
     warmup_t_trunc_low: float = 0.1        # t-truncation lower bound during warmup
     warmup_t_trunc_high: float = 0.9       # t-truncation upper bound during warmup
 
+    # DiT gradient checkpointing (独立于 VLM 的 gradient_checkpointing 开关)。
+    # DiT 是 256D bottleneck 的小模型, 激活 ~1GB, GC 的完整重算不划算 — 默认关;
+    # VLM (激活大头) 的 GC 仍由 gradient_checkpointing && train_vlm 控制。
+    # 显存吃紧时可用 --dit_gradient_checkpointing 重新打开。
+    dit_gradient_checkpointing: bool = False
+
     # Override defaults from LoLAConfig
     action_loss_weight: float = 10.0       # v06 was 1.0
 
