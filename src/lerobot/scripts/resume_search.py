@@ -316,7 +316,25 @@ def _cli(argv):
         build_lola_config,
     )
 
-    args, _ = build_arg_parser().parse_known_args(remaining)
+    # launcher (test_azure_v07c.sh) 的解析循环把 nargs="+" 参数以单个引号字符串
+    # 透传 (yaml 写法: --vlm_extract_layers "4 8 12 ..."), 原样进入 remaining 会被
+    # argparse 当作一个值做类型转换而报错。按 trainer parser 中实际的 nargs="+" 选项,
+    # 把跟随其后的含空格字符串重新拆开 (普通字符串参数不受影响)。
+    trainer_parser = build_arg_parser()
+    list_flags = {
+        opt
+        for action in trainer_parser._actions
+        if action.nargs in ("+", "*")
+        for opt in action.option_strings
+    }
+    expanded = []
+    for tok in remaining:
+        if expanded and expanded[-1] in list_flags and " " in tok:
+            expanded.extend(tok.split())
+        else:
+            expanded.append(tok)
+
+    args, _ = trainer_parser.parse_known_args(expanded)
     if known.local_dataset_root:
         args.dataset_root = known.local_dataset_root
 
