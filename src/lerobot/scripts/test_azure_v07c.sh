@@ -569,6 +569,90 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ----------------------------------------------------------------------
+# resume_search CLI 快照参数对齐 (2026-08-09 修复, 勿回退)
+# resume_search.py 用 LAUNCH_ARGS (原始 $@) 重建当前训练配置快照; 但 launcher
+# 对大量参数以 bash 默认值补齐后【无条件拼进 torchrun cmd】 (如
+# VLM_BACKBONE=cosmos3_nano / VLM_BRIDGE_MODE=transformer, 均不同于 trainer
+# parser 默认值 qwen3_5/legacy)。用户未显式传时 $@ 里没有这些参数 → CLI 快照
+# 退回 parser 默认值 → 与 ckpt 的 training_config.json 不匹配 → resume 搜索
+# 误判无匹配、静默从头训练 (2026-08-09 生产事故: 5 处 vlm_* 差异)。
+# 修复: 解析完成后把所有 launcher 管理的参数以【生效值】追加进 LAUNCH_ARGS。
+# argparse 同名参数后者生效; 用户显式传入的值与解析后的 bash 变量必然一致,
+# 因此追加总是无害的 (值参数与布尔 flag 的追加条件需与下方 cmd 拼装逻辑一致)。
+# 注意: 新增"bash 默认值 + 拼 cmd"的参数时, 必须同步到此列表。
+# ----------------------------------------------------------------------
+LAUNCH_ARGS+=(
+    --strategy "${STRATEGY}"
+    --batch_size "${BATCH_SIZE}"
+    --learning_rate "${LEARNING_RATE}"
+    --log_every_n_steps "${LOG_EVERY_N_STEPS}"
+    --gradient_clip_val "${GRADIENT_CLIP_VAL}"
+    --vlm_backbone "${VLM_BACKBONE}"
+    --action_dim "${ACTION_DIM}"
+    --action_chunk_size "${ACTION_CHUNK_SIZE}"
+    --pred_chunk_size "${PRED_CHUNK_SIZE}"
+    --n_obs_steps "${N_OBS_STEPS}"
+    --vlm_extract_layers ${VLM_EXTRACT_LAYERS}
+    --vlm_bridge_mode "${VLM_BRIDGE_MODE}"
+    --vlm_bridge_width "${VLM_BRIDGE_WIDTH}"
+    --vlm_bridge_layers "${VLM_BRIDGE_LAYERS}"
+    --max_image_pixels "${MAX_IMAGE_PIXELS}"
+    --min_image_pixels "${MIN_IMAGE_PIXELS}"
+    --num_inference_steps "${NUM_INFERENCE_STEPS}"
+    --gripper_dims "${GRIPPER_DIMS}"
+    --action_loss_weight "${ACTION_LOSS_WEIGHT}"
+    --gripper_loss_weight "${GRIPPER_LOSS_WEIGHT}"
+    --hist_action_token_drop_rate "${HIST_ACTION_TOKEN_DROP_RATE}"
+    --action_bottleneck_dim "${ACTION_BOTTLENECK_DIM}"
+    --grip_bottleneck_dim "${GRIP_BOTTLENECK_DIM}"
+    --state_bottleneck_dim "${STATE_BOTTLENECK_DIM}"
+    --state_grip_bottleneck_dim "${STATE_GRIP_BOTTLENECK_DIM}"
+    --encoder_lr_mult "${ENCODER_LR_MULT}"
+    --warmup_pct "${WARMUP_PCT}"
+    --vlm_unfreeze_v_loss_threshold "${VLM_UNFREEZE_V_LOSS_THRESHOLD}"
+    --vlm_lr_mult "${VLM_LR_MULT}"
+    --task_text_template_version "${TASK_TEXT_TEMPLATE_VERSION}"
+    --transition_mask_rate "${TRANSITION_MASK_RATE}"
+    --max_transition_len "${MAX_TRANSITION_LEN}"
+    --num_workers "${NUM_WORKERS}"
+    --norm_mode "${NORM_MODE}"
+    --norm_min "${NORM_MIN}"
+    --norm_max "${NORM_MAX}"
+    --stats_mode "${STATS_MODE}"
+    --deepspeed_zero_stage "${DEEPSPEED_ZERO_STAGE}"
+    --deepspeed_reduce_bucket_size "${DEEPSPEED_REDUCE_BUCKET_SIZE}"
+    --deepspeed_allgather_bucket_size "${DEEPSPEED_ALLGATHER_BUCKET_SIZE}"
+    --history_type "${HISTORY_TYPE}"
+    --state_encoder_mode "${STATE_ENCODER_MODE}"
+    --completed_tasks_history_len "${COMPLETED_TASKS_HISTORY_LEN}"
+)
+# 布尔/条件参数 (追加条件与 cmd 拼装保持一致)
+if [ "$LOAD_FULL_HISTORY" = true ]; then
+    LAUNCH_ARGS+=(--load_full_history --max_history_length "${MAX_HISTORY_LENGTH}" --history_padding_side "${HISTORY_PADDING_SIDE}")
+fi
+if [ "$USE_STATE_CONDITION" = true ]; then
+    LAUNCH_ARGS+=(--use_state_condition)
+fi
+if [ -n "$STATE_DIM" ]; then
+    LAUNCH_ARGS+=(--state_dim "${STATE_DIM}")
+fi
+if [ "$TRAIN_VLM" = true ]; then
+    LAUNCH_ARGS+=(--train_vlm --vlm_lr "${VLM_LR}")
+fi
+if [ "$COMPLETED_TASKS_USE_ANN" = false ]; then
+    LAUNCH_ARGS+=(--no_completed_tasks_use_ann)
+fi
+if [ "$STATIC_VLM_PADDING" = true ]; then
+    LAUNCH_ARGS+=(--static_vlm_padding)
+fi
+if [ -n "$VLM_MAX_LENGTH" ]; then
+    LAUNCH_ARGS+=(--vlm_max_length "${VLM_MAX_LENGTH}")
+fi
+if [ "$USE_SPECIAL_TOKENS" = true ]; then
+    LAUNCH_ARGS+=(--use_special_tokens)
+fi
+
+# ----------------------------------------------------------------------
 # 本地化 IO 前置阶段: blob -> 节点本地 NVMe (训练开始前)
 # ----------------------------------------------------------------------
 # 规范化: 统一剥掉路径变量的结尾斜杠, 否则 _to_local 等拼接会产生 //
