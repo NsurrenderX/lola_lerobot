@@ -1823,17 +1823,19 @@ class LoLAV07Trainer:
             batches_per_epoch = None
             _log("IterableDataset detected: cannot determine batches per epoch")
 
-        # resume skip logic: use start_epoch for epoch-based skip
-        if start_epoch > 0 and batches_per_epoch is not None:
-            skip_epochs = start_epoch
-            skip_batches = start_step % batches_per_epoch if start_step > 0 else 0
-            _log(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
-        elif start_step > 0 and batches_per_epoch is not None:
-            skip_epochs = start_step // batches_per_epoch
-            skip_batches = start_step % batches_per_epoch
-            _log(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
-        elif start_step > 0 and batches_per_epoch is None:
-            skip_epochs = 0
+        # resume 定位: 以 start_step (已完成 batch 数) 为唯一基准推导 epoch 起点。
+        # checkpoint 里的 current_epoch 是【进行中】的 epoch (1-indexed; save_every_n_epochs
+        # 在每个 epoch batch_idx==0 训完后触发, 见下方保存逻辑), 不能直接当循环起点 ——
+        # 2026-08-09 生产事故: 旧逻辑 epoch=start_epoch 已把 while 循环定位到
+        # start_epoch+1, skip_epochs=start_epoch 又把剩余每个 epoch 的首个 batch 全部
+        # break (双重跳过), resume 到后半程时一步未训直接存 final。勿回退。
+        if start_step > 0 and batches_per_epoch is not None:
+            epoch = start_step // batches_per_epoch  # 已完成的 epoch 数 (循环开头 epoch+=1)
+            skip_batches = start_step % batches_per_epoch  # 进行中 epoch 已训的 batch 数
+            _log(f"Resuming: start at epoch {epoch + 1}, skipping {skip_batches} batches")
+        elif start_step > 0:
+            # IterableDataset: 无法按步数定位数据, 数据从头开始 (model/optimizer/scheduler 已恢复)
+            epoch = start_epoch
             skip_batches = 0
             _log(
                 f"Resuming from step {start_step} with IterableDataset: "
@@ -1841,10 +1843,8 @@ class LoLAV07Trainer:
                 "For precise data resume, use map-style dataset or add start_index to IterableDataset."
             )
         else:
-            skip_epochs = 0
+            epoch = start_epoch
             skip_batches = 0
-
-        epoch = start_epoch
         while True:
             # 终止条件
             if self.max_epochs is not None and epoch >= self.max_epochs:
@@ -1860,11 +1860,8 @@ class LoLAV07Trainer:
                 if self.max_steps is not None and self.global_step >= self.total_steps:
                     break
 
-                # Map-style 数据集：跳过已训练的 batch
-                if skip_epochs > 0 or skip_batches > 0:
-                    if skip_epochs > 0:
-                        skip_epochs -= 1
-                        break  # 跳过整个 epoch
+                # Map-style 数据集：跳过 resume 前当前 epoch 已训的 batch
+                if skip_batches > 0:
                     skip_batches -= 1
                     continue
 
