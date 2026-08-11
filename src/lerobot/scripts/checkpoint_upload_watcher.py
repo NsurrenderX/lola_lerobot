@@ -39,7 +39,7 @@ DONE_MARKER = ".uploaded"
 # 上传 tag 目录时排除标记文件 (避免把本地状态泄漏到 blob)
 EXCLUDE_MARKERS = f"--exclude-pattern={READY_MARKER};{DONE_MARKER}"
 # run 级需要同步的小文件 (latest 指针随保存变化, 必须强覆盖)
-RUN_LEVEL_FILES = ("latest", "training_config.json", "zero_to_fp32.py")
+RUN_LEVEL_FILES = ("latest", "training_config.json", "zero_to_fp32.py", "resume_history.jsonl")
 
 
 def log(msg):

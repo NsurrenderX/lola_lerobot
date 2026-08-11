@@ -92,7 +92,7 @@ from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
 # resume 搜索 (同目录模块; run 集合目录 → 按训练配置匹配并选步数最多者)
-from resume_search import build_current_snapshot, make_serializable, resolve_resume_auto
+from resume_search import build_current_snapshot, diff_snapshot, make_serializable, resolve_resume_auto
 
 # 设置日志
 logging.basicConfig(
@@ -861,6 +861,9 @@ class LoLAV07Trainer:
         self.save_every_n_epochs = save_every_n_epochs
         self.log_every_n_steps = log_every_n_steps
         self.current_epoch = 0
+        # 原地续训 (方案 B): main() 判定 resume 配置匹配后赋值为被续训的 run 目录,
+        # train() 将后续 checkpoint 直接写回该目录; None = 新建时间戳目录
+        self.resume_save_dir = None
         self.deepspeed_config_path = deepspeed_config_path
         self.deepspeed_reduce_bucket_size = deepspeed_reduce_bucket_size
         self.deepspeed_allgather_bucket_size = deepspeed_allgather_bucket_size
@@ -1785,33 +1788,53 @@ class LoLAV07Trainer:
         self.model.train()
 
         # 创建 checkpoint 目录
-        # Rank 0 generates timestamp and broadcasts to all ranks to ensure consistency
-        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if self.world_size > 1:
-            time_str_list = [time_str]
-            dist.broadcast_object_list(time_str_list, src=0)
-            time_str = time_str_list[0]
-        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-v07-azure-{time_str}")
-        if self.is_main_process:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            _log(f"Checkpoint directory: {ckpt_dir}")
+        # 原地续训 (2026-08-09 方案 B): main() 已判定 resume 配置匹配并把被续训的 run
+        # 目录赋给 self.resume_save_dir → 后续 checkpoint 直接写回该目录 (一个 config
+        # 一条血统线一个目录, latest 指针即血统末端)。原 training_config.json 保留
+        # 不覆盖 — 配置已校验一致, 且原始 vlm_path 等字段不被本次运行的本地化现场值
+        # 覆盖; 续训事件追加到 resume_history.jsonl (由 watcher 同步到 blob)。
+        import json
 
-            # Save all training configurations as JSON
-            # (make_serializable 与 resume_search 共享, 保证写出的 training_config.json
-            #  与 resume 搜索重建的快照序列化方式一致, 可按值比较)
-            import json
+        if self.resume_save_dir is not None:
+            ckpt_dir = self.resume_save_dir
+            if self.is_main_process:
+                _log(f"Checkpoint directory (原地续训): {ckpt_dir}")
+                try:
+                    with open(os.path.join(ckpt_dir, "resume_history.jsonl"), "a") as f:
+                        f.write(json.dumps({
+                            "time": datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
+                            "resumed_from": getattr(self, "_resume_loaded_from", None),
+                            "from_step": start_step,
+                            "from_epoch": start_epoch,
+                        }) + "\n")
+                except OSError as e:
+                    _log(f"WARNING: resume_history.jsonl 写入失败 ({e}), 不影响训练")
+        else:
+            # Rank 0 generates timestamp and broadcasts to all ranks to ensure consistency
+            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if self.world_size > 1:
+                time_str_list = [time_str]
+                dist.broadcast_object_list(time_str_list, src=0)
+                time_str = time_str_list[0]
+            ckpt_dir = os.path.join(self.ckpt_dir, f"lola-v07-azure-{time_str}")
+            if self.is_main_process:
+                os.makedirs(ckpt_dir, exist_ok=True)
+                _log(f"Checkpoint directory: {ckpt_dir}")
 
-            full_config = make_serializable({
-                "lola_config": self.config,
-                "distributed": self.dist_info,
-                "training_args": self.training_args,
-                "dataset_metadata": self.dataset_metadata,
-            })
+                # Save all training configurations as JSON
+                # (make_serializable 与 resume_search 共享, 保证写出的 training_config.json
+                #  与 resume 搜索重建的快照序列化方式一致, 可按值比较)
+                full_config = make_serializable({
+                    "lola_config": self.config,
+                    "distributed": self.dist_info,
+                    "training_args": self.training_args,
+                    "dataset_metadata": self.dataset_metadata,
+                })
 
-            config_path = os.path.join(ckpt_dir, "training_config.json")
-            with open(config_path, "w") as f:
-                json.dump(full_config, f, indent=2, default=str)
-            _log(f"Training config saved to {config_path}")
+                config_path = os.path.join(ckpt_dir, "training_config.json")
+                with open(config_path, "w") as f:
+                    json.dump(full_config, f, indent=2, default=str)
+                _log(f"Training config saved to {config_path}")
 
         _log(f"Starting training from step {start_step}, epoch {start_epoch}")
 
@@ -2183,6 +2206,8 @@ class LoLAV07Trainer:
 
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
+        # 记录实际加载来源 (原地续训时写入 resume_history.jsonl)
+        self._resume_loaded_from = ckpt_path
         vlm_unfrozen = False
         if self.strategy == "deepspeed":
             # --resume 支持两种形式: 含 latest 文件的 run 目录, 或具体的 tag 目录 (step_XXXXXX)
@@ -2558,6 +2583,49 @@ def build_arg_parser():
     return parser
 
 
+def _resolve_inplace_save_dir(resume_path, current_snapshot, log):
+    """原地续训判定 (2026-08-09 方案 B): resume 目标配置与当前一致时返回应写回的 run 目录。
+
+    resume 后后续 checkpoint 直接写回被续训的 run 目录, 而不是另开时间戳目录 —
+    一个 config 一条血统线一个目录, latest 指针即血统末端 (resume_search /
+    upload watcher / 本地化下载 / eval 全都只认 run 目录 + latest, 下游零改动)。
+
+    Returns:
+        run 目录路径 (原地续训); 以下情况返回 None (调用方退回新建时间戳目录,
+        fork 语义, 原目录不受污染): 无 resume / 目标无 training_config.json
+        (无法校验) / 配置与当前不匹配 (配置漂移)。
+    """
+    import json
+
+    if not resume_path:
+        return None
+    base = os.path.basename(resume_path.rstrip("/"))
+    if base == "final" or (base.startswith("step_") and base[5:].isdigit()):
+        run_dir = os.path.dirname(resume_path.rstrip("/"))  # tag 目录 → 父 run 目录
+    else:
+        run_dir = resume_path
+    cfg_path = os.path.join(run_dir, "training_config.json")
+    if not os.path.isfile(cfg_path):
+        log(f"[inplace-resume] {run_dir} 无 training_config.json, 无法校验配置 — "
+            f"后续 checkpoint 写入新 run 目录 (fork)")
+        return None
+    try:
+        with open(cfg_path) as f:
+            cand_json = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"[inplace-resume] {cfg_path} 不可读 ({e}) — 后续 checkpoint 写入新 run 目录 (fork)")
+        return None
+    diffs = diff_snapshot(current_snapshot, cand_json)
+    if diffs:
+        log(f"[inplace-resume] ⚠️ 当前配置与 {run_dir} 的训练配置不匹配 (差异 {len(diffs)} 处) — "
+            f"后续 checkpoint 写入新 run 目录 (fork), 原目录不受污染:")
+        for d in diffs[:5]:
+            log(f"[inplace-resume]     {d}")
+        return None
+    log(f"[inplace-resume] 配置匹配, 后续 checkpoint 原地写回: {run_dir}")
+    return run_dir
+
+
 def main():
     # 初始化分布式
     dist_info = setup_distributed()
@@ -2653,6 +2721,7 @@ def main():
     # training_config.json, 与当前训练配置做语义匹配, 在匹配的 run 中选 latest
     # 步数最多者 (匹配规则详见 resume_search.py 模块 docstring)
     dataset_meta_snapshot = build_dataset_metadata_snapshot(dataset_metadata, features)
+    inplace_save_dir = None
     if args.resume and args.strategy == "deepspeed":
         _resume_snapshot = build_current_snapshot(
             args, config, dataset_meta_snapshot, dist_info["world_size"]
@@ -2660,6 +2729,10 @@ def main():
         args.resume = resolve_resume_auto(args.resume, _resume_snapshot, log=_log)
         if args.resume is None:
             _log("Resume disabled: 搜索模式未找到匹配的 checkpoint, 从头开始训练")
+        else:
+            # 原地续训判定: 配置匹配 → 后续 checkpoint 写回被续训的 run 目录;
+            # 配置漂移/无法校验 → 响亮告警并退回新建时间戳目录 (fork)
+            inplace_save_dir = _resolve_inplace_save_dir(args.resume, _resume_snapshot, log=_log)
 
     # 创建数据集
     _log("Creating dataset...")
@@ -2762,6 +2835,8 @@ def main():
 
     # Wandb 已在 main() 开头提前初始化，同步 trainer 的 use_wandb 标记
     trainer.use_wandb = use_wandb
+    # 原地续训写回目录 (None = 新建时间戳目录)
+    trainer.resume_save_dir = inplace_save_dir
 
     # 设置模型
     trainer.setup_model()
