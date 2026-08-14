@@ -282,7 +282,11 @@ class LolaImageProcessor(ObservationProcessorStep):
                             if img.dim() == 3:
                                 images_per_item[i].append(self._tensor_to_pil(img))
                             elif img.dim() == 4:
-                                images_per_item[i].append(self._tensor_to_pil(img[-1]))
+                                # (T, C, H, W) 多帧观测 (如 obs_prev_chunk_frame 的
+                                # [上一 chunk 起始帧, 当前帧]): 按时间顺序全部送入 VLM,
+                                # 不再只取最后一帧 (2026-08-12)
+                                for t in range(img.shape[0]):
+                                    images_per_item[i].append(self._tensor_to_pil(img[t]))
 
             new_observation['_lola_images_per_item'] = images_per_item
         else:
@@ -305,7 +309,9 @@ class LolaImageProcessor(ObservationProcessorStep):
                     if img_data.dim() == 3:
                         images.append(self._tensor_to_pil(img_data))
                     elif img_data.dim() == 4:
-                        images.append(self._tensor_to_pil(img_data[-1]))
+                        # (T, C, H, W) 多帧观测: 按时间顺序全部送入 VLM (2026-08-12)
+                        for t in range(img_data.shape[0]):
+                            images.append(self._tensor_to_pil(img_data[t]))
                 elif isinstance(img_data, dict) and 'image' in img_data:
                     images.append(img_data['image'])
 

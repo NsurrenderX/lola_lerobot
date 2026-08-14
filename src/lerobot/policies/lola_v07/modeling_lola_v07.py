@@ -12,7 +12,7 @@ Core changes from v06:
 import math
 import logging
 from collections import deque
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -378,7 +378,7 @@ class LoLAV07Pytorch(nn.Module):
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
                 hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None,
-                n_transition_chunks=0, n_transition_chunks_batch=None):
+                n_transition_chunks=0, n_transition_chunks_batch=None, return_per_sample=False):
         """Training forward with Latent Flow Matching.
 
         v-loss is computed in Bottleneck latent space (256D/128D), not 1024D.
@@ -386,6 +386,8 @@ class LoLAV07Pytorch(nn.Module):
         Args:
             n_transition_chunks: number of transition chunks in history (for previous_task_end placement)
             n_transition_chunks_batch: per-sample [B] tensor for attention mask construction
+            return_per_sample: 额外返回未聚合的逐样本 loss 张量 ([B], keys 以 "_per_sample" 结尾),
+                供 t-网格探针在 CRN 固定噪声下记录逐样本逐 t 曲线
         """
         b = target_actions.shape[0]
         device = target_actions.device
@@ -668,13 +670,40 @@ class LoLAV07Pytorch(nn.Module):
         total_loss = v_loss + action_loss_weight * arm_loss_mean + gripper_loss_weight * gripper_loss
         total_loss = total_loss.to(target_dtype)
 
-        return {
+        result = {
             "total_loss": total_loss,
             "v_loss": v_loss.float(),
             "arm_loss": arm_loss_mean.float(),
             "gripper_loss": gripper_loss.float(),
             "arm_loss_per_dim": arm_loss_per_dim.float(),
         }
+
+        # 13. Per-sample losses (t-网格探针用: CRN 固定噪声下逐样本逐 t 记录)
+        # 与 step 9/11/12 相同的公式, 仅去掉 batch 维度的聚合
+        if return_per_sample:
+            v_loss_ps = (v_loss_arm.mean(dim=(1, 2)) + v_loss_grip.mean(dim=(1, 2))) / 2.0
+            arm_huber_ps = arm_loss.mean(dim=(1, 2))
+            arm_mse_ps = F.mse_loss(pred_arm_matched, target_arm, reduction="none").mean(dim=(1, 2))
+            total_ps = v_loss_ps + action_loss_weight * arm_huber_ps
+            result["v_loss_per_sample"] = v_loss_ps.float()
+            result["arm_huber_per_sample"] = arm_huber_ps.float()
+            result["arm_mse_per_sample"] = arm_mse_ps.float()
+            if pred_gripper_logits_matched.shape[-1] > 0:
+                grip_bce_ps = F.binary_cross_entropy_with_logits(
+                    pred_gripper_logits_matched, target_gripper_01, reduction="none",
+                ).mean(dim=(1, 2))
+                grip_acc_ps = (
+                    (pred_gripper_logits_matched > 0) == (target_gripper_01 > 0.5)
+                ).float().mean(dim=(1, 2))
+                total_ps = total_ps + gripper_loss_weight * grip_bce_ps
+            else:
+                grip_bce_ps = torch.zeros(b, device=device)
+                grip_acc_ps = torch.zeros(b, device=device)
+            result["gripper_bce_per_sample"] = grip_bce_ps.float()
+            result["gripper_acc_per_sample"] = grip_acc_ps.float()
+            result["total_loss_per_sample"] = total_ps.float()
+
+        return result
 
     @torch.no_grad()
     def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None,
@@ -965,6 +994,8 @@ class LoLAV07Policy(PreTrainedPolicy):
 
         # Action queue
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
+        # obs_prev_chunk_frame 推理缓存 (见 inject_prev_chunk_frame)
+        self._prev_chunk_frames = None
 
         # VLM forward mode
         if config.gradient_checkpointing and config.train_vlm:
@@ -1030,6 +1061,34 @@ class LoLAV07Policy(PreTrainedPolicy):
 
     def reset(self):
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
+        # obs_prev_chunk_frame 推理缓存: {cam_key: 上一 chunk 起始帧 (C,H,W)}
+        self._prev_chunk_frames = None
+
+    def inject_prev_chunk_frame(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+        """obs_prev_chunk_frame 推理适配 (2026-08-12)。
+
+        在图像 processor (LolaImageProcessor) 之前对原始观测调用:
+        chunk 边界 (action queue 为空, 本步将预测新 chunk) 时, 把每个相机的当前帧
+        与缓存的上一 chunk 起始帧堆叠为 (2, C, H, W), 与训练侧
+        observation_delta_indices=[-action_chunk_size, 0] 严格对齐; episode 首
+        chunk 用当前帧自复制, 对应训练侧 episode 边界 clamp。
+        非边界步原样返回 (该步动作从 queue 弹出, batch 不被消费)。
+        仅处理 (C,H,W) tensor 形式的相机值 (CALVIN eval 路径)。
+        """
+        if not self.config.obs_prev_chunk_frame or len(self._action_queue) > 0:
+            return observation
+        obs = dict(observation)
+        new_cache = {}
+        for key, val in observation.items():
+            if not (key.startswith("observation.images.")
+                    and isinstance(val, torch.Tensor) and val.ndim == 3):
+                continue
+            prev = self._prev_chunk_frames.get(key) if self._prev_chunk_frames else None
+            obs[key] = torch.stack([prev if prev is not None else val, val], dim=0)
+            new_cache[key] = val
+        if new_cache:
+            self._prev_chunk_frames = new_cache
+        return obs
 
     # ---- Data preparation (same as LoLAPolicy) ----
 
@@ -1183,8 +1242,33 @@ class LoLAV07Policy(PreTrainedPolicy):
 
     # ---- Training & Inference ----
 
-    def forward(self, batch: Dict[str, torch.Tensor], compute_per_dim: bool = False, time=None):
-        """Training forward. NOTE: hist_actions/target_actions dtype is managed by LoLAV07Pytorch.forward()."""
+    def _drop_visual_tokens(self, hidden_states_all_layers, input_ids, batch):
+        """按 visual token 位置随机置零各层 hidden 特征 (见 forward 中调用点注释)。"""
+        rate = self.config.visual_token_drop_rate
+        image_token_id = getattr(self.vlm.config, "image_token_id", None)
+        if image_token_id is not None:
+            vis_mask = input_ids == image_token_id
+        else:
+            # 退路: Cosmos3/Qwen3-VL processor 的 mm_token_type_ids (1=image)
+            mm_types = batch.get("mm_token_type_ids", None)
+            if mm_types is None:
+                if not getattr(self, "_visual_drop_warned", False):
+                    self._visual_drop_warned = True
+                    print("[visual_token_drop] ⚠️ 无法定位 visual token "
+                          "(无 image_token_id / mm_token_type_ids), 跳过 drop")
+                return hidden_states_all_layers
+            vis_mask = mm_types == 1
+        keep = (torch.rand(vis_mask.shape, device=vis_mask.device) >= rate) | ~vis_mask
+        keep = keep.to(next(iter(hidden_states_all_layers.values())).dtype).unsqueeze(-1)
+        return {k: v * keep for k, v in hidden_states_all_layers.items()}
+
+    def forward(self, batch: Dict[str, torch.Tensor], compute_per_dim: bool = False, time=None,
+                noise=None, return_per_sample: bool = False):
+        """Training forward. NOTE: hist_actions/target_actions dtype is managed by LoLAV07Pytorch.forward().
+
+        noise: 可选 (noise_arm_latent, noise_grip_latent) 元组, 外部注入固定噪声 (CRN 探针用)。
+        return_per_sample: loss_dict 额外携带逐样本 loss 张量 (keys 以 "_per_sample" 结尾)。
+        """
         hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
         target_actions = self.prepare_target_actions(batch)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
@@ -1222,6 +1306,14 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask = hist_actions_mask.to(self.dtype)
         hidden_states_all_layers = {k: v.to(self.dtype) for k, v in hidden_states_all_layers.items()}
 
+        # Visual token drop (2026-08-12): bridge 输入侧以概率 p 将 visual token 的
+        # 特征置零 (置零而非 attention 删除 — 序列长度/位置结构不变, DiT 无联动)。
+        # training-only; eval 由 self.training 门控自动关闭。
+        if self.training and self.config.visual_token_drop_rate > 0:
+            hidden_states_all_layers = self._drop_visual_tokens(
+                hidden_states_all_layers, input_ids, batch
+            )
+
         losses = self.model(
             hidden_states_all_layers=hidden_states_all_layers,
             input_ids=input_ids,
@@ -1230,9 +1322,11 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask=hist_actions_mask,
             vlm_attention_mask=vlm_attention_mask,
             time=time,
+            noise=noise,
             state_emb=state_emb,
             n_transition_chunks=max_n_tc,
             n_transition_chunks_batch=n_transition_chunks_batch,
+            return_per_sample=return_per_sample,
         )
 
         loss = losses["total_loss"]
@@ -1244,6 +1338,10 @@ class LoLAV07Policy(PreTrainedPolicy):
         }
         if compute_per_dim:
             loss_dict["arm_loss_per_dim"] = losses["arm_loss_per_dim"].detach()
+        if return_per_sample:
+            for key, value in losses.items():
+                if key.endswith("_per_sample"):
+                    loss_dict[key] = value.detach()
         return loss, loss_dict
 
     @torch.no_grad()

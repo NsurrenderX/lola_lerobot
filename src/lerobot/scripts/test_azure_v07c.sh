@@ -125,6 +125,22 @@ MAX_TRANSITION_LEN=64
 VLM_UNFREEZE_V_LOSS_THRESHOLD=0.3
 VLM_LR_MULT=1.5
 
+# 2026-08-12: EMA / 图像增强 / visual token drop / chunk 帧观测
+# EMA: 全模型 (含解冻后 VLM), ZeRO-3 分片本地维护; 0=关闭, 建议 0.999
+EMA_DECAY=0.0
+# 图像增强 (train-only): B/C/S jitter (不碰 hue) + mild affine (reflection 填充);
+# 样本内所有相机/帧共享一组随机参数, 样本间独立; 全默认=关闭
+IMAGE_AUG_BRIGHTNESS=0.0
+IMAGE_AUG_CONTRAST=0.0
+IMAGE_AUG_SATURATION=0.0
+IMAGE_AUG_TRANSLATE=0.0
+IMAGE_AUG_SCALE_MIN=1.0
+IMAGE_AUG_SCALE_MAX=1.0
+# visual token 特征置零概率 (bridge 输入侧, training-only); 0=关闭
+VISUAL_TOKEN_DROP_RATE=0.0
+# chunk 帧观测: [上一 action chunk 起始帧, 当前帧]; 视觉 token 翻倍, 消融开关
+OBS_PREV_CHUNK_FRAME=false
+
 # Special tokens
 USE_SPECIAL_TOKENS=false
 
@@ -393,6 +409,44 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
+        # 2026-08-12: EMA / 图像增强 / visual token drop / chunk 帧观测
+        --ema_decay)
+            EMA_DECAY="$2"
+            shift 2
+            ;;
+        --image_aug_brightness)
+            IMAGE_AUG_BRIGHTNESS="$2"
+            shift 2
+            ;;
+        --image_aug_contrast)
+            IMAGE_AUG_CONTRAST="$2"
+            shift 2
+            ;;
+        --image_aug_saturation)
+            IMAGE_AUG_SATURATION="$2"
+            shift 2
+            ;;
+        --image_aug_translate)
+            IMAGE_AUG_TRANSLATE="$2"
+            shift 2
+            ;;
+        --image_aug_scale_min)
+            IMAGE_AUG_SCALE_MIN="$2"
+            shift 2
+            ;;
+        --image_aug_scale_max)
+            IMAGE_AUG_SCALE_MAX="$2"
+            shift 2
+            ;;
+        --visual_token_drop_rate)
+            VISUAL_TOKEN_DROP_RATE="$2"
+            shift 2
+            ;;
+        --obs_prev_chunk_frame)
+            OBS_PREV_CHUNK_FRAME=true
+            shift
+            ;;
+
         # V07: Bottleneck dimensions
         --action_bottleneck_dim)
             ACTION_BOTTLENECK_DIM="$2"
@@ -603,6 +657,14 @@ LAUNCH_ARGS+=(
     --action_loss_weight "${ACTION_LOSS_WEIGHT}"
     --gripper_loss_weight "${GRIPPER_LOSS_WEIGHT}"
     --hist_action_token_drop_rate "${HIST_ACTION_TOKEN_DROP_RATE}"
+    --ema_decay "${EMA_DECAY}"
+    --image_aug_brightness "${IMAGE_AUG_BRIGHTNESS}"
+    --image_aug_contrast "${IMAGE_AUG_CONTRAST}"
+    --image_aug_saturation "${IMAGE_AUG_SATURATION}"
+    --image_aug_translate "${IMAGE_AUG_TRANSLATE}"
+    --image_aug_scale_min "${IMAGE_AUG_SCALE_MIN}"
+    --image_aug_scale_max "${IMAGE_AUG_SCALE_MAX}"
+    --visual_token_drop_rate "${VISUAL_TOKEN_DROP_RATE}"
     --action_bottleneck_dim "${ACTION_BOTTLENECK_DIM}"
     --grip_bottleneck_dim "${GRIP_BOTTLENECK_DIM}"
     --state_bottleneck_dim "${STATE_BOTTLENECK_DIM}"
@@ -650,6 +712,9 @@ if [ -n "$VLM_MAX_LENGTH" ]; then
 fi
 if [ "$USE_SPECIAL_TOKENS" = true ]; then
     LAUNCH_ARGS+=(--use_special_tokens)
+fi
+if [ "$OBS_PREV_CHUNK_FRAME" = true ]; then
+    LAUNCH_ARGS+=(--obs_prev_chunk_frame)
 fi
 
 # ----------------------------------------------------------------------
@@ -739,7 +804,7 @@ if [ "$LOCALIZE_IO" = true ]; then
         START_RANK=$((NODE_RANK * NPROC_PER_NODE))
         END_RANK=$((START_RANK + NPROC_PER_NODE - 1))
         for ((i=START_RANK; i<=END_RANK; i++)); do
-            SHARD_PATTERNS="${SHARD_PATTERNS}${SHARD_PATTERNS:+;}*zero_pp_rank_${i}_mp_rank_00_*"
+            SHARD_PATTERNS="${SHARD_PATTERNS}${SHARD_PATTERNS:+;}*zero_pp_rank_${i}_mp_rank_00_*;ema_rank_${i}.pt"
         done
         if [[ "$RESUME_BASE" == step_* || "$RESUME_BASE" == final ]]; then
             # 直接指向 tag 目录
@@ -895,6 +960,14 @@ if [ "$NNODES" -eq 1 ]; then
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
+        --ema_decay ${EMA_DECAY} \
+        --image_aug_brightness ${IMAGE_AUG_BRIGHTNESS} \
+        --image_aug_contrast ${IMAGE_AUG_CONTRAST} \
+        --image_aug_saturation ${IMAGE_AUG_SATURATION} \
+        --image_aug_translate ${IMAGE_AUG_TRANSLATE} \
+        --image_aug_scale_min ${IMAGE_AUG_SCALE_MIN} \
+        --image_aug_scale_max ${IMAGE_AUG_SCALE_MAX} \
+        --visual_token_drop_rate ${VISUAL_TOKEN_DROP_RATE} \
         --action_bottleneck_dim ${ACTION_BOTTLENECK_DIM} \
         --grip_bottleneck_dim ${GRIP_BOTTLENECK_DIM} \
         --state_bottleneck_dim ${STATE_BOTTLENECK_DIM} \
@@ -947,6 +1020,14 @@ else
         --action_loss_weight ${ACTION_LOSS_WEIGHT} \
         --gripper_loss_weight ${GRIPPER_LOSS_WEIGHT} \
         --hist_action_token_drop_rate ${HIST_ACTION_TOKEN_DROP_RATE} \
+        --ema_decay ${EMA_DECAY} \
+        --image_aug_brightness ${IMAGE_AUG_BRIGHTNESS} \
+        --image_aug_contrast ${IMAGE_AUG_CONTRAST} \
+        --image_aug_saturation ${IMAGE_AUG_SATURATION} \
+        --image_aug_translate ${IMAGE_AUG_TRANSLATE} \
+        --image_aug_scale_min ${IMAGE_AUG_SCALE_MIN} \
+        --image_aug_scale_max ${IMAGE_AUG_SCALE_MAX} \
+        --visual_token_drop_rate ${VISUAL_TOKEN_DROP_RATE} \
         --action_bottleneck_dim ${ACTION_BOTTLENECK_DIM} \
         --grip_bottleneck_dim ${GRIP_BOTTLENECK_DIM} \
         --state_bottleneck_dim ${STATE_BOTTLENECK_DIM} \
@@ -1062,6 +1143,11 @@ fi
 # Special tokens
 if [ "$USE_SPECIAL_TOKENS" = true ]; then
     cmd="${cmd} --use_special_tokens"
+fi
+
+# 观测扩展: [上一 chunk 起始帧, 当前帧]
+if [ "$OBS_PREV_CHUNK_FRAME" = true ]; then
+    cmd="${cmd} --obs_prev_chunk_frame"
 fi
 
 echo "Running: $cmd"

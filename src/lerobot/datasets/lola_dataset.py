@@ -39,6 +39,64 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.video_utils import decode_video_frames, scan_video_seek_modes
 
 
+class LolaImageAugment:
+    """LoLA 图像增强 (2026-08-12): brightness/contrast/saturation 小幅 jitter
+    (不碰 hue, 保住颜色-指令绑定) + mild affine (平移/缩放, reflection 填充保内容)。
+
+    输入: (C,H,W) 或 (T,C,H,W) 的 [0,1] float tensor。一次 __call__ 内只采样一组
+    随机参数, 4D 输入的所有帧共享 — 配合 LoLADataset.__getitem__ 的 per-sample
+    固定 seed, 实现 "样本内所有相机/所有帧共享参数, 样本间独立"。
+
+    模块级纯数据类, 可 pickle (DataLoader worker / 解码子进程传递安全)。
+    """
+
+    def __init__(self, brightness: float = 0.0, contrast: float = 0.0,
+                 saturation: float = 0.0, translate: float = 0.0,
+                 scale_min: float = 1.0, scale_max: float = 1.0):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.translate = translate
+        self.scale_min = scale_min
+        self.scale_max = scale_max
+
+    @staticmethod
+    def _jitter(amount: float) -> float:
+        return 1.0 + (float(torch.rand(())) * 2.0 - 1.0) * amount
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        from torchvision.transforms.v2 import functional as TVF
+        if self.brightness > 0:
+            img = TVF.adjust_brightness(img, self._jitter(self.brightness))
+        if self.contrast > 0:
+            img = TVF.adjust_contrast(img, self._jitter(self.contrast))
+        if self.saturation > 0:
+            img = TVF.adjust_saturation(img, self._jitter(self.saturation))
+        if self.translate > 0 or self.scale_min < 1.0 or self.scale_max > 1.0:
+            img = self._affine(img)
+        return img.clamp(0.0, 1.0)
+
+    def _affine(self, img: torch.Tensor) -> torch.Tensor:
+        """共享参数的 batched 仿射: 缩放 (reflection 补边) + 平移, 双线性采样。"""
+        single = img.ndim == 3
+        x = img.unsqueeze(0) if single else img
+        B, C, H, W = x.shape
+        s = (float(torch.rand(())) * (self.scale_max - self.scale_min) + self.scale_min) \
+            if self.scale_max > self.scale_min else self.scale_min
+        inv = 1.0 / max(s, 1e-6)
+        dx = (float(torch.rand(())) * 2.0 - 1.0) * self.translate if self.translate > 0 else 0.0
+        dy = (float(torch.rand(())) * 2.0 - 1.0) * self.translate if self.translate > 0 else 0.0
+        # 归一化坐标: 输出 o 采样输入 inv*(o - 2d), 平移 d (图幅比例) 且缩放 s
+        theta = torch.tensor(
+            [[inv, 0.0, -2.0 * dx * inv], [0.0, inv, -2.0 * dy * inv]],
+            dtype=x.dtype,
+        ).unsqueeze(0).expand(B, 2, 3)
+        grid = F.affine_grid(theta, list(x.shape), align_corners=False)
+        out = F.grid_sample(x, grid, mode="bilinear", padding_mode="reflection",
+                            align_corners=False)
+        return out.squeeze(0) if single else out
+
+
 class LoLADataset(LeRobotDataset):
     """
     支持加载完整历史action的LoLA专用数据集。
@@ -110,11 +168,15 @@ class LoLADataset(LeRobotDataset):
             video_backend: 视频后端
             stats_mode: stats模式，"original"使用原始stats，"incremental"使用包含transition数据的增量stats
         """
+        # 图像变换不在父类逐相机应用 (每个相机会独立采样随机参数) — 改由本类在
+        # __getitem__ 中以 per-sample 固定 seed 应用, 保证样本内所有相机/所有帧
+        # 共享同一组增强参数 (2026-08-12 需求), 样本间参数独立。
+        self._lola_image_transforms = image_transforms
         super().__init__(
             repo_id=repo_id,
             root=root,
             episodes=episodes,
-            image_transforms=image_transforms,
+            image_transforms=None,
             delta_timestamps=delta_timestamps,
             tolerance_s=tolerance_s,
             tolerance_frames=tolerance_frame,
@@ -284,6 +346,17 @@ class LoLADataset(LeRobotDataset):
         """
         # 调用父类方法获取基础数据
         item = super().__getitem__(idx)
+
+        # 样本级共享参数的图像增强: 同一 __getitem__ 内所有相机/所有帧用同一
+        # seed 采样增强参数 (上下文语义一致); 不同样本 seed 不同。仅训练集传入
+        # transforms, eval/val 数据集传 None 即自动关闭。
+        if self._lola_image_transforms is not None:
+            seed = random.randrange(2**31)
+            for key in list(item.keys()):
+                if key.startswith("observation.images.") and isinstance(item[key], torch.Tensor):
+                    with torch.random.fork_rng(devices=[]):
+                        torch.manual_seed(seed)
+                        item[key] = self._lola_image_transforms(item[key])
 
         # 获取episode信息
         ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]

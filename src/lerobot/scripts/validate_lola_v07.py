@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 """
-LoLA 模型验证脚本 - 在验证集上评估模型质量
+LoLA V07 模型验证脚本 - 在验证集上评估模型质量
+
+与 validate_lola.py (v06) 的区别:
+    - 使用 LoLAV07Config / LoLAV07Policy (bottleneck 空间 latent flow matching)
+    - 数据集/_collate 复用 train_lola_v07_azure (hist_states, completed_tasks,
+      n_transition_chunks, stats_mode)
+    - 支持 --training_config: 从训练保存的 training_config.json 自动匹配配置
+      (参照 eval_calvin.py; CLI 参数优先级高于 training_config)
 
 支持两种验证模式:
     forward_loss: 计算 v-loss 和 action_loss（与训练相同的前向传播）
@@ -8,23 +15,25 @@ LoLA 模型验证脚本 - 在验证集上评估模型质量
     both:         同时运行两种模式
 
 使用方法:
-    # 验证 Lightning checkpoint（两种模式）
-    python src/lerobot/scripts/validate_lola.py \
-        --checkpoint_path /path/to/lola.ckpt \
+    # 推荐: 用 training_config.json 自动匹配训练配置
+    python src/lerobot/scripts/validate_lola_v07.py \
+        --training_config /path/to/run_dir/training_config.json \
+        --checkpoint_path /path/to/run_dir/step_000100 \
         --val_dataset_repo_id <val_dataset> \
         --mode both
 
-    # 仅前向 loss 验证
-    python src/lerobot/scripts/validate_lola.py \
-        --checkpoint_path /path/to/lola.ckpt \
-        --val_dataset_repo_id <val_dataset> \
-        --mode forward_loss
-
     # 多 GPU
-    torchrun --nproc_per_node=4 src/lerobot/scripts/validate_lola.py \
-        --checkpoint_path /path/to/lola.ckpt \
-        --val_dataset_repo_id <val_dataset> \
-        --strategy fsdp
+    torchrun --nproc_per_node=4 src/lerobot/scripts/validate_lola_v07.py \
+        --training_config /path/to/run_dir/training_config.json \
+        --checkpoint_path /path/to/run_dir \
+        --val_dataset_repo_id <val_dataset>
+
+    # CLI 覆盖 training_config 中的值 (CLI 优先)
+    python src/lerobot/scripts/validate_lola_v07.py \
+        --training_config /path/to/training_config.json \
+        --checkpoint_path /path/to/ckpt \
+        --history_type state --use_special_tokens \
+        --val_dataset_repo_id <val_dataset>
 """
 
 import argparse
@@ -36,43 +45,47 @@ import time
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, _REPO_ROOT)
+# train_lola_v07_azure 内部 `from resume_search import ...` (同目录模块), 需要 scripts 目录在 sys.path
+sys.path.insert(0, os.path.join(_REPO_ROOT, "src", "lerobot", "scripts"))
 
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
-from lerobot.policies.lola import LoLAConfig, LoLAPolicy
+from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
-# 从训练脚本复用
-from lerobot.scripts.train_lola_azure import (
+# 从 V07 训练脚本复用 (hist_states / completed_tasks / n_transition_chunks / stats_mode 支持)
+from lerobot.scripts.train_lola_v07_azure import (
     create_lola_dataset,
     make_collate_fn,
+    compute_vlm_max_length,
 )
 
 
-def unnormalize_lola_actions(actions, dataset_stats, action_dim, norm_mode):
+def unnormalize_lola_actions(actions, dataset_stats, action_dim, norm_mode, action_key="action"):
     """将动作从模型输出空间反归一化回原始空间。
 
     default (MEAN_STD) 模式: actions * std + mean
     robovlm 模式: 数据集已用 normalize_action 归一化到 [-1,1]（夹爪保持原值），
-                  需用 unnoramalize_action 反归一化，但夹爪仍保持原值。
+                  无需反归一化。
     zscore 模式: 与 MEAN_STD 相同公式 actions * std + mean，
                  用于横向对比时将预测和标签都还原到原始空间。
+
+    action_key: stats_mode="incremental" 时为 "action_incremental"，否则 "action"。
     """
     if norm_mode == "robovlm":
         # robovlm 模式下夹爪值本身就是原始的 {-1,1}/{0,1}
-        # 不需要反归一化就能做分类，所以这里返回原值
         return actions
     else:
-        # MEAN_STD / zscore 模式: 反归一化 = action * std + mean
-        action_mean = dataset_stats["action"]["mean"][:action_dim]
-        action_std = dataset_stats["action"]["std"][:action_dim]
+        stats_entry = dataset_stats.get(action_key) or dataset_stats["action"]
+        action_mean = stats_entry["mean"][:action_dim]
+        action_std = stats_entry["std"][:action_dim]
         if not isinstance(action_mean, torch.Tensor):
             action_mean = torch.tensor(action_mean, dtype=torch.float32)
         if not isinstance(action_std, torch.Tensor):
@@ -83,9 +96,19 @@ def unnormalize_lola_actions(actions, dataset_stats, action_dim, norm_mode):
 
 
 def extract_special_fields(batch):
-    """提取特殊字段，避免被preprocessor处理（与训练脚本逻辑一致）"""
+    """提取特殊字段，避免被preprocessor处理（与 V07 训练脚本逻辑一致）。
+
+    V07 相比 v06 新增: hist_states_* (history_type="state") 和
+    n_transition / n_transition_chunks (5 个特殊 token 中 previous_task_end 的定位)。
+    completed_tasks / completed_tasks_ann 不在此提取 — 它们必须随 batch 一起
+    经过 preprocessor (任务文本模板在 processor 内组装)。
+    """
     special_data = {}
-    keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length"]
+    keys_to_extract = [
+        "hist_actions_full", "hist_actions_mask", "hist_actions_length",
+        "hist_states_full", "hist_states_mask", "hist_states_length",
+        "n_transition", "n_transition_chunks",
+    ]
     for key in keys_to_extract:
         if key in batch:
             special_data[key] = batch.pop(key)
@@ -96,7 +119,7 @@ def extract_special_fields(batch):
 
 def load_deepspeed_checkpoint(
     checkpoint_dir: str,
-    policy: LoLAPolicy,
+    policy: LoLAV07Policy,
     tag: str | None = None,
     local_rank: int = 0,
     use_ema: bool = False,
@@ -108,13 +131,14 @@ def load_deepspeed_checkpoint(
       - tag 子目录（如 'ckpt_dir/step_000100/'）：从路径推导 tag
 
     由于训练时使用 exclude_frozen_parameters=True，冻结的 VLM 权重不在 checkpoint 中。
-    仅加载 DiT 权重 (policy.model)。VLM 已从本地 Qwen3.5 模型路径初始化。
+    仅加载 DiT 权重 (policy.model)。VLM 已从本地模型路径初始化。
 
     Args:
         checkpoint_dir: DeepSpeed checkpoint 路径（基目录或 tag 子目录）
-        policy: LoLAPolicy 实例（VLM 已初始化）
+        policy: LoLAV07Policy 实例（VLM 已初始化）
         tag: 显式指定 tag。如果 None，从 'latest' 文件或路径自动检测。
         local_rank: GPU rank，用于日志
+        use_ema: 是否用 EMA 分片权重覆盖
 
     Returns:
         dict: 包含 step/epoch 元数据（如果可解析）
@@ -138,7 +162,6 @@ def load_deepspeed_checkpoint(
         # 基目录：DeepSpeed 会从 'latest' 文件读取 tag
         resolved_dir = checkpoint_dir
         if tag is None:
-            # 读取 latest 文件获取 tag
             latest_file = os.path.join(checkpoint_dir, "latest")
             with open(latest_file, "r") as f:
                 resolved_tag = f.read().strip()
@@ -151,7 +174,6 @@ def load_deepspeed_checkpoint(
         resolved_tag = tag_name
         print(f"[Rank {local_rank}] Detected DeepSpeed tag subdirectory: tag={resolved_tag}, base_dir={resolved_dir}")
     else:
-        # 列出目录内容帮助诊断
         contents = os.listdir(checkpoint_dir) if os.path.isdir(checkpoint_dir) else []
         raise ValueError(
             f"Directory does not appear to be a valid DeepSpeed checkpoint: {checkpoint_dir}\n"
@@ -200,6 +222,9 @@ def load_deepspeed_checkpoint(
         policy.model.load_state_dict(current_dit_sd)
         print(f"[Rank {local_rank}] DiT weights from DeepSpeed: {dit_loaded} loaded, "
               f"{dit_missing} missing (VLM keys absent: exclude_frozen_parameters=True)")
+        if dit_missing > 0:
+            print(f"[Rank {local_rank}] WARNING: {dit_missing} DiT params not found in checkpoint — "
+                  f"确认 config 与训练一致 (bottleneck dims / bridge / special tokens / history_type)")
 
     # 加载 VLM 权重（仅在 train_vlm=True 时可能存在）
     if vlm_sd_raw:
@@ -219,7 +244,6 @@ def load_deepspeed_checkpoint(
     # 从 tag 名称解析 step/epoch 元数据
     metadata = {}
     if resolved_tag:
-        # tag 格式通常是 "step_000100" 或 "final" 或 "global_step14"
         step_match = re.search(r"step_?(\d+)", resolved_tag)
         if step_match:
             metadata["step"] = int(step_match.group(1))
@@ -308,6 +332,9 @@ def validate_forward_loss(policy, preprocessor, val_loader, device,
     need_per_dim = compute_per_dim or len(gripper_dim_indices) > 0
 
     # forward loss 需要模型在 train 模式（flow matching 需要随机采样噪声和时间步）
+    # 注意: 只开 policy.model 的 train 模式; policy 自身保持 eval,
+    # 避免 V07 的 visual_token_drop (self.training 门控) 在验证时误触发。
+    policy.eval()
     policy.model.train()
     # 但冻结的 VLM 保持 eval
     if not policy.config.train_vlm and hasattr(policy, 'vlm'):
@@ -394,7 +421,6 @@ def validate_forward_loss(policy, preprocessor, val_loader, device,
     # 每维度 arm_loss（arm_loss_per_dim 只含 arm 维度，不含夹爪）
     if need_per_dim:
         per_dim_arm_loss_avg = per_dim_arm_loss_sum / num_batches
-        # 使用 continuous_dim_indices 作为维度标签（arm 维度在原始 action 空间中的索引）
         for i, dim_idx in enumerate(continuous_dim_indices):
             results[f"val_arm_loss_dim_{dim_idx}"] = per_dim_arm_loss_avg[i].item()
 
@@ -406,11 +432,13 @@ def validate_forward_loss(policy, preprocessor, val_loader, device,
 def validate_inference(policy, preprocessor, val_loader, device, max_samples=100,
                        action_dim=None, gripper_dim_indices=None, gripper_threshold=0.0,
                        compute_per_dim=False, norm_mode="default", dataset_stats=None,
-                       num_act_exec=None):
+                       num_act_exec=None, action_key="action"):
     """运行推理去噪管线，对比预测动作与真实动作。
 
     支持每维度 MSE/L1 指标和夹爪分类指标（accuracy, precision, recall, F1）。
+    action_key: stats_mode="incremental" 时为 "action_incremental"。
     """
+    policy.eval()
     policy.model.eval()
 
     gripper_dim_indices = gripper_dim_indices or []
@@ -445,10 +473,15 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
         # 应用预处理器（内含 DeviceProcessorStep 会将数据移到 config.device）
         batch = preprocessor(batch)
 
-        # 恢复历史 action 字段（推理需要），并移动到设备
-        for key in ["hist_actions_full", "hist_actions_mask", "hist_actions_length"]:
-            if key in special_data:
-                batch[key] = special_data[key].to(device)
+        # 恢复历史/transition 字段（推理需要），并移动到设备
+        # ("action" 不恢复 — 它是 GT, 不是模型输入)
+        for key, value in special_data.items():
+            if key == "action":
+                continue
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(device)
+            else:
+                batch[key] = value
 
         # 推理
         with torch.no_grad():
@@ -475,7 +508,7 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
         #   gripper dims stay in original space.
         if norm_mode in ("default", "zscore") and dataset_stats is not None:
             pred_for_metric = unnormalize_lola_actions(
-                pred_matched, dataset_stats, action_dim, norm_mode)
+                pred_matched, dataset_stats, action_dim, norm_mode, action_key)
             # Overwrite gripper dims with original predictions (already in original space)
             for g_dim in gripper_dim_indices:
                 pred_for_metric[:, :, g_dim] = pred_matched[:, :, g_dim]
@@ -483,7 +516,7 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
             if norm_mode == "zscore":
                 # zscore: GT is also normalized, must unnormalize for original-space comparison
                 gt_for_metric = unnormalize_lola_actions(
-                    gt_matched, dataset_stats, action_dim, norm_mode)
+                    gt_matched, dataset_stats, action_dim, norm_mode, action_key)
                 for g_dim in gripper_dim_indices:
                     gt_for_metric[:, :, g_dim] = gt_matched[:, :, g_dim]
             else:
@@ -509,17 +542,15 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
 
         # 夹爪分类指标
         if num_gripper_dims > 0:
-            # Dual-Token/Dual-Expert: gripper dims are already discretized to {-1, 1}
-            # via sigmoid thresholding in sample_actions, so they are already in original
-            # space regardless of norm_mode. No unnormalization needed for gripper dims.
+            # Gripper dims are already discretized to {-1, 1} via sigmoid thresholding
+            # in sample_actions, so they are already in original space regardless of
+            # norm_mode. No unnormalization needed for gripper dims.
             pred_for_gripper = pred_matched
 
             for g_idx, g_dim in enumerate(gripper_dim_indices):
                 pred_gripper = pred_for_gripper[:, :, g_dim]  # [B, min_len]
                 gt_gripper = gt_matched[:, :, g_dim]          # [B, min_len]
 
-                # pred_binary = (pred_gripper > gripper_threshold).reshape(-1).float()
-                # gt_binary = (gt_gripper > gripper_threshold).reshape(-1).float()
                 pred_binary = (pred_gripper > 0.0).reshape(-1).float()
                 gt_binary = (gt_gripper > 0.0).reshape(-1).float()
 
@@ -641,14 +672,127 @@ def validate_inference(policy, preprocessor, val_loader, device, max_samples=100
     return results
 
 
+# ─── training_config.json 自动匹配 (参照 eval_calvin.py) ─────────────────────
+
+def _load_training_config(config_path, rank=0):
+    """Load training_config.json and return (lola_config, training_args) dicts."""
+    print(f"[Rank {rank}] Loading training config from {config_path}...")
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    lola_cfg = cfg.get("lola_config", {})
+    train_args = cfg.get("training_args", {})
+    print(f"[Rank {rank}] Training config loaded: history_type={lola_cfg.get('history_type')}, "
+          f"use_special_tokens={lola_cfg.get('use_special_tokens')}, "
+          f"state_dim={lola_cfg.get('state_dim')}, action_dim={lola_cfg.get('action_dim')}")
+    return lola_cfg, train_args
+
+
+def _apply_training_config(args, lola_cfg, train_args):
+    """Apply training_config values to args (CLI overrides take precedence)."""
+    # Mapping: (args attr, lola_config key, training_args key)
+    mapping = [
+        ("action_dim", "action_dim", "action_dim"),
+        ("action_chunk_size", "action_chunk_size", "action_chunk_size"),
+        ("pred_chunk_size", "pred_chunk_size", "pred_chunk_size"),
+        ("n_obs_steps", "n_obs_steps", "n_obs_steps"),
+        ("max_history_length", "max_history_length", "max_history_length"),
+        ("history_padding_side", "history_padding_side", "history_padding_side"),
+        ("vlm_extract_layers", "vlm_extract_layers", "vlm_extract_layers"),
+        ("max_image_pixels", "max_image_pixels", "max_image_pixels"),
+        ("min_image_pixels", "min_image_pixels", "min_image_pixels"),
+        ("num_inference_steps", "num_inference_steps", "num_inference_steps"),
+        ("vlm_backbone", "vlm_backbone", "vlm_backbone"),
+        ("vlm_hidden_size", "vlm_hidden_size", "vlm_hidden_size"),
+        ("dit_hidden_size", "dit_hidden_size", "dit_hidden_size"),
+        ("empty_cameras", "empty_cameras", "empty_cameras"),
+        ("empty_token_id", "empty_token_id", "empty_token_id"),
+        ("gripper_threshold", "gripper_threshold", "gripper_threshold"),
+        ("gripper_loss_weight", "gripper_loss_weight", "gripper_loss_weight"),
+        ("action_loss_weight", "action_loss_weight", "action_loss_weight"),
+        ("vlm_model_name", "vlm_model_name", "vlm_model_name"),
+        # v07 架构/行为字段
+        ("history_type", "history_type", "history_type"),
+        ("state_dim", "state_dim", "state_dim"),
+        ("state_encoder_mode", "state_encoder_mode", "state_encoder_mode"),
+        ("use_state_condition", "use_state_condition", "use_state_condition"),
+        ("vlm_bridge_mode", "vlm_bridge_mode", "vlm_bridge_mode"),
+        ("vlm_bridge_width", "vlm_bridge_width", "vlm_bridge_width"),
+        ("vlm_bridge_layers", "vlm_bridge_layers", "vlm_bridge_layers"),
+        ("vlm_bridge_num_heads", "vlm_bridge_num_heads", "vlm_bridge_num_heads"),
+        ("vlm_bridge_ffn_ratio", "vlm_bridge_ffn_ratio", "vlm_bridge_ffn_ratio"),
+        ("obs_prev_chunk_frame", "obs_prev_chunk_frame", "obs_prev_chunk_frame"),
+        ("action_bottleneck_dim", "action_bottleneck_dim", "action_bottleneck_dim"),
+        ("grip_bottleneck_dim", "grip_bottleneck_dim", "grip_bottleneck_dim"),
+        ("state_bottleneck_dim", "state_bottleneck_dim", "state_bottleneck_dim"),
+        ("state_grip_bottleneck_dim", "state_grip_bottleneck_dim", "state_grip_bottleneck_dim"),
+        # Text template & completed tasks
+        ("task_text_template_version", "task_text_template_version", "task_text_template_version"),
+        ("completed_tasks_use_ann", "completed_tasks_use_ann", "completed_tasks_use_ann"),
+        ("completed_tasks_history_len", "completed_tasks_history_len", "completed_tasks_history_len"),
+        ("max_transition_len", "max_transition_len", "max_transition_len"),
+        # Special tokens
+        ("use_special_tokens", "use_special_tokens", "use_special_tokens"),
+        # Normalization
+        ("norm_mode", None, "norm_mode"),
+        ("norm_min", None, "norm_min"),
+        ("norm_max", None, "norm_max"),
+        ("stats_mode", None, "stats_mode"),
+    ]
+    for attr, lola_key, train_key in mapping:
+        if getattr(args, attr) is not None:
+            continue  # CLI override takes precedence
+        if lola_key and lola_key in lola_cfg:
+            setattr(args, attr, lola_cfg[lola_key])
+        elif train_key and train_key in train_args:
+            setattr(args, attr, train_args[train_key])
+
+    # Special handling for boolean flags / paths
+    if args.vlm_path is None:
+        args.vlm_path = lola_cfg.get("vlm_path") or train_args.get("vlm_path")
+    if args.train_vlm is None:
+        args.train_vlm = lola_cfg.get("train_vlm", False)
+    if args.load_full_history is None:
+        args.load_full_history = lola_cfg.get("load_full_history", False)
+    if args.gripper_dims is None:
+        gd = lola_cfg.get("gripper_dim_indices", train_args.get("gripper_dims"))
+        if isinstance(gd, (list, tuple)):
+            args.gripper_dims = ",".join(str(x) for x in gd)
+        elif isinstance(gd, str):
+            args.gripper_dims = gd
+    if args.static_vlm_padding is None:
+        args.static_vlm_padding = lola_cfg.get("static_vlm_padding", False)
+    if args.vlm_max_length is None:
+        args.vlm_max_length = lola_cfg.get("vlm_max_length")
+    # normalization_mapping: 训练时保存的精确映射 (json 中是 "MEAN_STD" 等字符串),
+    # 在 main 中转换回 NormalizationMode
+    if getattr(args, "normalization_mapping", None) is None:
+        args.normalization_mapping = lola_cfg.get("normalization_mapping")
+
+    # 验证数据集: 默认用训练时保存的 val 数据集 (没有则回退训练数据集)
+    if args.val_dataset_repo_id is None:
+        args.val_dataset_repo_id = train_args.get("val_dataset_repo_id") or train_args.get("dataset_repo_id")
+        if args.val_dataset_repo_id:
+            print(f"Auto-filled val_dataset_repo_id from training_config: {args.val_dataset_repo_id}")
+    if args.val_dataset_root is None:
+        args.val_dataset_root = train_args.get("val_dataset_root") or train_args.get("dataset_root")
+        if args.val_dataset_root:
+            print(f"Auto-filled val_dataset_root from training_config: {args.val_dataset_root}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="LoLA Model Validation")
+    parser = argparse.ArgumentParser(description="LoLA V07 Model Validation")
+
+    # Training config — 自动匹配训练配置 (CLI 参数优先)
+    parser.add_argument("--training_config", type=str, default=None,
+                        help="Path to training_config.json saved by v07 training. "
+                             "When provided, config args are auto-populated; "
+                             "CLI args override training_config values.")
 
     # 验证数据集参数
     parser.add_argument("--val_dataset_repo_id", type=str, default=None,
-                        help="Validation dataset repo ID")
+                        help="Validation dataset repo ID (default: from training_config)")
     parser.add_argument("--val_dataset_root", type=str, default=None,
-                        help="Local root for validation dataset")
+                        help="Local root for validation dataset (default: from training_config)")
     parser.add_argument("--val_episodes", type=int, nargs="*", default=None,
                         help="Specific validation episodes to load (optional)")
 
@@ -661,34 +805,67 @@ def main():
                              "Auto-detected from 'latest' file or directory name if not provided.")
     parser.add_argument("--use_ema", action="store_true", default=False,
                         help="用 checkpoint 内的 EMA 权重 (ema_rank_*.pt / ema_state) 覆盖训练权重后再验证")
-    parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/",
-                        help="Path to local Qwen3.5-4B model")
-    parser.add_argument("--action_dim", type=int, default=14)
-    parser.add_argument("--action_chunk_size", type=int, default=10)
-    parser.add_argument("--pred_chunk_size", type=int, default=50)
-    parser.add_argument("--n_obs_steps", type=int, default=1)
-    parser.add_argument("--train_vlm", action="store_true", default=False)
-    parser.add_argument("--load_full_history", action="store_true")
-    parser.add_argument("--max_history_length", type=int, default=100)
-    parser.add_argument("--history_padding_side", type=str, default="left", choices=["left", "right"])
-    parser.add_argument("--vlm_extract_layers", type=int, nargs="+", default=[8, 16, 24])
-    parser.add_argument("--max_image_pixels", type=int, default=230400)
-    parser.add_argument("--min_image_pixels", type=int, default=65536)
-    parser.add_argument("--num_inference_steps", type=int, default=10)
-    parser.add_argument("--gradient_checkpointting", action="store_true", default=True)
-    parser.add_argument("--no_gradient_checkpointting", action="store_true")
-    parser.add_argument("--static_vlm_padding", action="store_true", default=False,
+    parser.add_argument("--vlm_path", type=str, default=None,
+                        help="Path to local VLM model (default: from training_config)")
+    parser.add_argument("--vlm_model_name", type=str, default=None,
+                        help="HF model name for the VLM backbone. None → backbone default "
+                             "(qwen3_5: Qwen/Qwen3.5-4B, cosmos3_nano: nvidia/Cosmos3-Nano)")
+
+    # LoLAV07Config 参数 (default None → training_config → 内置默认)
+    parser.add_argument("--action_dim", type=int, default=None)
+    parser.add_argument("--action_chunk_size", type=int, default=None)
+    parser.add_argument("--pred_chunk_size", type=int, default=None)
+    parser.add_argument("--n_obs_steps", type=int, default=None)
+    parser.add_argument("--train_vlm", action="store_true", default=None)
+    parser.add_argument("--load_full_history", action="store_true", default=None)
+    parser.add_argument("--max_history_length", type=int, default=None)
+    parser.add_argument("--history_padding_side", type=str, default=None, choices=["left", "right"])
+    parser.add_argument("--vlm_extract_layers", type=int, nargs="+", default=None)
+    parser.add_argument("--max_image_pixels", type=int, default=None)
+    parser.add_argument("--min_image_pixels", type=int, default=None)
+    parser.add_argument("--num_inference_steps", type=int, default=None)
+    parser.add_argument("--static_vlm_padding", action="store_true", default=None,
                         help="Pad VLM tokens to fixed max_length for consistent tensor shapes")
     parser.add_argument("--vlm_max_length", type=int, default=None,
                         help="Override tokenizer max_length when static_vlm_padding=True")
-    parser.add_argument("--empty_cameras", type=int, default=0,
-                        help="Number of empty camera slots to add")
-    parser.add_argument("--vlm_hidden_size", type=int, default=2560,
-                        help="VLM hidden dimension (Qwen3.5-4B = 2560, Qwen3.5-2B = 1536)")
-    parser.add_argument("--dit_hidden_size", type=int, default=1024,
-                        help="DiT core hidden dimension")
-    parser.add_argument("--action_loss_weight", type=float, default=1.0,
-                        help="Huber loss weight for continuous arm dimensions")
+    parser.add_argument("--empty_cameras", type=int, default=None)
+    parser.add_argument("--vlm_hidden_size", type=int, default=None,
+                        help="VLM hidden dim (None → backbone default: qwen3_5=2560, cosmos3_nano=4096)")
+    parser.add_argument("--vlm_backbone", type=str, default=None,
+                        help="VLM backbone registry key (e.g. qwen3_5, cosmos3_nano); must match training")
+    parser.add_argument("--dit_hidden_size", type=int, default=None)
+    parser.add_argument("--empty_token_id", type=int, default=None,
+                        help="Empty token ID (None → backbone default)")
+
+    # v07 架构/行为参数
+    parser.add_argument("--history_type", type=str, default=None, choices=["action", "state"])
+    parser.add_argument("--state_dim", type=int, default=None)
+    parser.add_argument("--state_encoder_mode", type=str, default=None, choices=["unified", "separated"])
+    parser.add_argument("--use_state_condition", action="store_true", default=None)
+    parser.add_argument("--vlm_bridge_mode", type=str, default=None, choices=["legacy", "transformer"])
+    parser.add_argument("--vlm_bridge_width", type=int, default=None)
+    parser.add_argument("--vlm_bridge_layers", type=int, default=None)
+    parser.add_argument("--vlm_bridge_num_heads", type=int, default=None,
+                        help="Bridge attention heads (0 → auto width // 128)")
+    parser.add_argument("--vlm_bridge_ffn_ratio", type=float, default=None,
+                        help="Bridge SwiGLU FFN expansion ratio")
+    parser.add_argument("--obs_prev_chunk_frame", action="store_true", default=None,
+                        help="观测 = [上一 chunk 起始帧, 当前帧]; 必须与训练一致 (改变数据集取帧)")
+    parser.add_argument("--action_bottleneck_dim", type=int, default=None)
+    parser.add_argument("--grip_bottleneck_dim", type=int, default=None)
+    parser.add_argument("--state_bottleneck_dim", type=int, default=None)
+    parser.add_argument("--state_grip_bottleneck_dim", type=int, default=None)
+
+    # v07 文本模板 / 特殊 token
+    parser.add_argument("--task_text_template_version", type=str, default=None,
+                        choices=["raw", "v1_with_completed"])
+    parser.add_argument("--completed_tasks_use_ann", action="store_true", default=None)
+    parser.add_argument("--no_completed_tasks_use_ann", action="store_true")
+    parser.add_argument("--completed_tasks_history_len", type=int, default=None)
+    parser.add_argument("--max_transition_len", type=int, default=None)
+    parser.add_argument("--use_special_tokens", action="store_true", default=None,
+                        help="Insert 5 special token embeddings in DiT sequence; must match training")
+    parser.add_argument("--no_use_special_tokens", action="store_true")
 
     # 验证模式
     parser.add_argument("--mode", type=str, default="both",
@@ -704,29 +881,25 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
 
-    # 分布式参数
-    parser.add_argument("--strategy", type=str, default="auto",
-                        choices=["fsdp", "deepspeed", "ddp", "auto"])
-    parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="bf16-mixed",
-                        choices=["32", "16-mixed", "bf16-mixed"])
-
     # 归一化参数
-    parser.add_argument("--norm_mode", type=str, default="default",
+    parser.add_argument("--norm_mode", type=str, default=None,
                         choices=["default", "robovlm", "zscore"])
-    parser.add_argument("--norm_min", type=float, default=-0.65)
-    parser.add_argument("--norm_max", type=float, default=0.65)
+    parser.add_argument("--norm_min", type=float, default=None)
+    parser.add_argument("--norm_max", type=float, default=None)
+    parser.add_argument("--stats_mode", type=str, default=None,
+                        choices=["original", "incremental"],
+                        help="Stats mode for z-score normalization; must match training "
+                             "(incremental → action_incremental stats)")
 
     # 每维度指标与夹爪分类参数
     parser.add_argument("--gripper_dims", type=str, default=None,
                         help="Comma-separated indices of gripper dims. Supports negative indices "
-                             "(e.g., '-1' for last dim, '-1,-11' for dual-arm)")
-    parser.add_argument("--gripper_threshold", type=float, default=0.5,
-                        help="Threshold for discretizing gripper predictions in classification metrics. "
-                             "Also passed to LoLAConfig.gripper_threshold for inference discretization. "
-                             "0.5 works for both {-1,1} and {0,1} range")
-    parser.add_argument("--gripper_loss_weight", type=float, default=1.0,
-                        help="BCE loss weight for gripper dimension")
+                             "(e.g., '-1' for last dim, '-1,-11' for dual-arm). "
+                             "Default: from training_config")
+    parser.add_argument("--gripper_threshold", type=float, default=None)
+    parser.add_argument("--gripper_loss_weight", type=float, default=None)
+    parser.add_argument("--action_loss_weight", type=float, default=None,
+                        help="Huber loss weight for continuous arm dimensions (v07 default 10.0)")
     parser.add_argument("--per_dim_metrics", action="store_true", default=False,
                         help="Compute per-dimension MSE/L1 for all action dims")
 
@@ -736,11 +909,109 @@ def main():
 
     args = parser.parse_args()
 
+    # ─── Apply training_config.json if provided ─────────────────────────────
+    if args.training_config is not None:
+        lola_cfg, train_args = _load_training_config(args.training_config)
+        _apply_training_config(args, lola_cfg, train_args)
+
+    # ─── 默认值填充 (training_config 与 CLI 都未提供时) ──────────────────────
+    if args.state_dim is None:
+        args.state_dim = None  # 加载数据集 features 后解析, 见下文
+    if args.history_type is None:
+        args.history_type = "action"
+    if args.state_encoder_mode is None:
+        args.state_encoder_mode = "unified"
+    if args.use_state_condition is None:
+        args.use_state_condition = False
+    if args.vlm_bridge_mode is None:
+        args.vlm_bridge_mode = "legacy"
+    if args.vlm_bridge_width is None:
+        args.vlm_bridge_width = 2048
+    if args.vlm_bridge_layers is None:
+        args.vlm_bridge_layers = 8
+    if args.vlm_bridge_num_heads is None:
+        args.vlm_bridge_num_heads = 0  # 0 → auto width // 128
+    if args.vlm_bridge_ffn_ratio is None:
+        args.vlm_bridge_ffn_ratio = 4.0
+    if args.obs_prev_chunk_frame is None:
+        args.obs_prev_chunk_frame = False
+    if args.norm_mode is None:
+        args.norm_mode = "default"
+    if args.norm_min is None:
+        args.norm_min = -0.65
+    if args.norm_max is None:
+        args.norm_max = 0.65
+    if args.stats_mode is None:
+        args.stats_mode = "original"
+    if args.gripper_threshold is None:
+        args.gripper_threshold = 0.5
+    if args.gripper_loss_weight is None:
+        args.gripper_loss_weight = 1.0
+    if args.action_loss_weight is None:
+        args.action_loss_weight = 10.0  # v07 默认 (v06 为 1.0)
+    if args.action_chunk_size is None:
+        args.action_chunk_size = 10
+    if args.pred_chunk_size is None:
+        args.pred_chunk_size = 50
+    if args.n_obs_steps is None:
+        args.n_obs_steps = 1
+    if args.max_history_length is None:
+        args.max_history_length = 100
+    if args.history_padding_side is None:
+        args.history_padding_side = "left"
+    if args.vlm_extract_layers is None:
+        args.vlm_extract_layers = [8, 16, 24]
+    if args.max_image_pixels is None:
+        args.max_image_pixels = 230400
+    if args.min_image_pixels is None:
+        args.min_image_pixels = 65536
+    if args.num_inference_steps is None:
+        args.num_inference_steps = 10
+    if args.vlm_backbone is None:
+        args.vlm_backbone = "qwen3_5"  # 兼容无该字段的旧 checkpoint
+    if args.dit_hidden_size is None:
+        args.dit_hidden_size = 1024
+    if args.empty_cameras is None:
+        args.empty_cameras = 0
+    if args.action_bottleneck_dim is None:
+        args.action_bottleneck_dim = 256
+    if args.grip_bottleneck_dim is None:
+        args.grip_bottleneck_dim = 128
+    if args.state_bottleneck_dim is None:
+        args.state_bottleneck_dim = 256
+    if args.state_grip_bottleneck_dim is None:
+        args.state_grip_bottleneck_dim = 128
+    if args.train_vlm is None:
+        args.train_vlm = False
+    if args.load_full_history is None:
+        args.load_full_history = False
+    if args.static_vlm_padding is None:
+        args.static_vlm_padding = False
+    if args.task_text_template_version is None:
+        args.task_text_template_version = "raw"
+    if args.completed_tasks_use_ann is None:
+        args.completed_tasks_use_ann = True
+    if args.no_completed_tasks_use_ann:
+        args.completed_tasks_use_ann = False
+    if args.completed_tasks_history_len is None:
+        args.completed_tasks_history_len = 5
+    if args.max_transition_len is None:
+        args.max_transition_len = 64
+    if args.use_special_tokens is None:
+        args.use_special_tokens = False
+    if args.no_use_special_tokens:
+        args.use_special_tokens = False
+    if args.vlm_path is None:
+        args.vlm_path = "/data_16T/deepseek/qwen3_5/Qwen3.5-4B/"
+        print(f"WARNING: --vlm_path not provided and not in training_config, "
+              f"falling back to {args.vlm_path}")
+
     if args.val_dataset_repo_id is None and args.val_dataset_root is None:
-        raise ValueError("Either --val_dataset_repo_id or --val_dataset_root must be provided.")
+        raise ValueError("Either --val_dataset_repo_id or --val_dataset_root must be provided "
+                         "(not found in training_config either).")
 
     # set seed
-    seed=42
+    seed = 42
     torch.manual_seed(seed)
 
     # 确定设备
@@ -752,7 +1023,6 @@ def main():
     # 初始化分布式（如果使用 torchrun）
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     if world_size > 1:
-        import torch.distributed as dist
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
@@ -765,7 +1035,21 @@ def main():
 
     # 获取 features
     features = dataset_to_policy_features(dataset_metadata.features)
-    action_dim = features["action"].shape[0] if "action" in features else args.action_dim
+    if "action" in features:
+        action_dim = features["action"].shape[0]
+    elif args.action_dim is not None:
+        action_dim = args.action_dim
+    else:
+        raise ValueError("action_dim could not be determined from dataset features, "
+                         "training_config, or --action_dim")
+
+    # state_dim: CLI/training_config > dataset features > action_dim
+    if args.state_dim is not None:
+        state_dim = args.state_dim
+    elif "observation.state" in features:
+        state_dim = features["observation.state"].shape[0]
+    else:
+        state_dim = action_dim  # fallback
 
     # 解析夹爪维度索引
     gripper_dim_indices = []
@@ -785,17 +1069,38 @@ def main():
 
     compute_per_dim = args.per_dim_metrics or len(gripper_dim_indices) > 0
 
+    # stats_mode → action stats key
+    action_key = "action_incremental" if args.stats_mode == "incremental" else "action"
+    if args.stats_mode == "incremental" and action_key not in (dataset_metadata.stats or {}):
+        print(f"WARNING: stats_mode=incremental 但数据集 stats 中无 '{action_key}', "
+              f"unnormalize 将回退到 'action'")
+
     print(f"Validation Dataset Info:")
     print(f"  - Total episodes: {dataset_metadata.total_episodes}")
     print(f"  - Total frames: {dataset_metadata.total_frames}")
     print(f"  - FPS: {dataset_metadata.fps}")
-    print(f"  - Action dim: {action_dim}")
+    print(f"  - Action dim: {action_dim}, State dim: {state_dim}")
 
-    # 创建 LoLA 配置
-    gradient_checkpointting = not args.no_gradient_checkpointting
-    config = LoLAConfig(
-        vlm_model_name="Qwen/Qwen3.5-4B",
+    # static VLM padding 但未给 vlm_max_length: 与训练一致自动计算
+    if args.static_vlm_padding and args.vlm_max_length is None:
+        frames_per_cam = 2 if args.obs_prev_chunk_frame else max(1, args.n_obs_steps)
+        args.vlm_max_length = compute_vlm_max_length(
+            dataset_metadata,
+            vlm_path=args.vlm_path,
+            min_image_pixels=args.min_image_pixels,
+            max_image_pixels=args.max_image_pixels,
+            frames_per_cam=frames_per_cam,
+        )
+        print(f"Auto-computed vlm_max_length={args.vlm_max_length}")
+
+    # ─── 创建 LoLAV07 配置 ──────────────────────────────────────────────────
+    # 注意: train-only 字段强制为验证语义 (与推理分布对齐):
+    #   hist_action_token_drop_rate=0 / transition_mask_rate=0 / visual_token_drop_rate=0
+    #   gradient_checkpointing=False (eval 无需重算)
+    config = LoLAV07Config(
+        vlm_backbone=args.vlm_backbone,
         vlm_path=args.vlm_path,
+        vlm_model_name=args.vlm_model_name,
         action_dim=action_dim,
         action_chunk_size=args.action_chunk_size,
         pred_chunk_size=args.pred_chunk_size,
@@ -806,47 +1111,86 @@ def main():
         load_full_history=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
+        history_type=args.history_type,
+        state_dim=state_dim,
+        state_encoder_mode=args.state_encoder_mode,
+        use_state_condition=args.use_state_condition,
+        gradient_checkpointing=False,
+        dit_gradient_checkpointing=False,
         vlm_extract_layers=tuple(args.vlm_extract_layers),
+        vlm_bridge_mode=args.vlm_bridge_mode,
+        vlm_bridge_width=args.vlm_bridge_width,
+        vlm_bridge_layers=args.vlm_bridge_layers,
+        vlm_bridge_num_heads=args.vlm_bridge_num_heads,
+        vlm_bridge_ffn_ratio=args.vlm_bridge_ffn_ratio,
+        use_special_tokens=args.use_special_tokens,
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
         gripper_loss_weight=args.gripper_loss_weight,
-        gripper_dim_indices=tuple(int(x.strip()) for x in args.gripper_dims.split(",")) if args.gripper_dims else (),
+        action_loss_weight=args.action_loss_weight,
+        gripper_dim_indices=tuple(gripper_dim_indices),
         gripper_threshold=args.gripper_threshold,
+        hist_action_token_drop_rate=0.0,   # train-only
         static_vlm_padding=args.static_vlm_padding,
         vlm_max_length=args.vlm_max_length,
         empty_cameras=args.empty_cameras,
         vlm_hidden_size=args.vlm_hidden_size,
         dit_hidden_size=args.dit_hidden_size,
-        action_loss_weight=args.action_loss_weight,
+        num_inference_steps=args.num_inference_steps,
+        empty_token_id=args.empty_token_id,
+        task_text_template_version=args.task_text_template_version,
+        completed_tasks_use_ann=args.completed_tasks_use_ann,
+        completed_tasks_history_len=args.completed_tasks_history_len,
+        transition_mask_rate=0.0,            # train-only: 验证不对 transition token 做随机 mask
+        max_transition_len=args.max_transition_len,
+        action_bottleneck_dim=args.action_bottleneck_dim,
+        grip_bottleneck_dim=args.grip_bottleneck_dim,
+        state_bottleneck_dim=args.state_bottleneck_dim,
+        state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
+        obs_prev_chunk_frame=args.obs_prev_chunk_frame,
+        visual_token_drop_rate=0.0,          # train-only
     )
-    # draccus.ChoiceRegistry 不接受 gradient_checkpointting 作为构造参数
-    config.gradient_checkpointting = gradient_checkpointting
-
     # 设置 config.device 为当前 rank 对应的 GPU
     # 这会影响 preprocessor 中的 DeviceProcessorStep 以及模型加载
     config.device = f"cuda:{local_rank}"
 
-    # 归一化模式
-    if args.norm_mode == "robovlm":
-        from lerobot.configs.types import NormalizationMode
+    print(f"[Rank {local_rank}] Config: history_type={config.history_type}, "
+          f"use_special_tokens={config.use_special_tokens}, "
+          f"task_template={config.task_text_template_version}, "
+          f"vlm_backbone={config.vlm_backbone}, "
+          f"obs_prev_chunk_frame={config.obs_prev_chunk_frame}, "
+          f"action_bottleneck={config.action_bottleneck_dim}, "
+          f"grip_bottleneck={config.grip_bottleneck_dim}, "
+          f"stats_mode={args.stats_mode}")
+
+    # 归一化模式: 优先用 training_config 保存的精确 normalization_mapping
+    # (反映训练时 preprocessor 的实际行为, 如 zscore 训练是 STATE=MEAN_STD/ACTION=IDENTITY)
+    saved_norm_mapping = getattr(args, "normalization_mapping", None)
+    if saved_norm_mapping:
+        config.normalization_mapping = {
+            k: NormalizationMode(v) for k, v in saved_norm_mapping.items()
+        }
+        print(f"[Rank {local_rank}] normalization_mapping from training_config: "
+              f"{ {k: v.value for k, v in config.normalization_mapping.items()} }")
+    elif args.norm_mode == "robovlm":
         config.normalization_mapping = {
             "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.IDENTITY,
             "ACTION": NormalizationMode.IDENTITY,
         }
     elif args.norm_mode == "zscore":
-        from lerobot.configs.types import NormalizationMode
+        # 与 train_lola_v07_azure 一致: zscore 下 STATE 走 MEAN_STD
         config.normalization_mapping = {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.IDENTITY,
         }
 
     # 加载模型
-    print(f"[Rank {local_rank}] Loading LoLA model...")
+    print(f"[Rank {local_rank}] Loading LoLAV07 model...")
 
     # 先创建 policy 和 preprocessor（模型在 CPU 上）
-    policy = LoLAPolicy(config)
+    policy = LoLAV07Policy(config)
     preprocessor, postprocessor = make_pre_post_processors(
         config,
         dataset_stats=dataset_metadata.stats,
@@ -904,6 +1248,9 @@ def main():
                         dit_missing += 1
                 policy.model.load_state_dict(current_dit_sd)
                 print(f"[Rank {local_rank}] DiT weights: {dit_loaded} loaded, {dit_missing} missing")
+                if dit_missing > 0:
+                    print(f"[Rank {local_rank}] WARNING: {dit_missing} DiT params not found — "
+                          f"确认 config 与训练一致 (bottleneck dims / bridge / special tokens / history_type)")
 
             # 加载 VLM 权重
             if vlm_sd_raw:
@@ -961,6 +1308,7 @@ def main():
     policy._device = device
     policy.model = policy.model.to(device)
     policy.vlm = policy.vlm.to(device)
+    policy.eval()
     policy.model.eval()
     if not policy.config.train_vlm:
         policy.vlm.eval()
@@ -970,11 +1318,14 @@ def main():
     vlm_device = next(policy.vlm.parameters()).device
     print(f"[Rank {local_rank}] DiT device: {dit_device}, VLM device: {vlm_device}")
 
-    # 创建验证数据集
+    # 创建验证数据集 (V07 参数: history_type / state_dim / completed_tasks / stats_mode)
     print("Creating validation dataset...")
-    norm_action = (args.norm_mode == "robovlm")
-    if args.norm_mode == "zscore":
+    if args.norm_mode == "robovlm":
+        norm_action = True
+    elif args.norm_mode == "zscore":
         norm_action = "zscore"
+    else:
+        norm_action = False
     val_dataset = create_lola_dataset(
         repo_id=args.val_dataset_repo_id,
         config=config,
@@ -988,6 +1339,15 @@ def main():
         norm_max=args.norm_max,
         gripper_dim_indices_abs=config.gripper_dim_indices_abs,
         dataset_stats=dataset_metadata.stats,
+        history_type=args.history_type,
+        state_dim=state_dim,
+        # V2: completed tasks + transition masking
+        track_completed_tasks=config.task_text_template_version == "v1_with_completed",
+        transition_mask_rate=0.0,  # train-only: 验证不做随机 transition mask
+        completed_tasks_use_ann=config.completed_tasks_use_ann,
+        completed_tasks_history_len=config.completed_tasks_history_len,
+        max_transition_len=config.max_transition_len,
+        stats_mode=args.stats_mode,
     )
     print(f"Total validation samples: {len(val_dataset)}")
 
@@ -1041,27 +1401,34 @@ def main():
             norm_mode=args.norm_mode,
             dataset_stats=dataset_metadata.stats,
             num_act_exec=args.num_act_exec,
+            action_key=action_key,
         )
         all_metrics.update(inference_metrics)
 
     elapsed = time.time() - start_time
 
     # 输出结果
-    for rank in range(dist.get_world_size()):
-        if dist.get_rank() == rank:
-            print("=" * 60)
-            print("LoLA Validation Results")
-            print("=" * 60)
-            print(f"Dataset: {args.val_dataset_repo_id or args.val_dataset_root}")
-            print(f"Checkpoint: {args.checkpoint_path or 'N/A'}")
-            print(f"Mode: {args.mode}")
-            print(f"Validation samples: {len(val_dataset)}")
-            print("-" * 60)
-            for name, value in all_metrics.items():
-                print(f"  {name}: {value:.6f}")
-            print(f"  Elapsed time: {elapsed:.1f}s")
-            print("=" * 60)
-        dist.barrier()
+    def _print_results():
+        print("=" * 60)
+        print("LoLA V07 Validation Results")
+        print("=" * 60)
+        print(f"Dataset: {args.val_dataset_repo_id or args.val_dataset_root}")
+        print(f"Checkpoint: {args.checkpoint_path or 'N/A'}")
+        print(f"Mode: {args.mode}")
+        print(f"Validation samples: {len(val_dataset)}")
+        print("-" * 60)
+        for name, value in all_metrics.items():
+            print(f"  {name}: {value:.6f}")
+        print(f"  Elapsed time: {elapsed:.1f}s")
+        print("=" * 60)
+
+    if dist.is_initialized():
+        for rank in range(dist.get_world_size()):
+            if dist.get_rank() == rank:
+                _print_results()
+            dist.barrier()
+    else:
+        _print_results()
 
     # 保存结果（仅主进程保存）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
@@ -1077,13 +1444,18 @@ def main():
 
         results = {
             "dataset": args.val_dataset_repo_id or args.val_dataset_root,
+            "training_config": args.training_config,
             "checkpoint_info": ckpt_info,
             "mode": args.mode,
             "num_samples": len(val_dataset),
             "action_dim": action_dim,
+            "state_dim": state_dim,
+            "history_type": args.history_type,
+            "use_special_tokens": args.use_special_tokens,
             "gripper_dim_indices": gripper_dim_indices,
             "gripper_threshold": args.gripper_threshold,
             "norm_mode": args.norm_mode,
+            "stats_mode": args.stats_mode,
             "metrics": {k: float(v) for k, v in all_metrics.items()},
             "elapsed_s": elapsed,
         }

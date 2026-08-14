@@ -346,6 +346,7 @@ def compute_vlm_max_length(
     vlm_path: str,
     min_image_pixels: int = 65536,
     max_image_pixels: int = 230400,
+    frames_per_cam: int = 1,
 ) -> int:
     """Auto-compute vlm_max_length from dataset info for static VLM padding.
 
@@ -356,6 +357,8 @@ def compute_vlm_max_length(
         vlm_path: Path to Qwen3.5 model for tokenization.
         min_image_pixels: min_pixels for Qwen smart_resize.
         max_image_pixels: max_pixels for Qwen smart_resize.
+        frames_per_cam: 每相机送入 VLM 的帧数 (obs_prev_chunk_frame=2 等),
+            直接乘进 visual token 计数。
 
     Returns:
         vlm_max_length: fixed tokenizer max_length for static padding.
@@ -395,8 +398,8 @@ def compute_vlm_max_length(
                     w_bar += 1
 
         tokens = h_bar * w_bar // (merge_size ** 2)
-        visual_tokens_total += tokens
-        num_images += 1
+        visual_tokens_total += tokens * frames_per_cam
+        num_images += frames_per_cam
 
     # 2. Compute structural tokens from chat template
     # For Qwen3.5 with N images:
@@ -918,6 +921,65 @@ class LoLAV07Trainer:
             self._vlm_unfrozen = True
             self._vlm_delayed_unfreeze = False
 
+        # EMA (2026-08-12): {param_name: 本地 shard 副本}。ZeRO-3 下每 rank 只维护
+        # 自己分片的 EMA, 零额外通信; None = 关闭 (config.ema_decay <= 0)。
+        # 冻结 VLM requires_grad=False 不跟踪 (权重不变, EMA 恒等); 动态解冻时
+        # _ema_rebind 以当前权重初始化 VLM 分片并继续跟踪。
+        self._ema_state = None
+
+    # ────────────────────────────────────────────────────────────────
+    # EMA (全模型, ZeRO-3 分片本地维护)
+    # ────────────────────────────────────────────────────────────────
+    def _ema_register(self):
+        """注册 EMA: 以当前权重初始化所有 requires_grad 参数的本地副本。"""
+        self._ema_state = {}
+        with torch.no_grad():
+            for name, p in self.policy.named_parameters():
+                if p.requires_grad:
+                    self._ema_state[name] = p.data.detach().clone()
+        n_params = sum(t.numel() for t in self._ema_state.values())
+        _log(f"[EMA] 注册 {len(self._ema_state)} 个参数分片, "
+             f"本 rank 共 {n_params/1e6:.1f}M 元素 (decay={self.config.ema_decay})")
+
+    @torch.no_grad()
+    def _ema_update(self):
+        """每步 optimizer.step 之后调用: 本地 shard 原地 EMA 更新。"""
+        if self._ema_state is None:
+            return
+        d = self.config.ema_decay
+        for name, p in self.policy.named_parameters():
+            ema = self._ema_state.get(name)
+            if ema is not None:
+                ema.mul_(d).add_(p.data, alpha=1.0 - d)
+
+    @torch.no_grad()
+    def _ema_rebind(self):
+        """engine 重建 (VLM 动态解冻) 后重绑: 已有 name 保留 EMA 历史值
+        (ZeRO-3 分片布局不随 param group 新增而变化, shard 语义不变),
+        新增 name (解冻的 VLM) 以当前权重初始化 — 冻结期权重未变, 无漂移。"""
+        if self._ema_state is None:
+            return
+        new_state = {}
+        n_kept, n_new, n_reinit = 0, 0, 0
+        for name, p in self.policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            old = self._ema_state.get(name)
+            if old is None:
+                new_state[name] = p.data.detach().clone()
+                n_new += 1
+            elif old.shape == p.data.shape:
+                new_state[name] = old
+                n_kept += 1
+            else:
+                # 分片布局意外变化 — 响亮降级: 以当前权重重启该参数的 EMA
+                _log(f"[EMA] ⚠️ {name} 分片形状变化 {tuple(old.shape)} → {tuple(p.data.shape)}, "
+                     f"该参数 EMA 以当前权重重启")
+                new_state[name] = p.data.detach().clone()
+                n_reinit += 1
+        self._ema_state = new_state
+        _log(f"[EMA] engine 重建后重绑: 保留 {n_kept}, 新增 {n_new} (VLM), 重启 {n_reinit}")
+
     def setup_model(self):
         # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
         torch.backends.cuda.enable_cudnn_sdp(True)
@@ -1268,6 +1330,9 @@ class LoLAV07Trainer:
                 static_graph=False,  # Must use static_graph=False after unfreezing new params
             )
             _log("Rebuilt DDP with VLM params included (static_graph=False for dynamic param graph)")
+
+        # EMA 重绑: 新解冻的 VLM 以当前权重初始化 EMA 并开始跟踪
+        self._ema_rebind()
 
         trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         _log(f"VLM unfrozen: {trainable_count:,} trainable params")
@@ -1626,6 +1691,10 @@ class LoLAV07Trainer:
         # Re-configure DeepSpeed checkpointing
         self._configure_deepspeed_checkpointing()
 
+        # EMA 重绑: 已有参数保留 EMA 历史 (分片布局不变), 新解冻的 VLM 以当前
+        # 权重初始化 EMA 并开始跟踪
+        self._ema_rebind()
+
         trainable_count = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
         _log(f"DeepSpeed VLM unfrozen: {trainable_count:,} trainable params, engine rebuilt")
 
@@ -1838,6 +1907,11 @@ class LoLAV07Trainer:
 
         _log(f"Starting training from step {start_step}, epoch {start_epoch}")
 
+        # EMA 注册: fresh 训练以初始权重注册; resume 场景 _ema_state 已在
+        # load_checkpoint 中恢复 (或以其加载的权重兜底注册), 此处不再覆盖
+        if self.config.ema_decay > 0 and self._ema_state is None:
+            self._ema_register()
+
         # 计算 resume 时需要跳过的 batch 数
         try:
             batches_per_epoch = len(train_loader)
@@ -1958,6 +2032,10 @@ class LoLAV07Trainer:
                     self.scheduler.step()
 
                 self.global_step += 1
+
+                # EMA 更新 (optimizer.step 之后, 本地 shard 原地更新, 无通信)
+                if self._ema_state is not None:
+                    self._ema_update()
 
                 # Deferred DeepSpeed VLM unfreeze: engine rebuild happens at step
                 # boundary (after backward+optimizer, before next forward) to avoid
@@ -2150,6 +2228,16 @@ class LoLAV07Trainer:
                 exclude_frozen_parameters=True,
             )
             ckpt_path = f"{ckpt_dir}/{tag}"
+            # EMA 分片随 tag 目录落盘 (每 rank 写自己的 shard; watcher 递归上传
+            # tag 目录会自动带上)。必须在 .upload_ready 之前写完 — 标记一落 watcher
+            # 即开始上传; barrier 保证所有 rank 的 ema_rank_*.pt 就位。
+            if self._ema_state is not None:
+                torch.save(
+                    self._ema_state,
+                    os.path.join(ckpt_path, f"ema_rank_{self.world_rank}.pt"),
+                )
+                if self.is_distributed:
+                    dist.barrier()
             # 上传就绪标记: DS save_checkpoint 末尾有 dist.barrier(), 返回时本节点
             # 分片已完整落盘。各节点 local_rank==0 落标记, 后台 watchdog
             # (checkpoint_upload_watcher.py) 据此把 tag 目录异步上传至 blob,
@@ -2200,6 +2288,7 @@ class LoLAV07Trainer:
                 "scheduler_state_dict": self.scheduler.state_dict(),
                 "vlm_unfrozen": self._vlm_unfrozen,
                 "global_step": self.global_step,
+                "ema_state": self._ema_state,
             }, ckpt_path)
 
         _log(f"Checkpoint saved: {ckpt_path}")
@@ -2235,6 +2324,22 @@ class LoLAV07Trainer:
             self.global_step = client_state.get("step", 0)
             self.current_epoch = client_state.get("epoch", 0)
             vlm_unfrozen = client_state.get("vlm_unfrozen", False)
+            # EMA 恢复: 随 tag 目录的 ema_rank_<world_rank>.pt; 旧 checkpoint 没有
+            # 该文件时以刚加载的权重兜底注册 (EMA 从 resume 点重新开始累计)
+            if self.config.ema_decay > 0:
+                if load_tag is None:
+                    with open(os.path.join(ckpt_path, "latest")) as f:
+                        _tag = f.read().strip()
+                    _tag_dir = os.path.join(ckpt_path, _tag)
+                else:
+                    _tag_dir = ckpt_path
+                ema_path = os.path.join(_tag_dir, f"ema_rank_{self.world_rank}.pt")
+                if os.path.isfile(ema_path):
+                    self._ema_state = torch.load(ema_path, map_location=self.device)
+                    _log(f"[EMA] 从 {ema_path} 恢复 ({len(self._ema_state)} 个分片)")
+                else:
+                    _log(f"[EMA] {ema_path} 不存在, 以 resume 加载的权重重新注册")
+                    self._ema_register()
         elif self.strategy == "fsdp":
             from torch.distributed.checkpoint import load as load_fsdp_checkpoint
             from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
@@ -2275,6 +2380,12 @@ class LoLAV07Trainer:
             self.global_step = checkpoint.get("step", 0)
             self.current_epoch = checkpoint.get("epoch", 0)
             vlm_unfrozen = checkpoint.get("vlm_unfrozen", False)
+            if self.config.ema_decay > 0:
+                if checkpoint.get("ema_state") is not None:
+                    self._ema_state = checkpoint["ema_state"]
+                    _log(f"[EMA] 从 checkpoint 恢复 ({len(self._ema_state)} 个分片)")
+                else:
+                    self._ema_register()
 
         # Restore VLM unfreezing state: if VLM was unfrozen before checkpoint,
         # we need to unfreeze it again (optimizer/scheduler rebuilt with VLM group).
@@ -2324,11 +2435,14 @@ def build_lola_config(args, dataset_metadata):
 
     # Auto-compute vlm_max_length if static VLM padding is enabled but no override given
     if args.static_vlm_padding and args.vlm_max_length is None:
+        # obs_prev_chunk_frame / n_obs_steps>1 时每相机多帧进 VLM, 序列变长
+        frames_per_cam = 2 if args.obs_prev_chunk_frame else max(1, args.n_obs_steps)
         args.vlm_max_length = compute_vlm_max_length(
             dataset_metadata,
             vlm_path=args.vlm_path,
             min_image_pixels=args.min_image_pixels,
             max_image_pixels=args.max_image_pixels,
+            frames_per_cam=frames_per_cam,
         )
 
     gradient_checkpointing = not args.no_gradient_checkpointing
@@ -2382,6 +2496,16 @@ def build_lola_config(args, dataset_metadata):
         state_grip_bottleneck_dim=args.state_grip_bottleneck_dim,
         encoder_lr_mult=args.encoder_lr_mult,
         warmup_pct=args.warmup_pct,
+        # 2026-08-12: EMA / 图像增强 / visual token drop / chunk 帧观测
+        ema_decay=args.ema_decay,
+        image_aug_brightness=args.image_aug_brightness,
+        image_aug_contrast=args.image_aug_contrast,
+        image_aug_saturation=args.image_aug_saturation,
+        image_aug_translate=args.image_aug_translate,
+        image_aug_scale_min=args.image_aug_scale_min,
+        image_aug_scale_max=args.image_aug_scale_max,
+        visual_token_drop_rate=args.visual_token_drop_rate,
+        obs_prev_chunk_frame=args.obs_prev_chunk_frame,
     )
 
     # 归一化模式
@@ -2580,6 +2704,22 @@ def build_arg_parser():
                         choices=["original", "incremental"],
                         help="Stats模式: 'original'使用annotation-only stats, 'incremental'使用包含所有Calvin帧(含transition)的增量stats")
 
+    # 2026-08-12: EMA / 图像增强 / visual token drop / chunk 帧观测
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="全模型 EMA decay (ZeRO-3 分片本地维护, 含解冻后的 VLM); 0=关闭, 建议 0.999")
+    parser.add_argument("--image_aug_brightness", type=float, default=0.0,
+                        help="亮度 jitter 幅度 (0.2 → U(0.8,1.2)); 样本内所有相机/帧共享参数, 0=关闭")
+    parser.add_argument("--image_aug_contrast", type=float, default=0.0, help="对比度 jitter 幅度")
+    parser.add_argument("--image_aug_saturation", type=float, default=0.0, help="饱和度 jitter 幅度 (不碰 hue)")
+    parser.add_argument("--image_aug_translate", type=float, default=0.0,
+                        help="mild affine 平移幅度 (相对图幅, 如 0.1=±10%; reflection 填充保内容完整)")
+    parser.add_argument("--image_aug_scale_min", type=float, default=1.0, help="mild affine 缩放下界")
+    parser.add_argument("--image_aug_scale_max", type=float, default=1.0, help="mild affine 缩放上界")
+    parser.add_argument("--visual_token_drop_rate", type=float, default=0.0,
+                        help="visual token 特征置零概率 (bridge 输入侧, training-only); 0=关闭")
+    parser.add_argument("--obs_prev_chunk_frame", action="store_true",
+                        help="观测扩展为 [上一 action chunk 起始帧, 当前帧] (chunk 尺度动作-场景反馈)")
+
     return parser
 
 
@@ -2742,11 +2882,31 @@ def main():
         norm_action = "zscore"
     else:
         norm_action = False
+    # 2026-08-12: 图像增强 (train-only; LoLADataset 内样本级共享参数应用,
+    # eval/val 数据集不要传此 transform)
+    image_aug_transform = None
+    if (args.image_aug_brightness > 0 or args.image_aug_contrast > 0
+            or args.image_aug_saturation > 0 or args.image_aug_translate > 0
+            or args.image_aug_scale_min < 1.0 or args.image_aug_scale_max > 1.0):
+        from lerobot.datasets.lola_dataset import LolaImageAugment
+        image_aug_transform = LolaImageAugment(
+            brightness=args.image_aug_brightness,
+            contrast=args.image_aug_contrast,
+            saturation=args.image_aug_saturation,
+            translate=args.image_aug_translate,
+            scale_min=args.image_aug_scale_min,
+            scale_max=args.image_aug_scale_max,
+        )
+        _log(f"Image augmentation enabled: b={args.image_aug_brightness} "
+             f"c={args.image_aug_contrast} s={args.image_aug_saturation} "
+             f"t={args.image_aug_translate} scale=[{args.image_aug_scale_min}, {args.image_aug_scale_max}]")
+
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
         config=config,
         root=args.dataset_root,
         episodes=args.episodes,
+        image_transforms=image_aug_transform,
         use_lola_dataset=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
