@@ -326,6 +326,24 @@ class LoLADataset(LeRobotDataset):
 
         return item
 
+    def _apply_image_transforms(self, item: dict) -> dict:
+        """对 item 中的相机图像应用样本级共享参数增强 (2026-08-12)。
+
+        仅处理 self.meta.camera_keys 列出的真实相机键 — 不能用前缀匹配:
+        delta_indices 开启时父类会附加 "observation.images.{cam}_is_pad"
+        布尔 padding 标记 (1-D), 前缀匹配会误中并崩溃 (2026-08-14 事故)。
+        """
+        if self._lola_image_transforms is None:
+            return item
+        seed = random.randrange(2**31)
+        for key in self.meta.camera_keys:
+            val = item.get(key)
+            if isinstance(val, torch.Tensor) and val.ndim >= 3:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    item[key] = self._lola_image_transforms(val)
+        return item
+
     def __getitem__(self, idx) -> dict:
         """
         获取数据项，包含完整历史action。
@@ -350,13 +368,7 @@ class LoLADataset(LeRobotDataset):
         # 样本级共享参数的图像增强: 同一 __getitem__ 内所有相机/所有帧用同一
         # seed 采样增强参数 (上下文语义一致); 不同样本 seed 不同。仅训练集传入
         # transforms, eval/val 数据集传 None 即自动关闭。
-        if self._lola_image_transforms is not None:
-            seed = random.randrange(2**31)
-            for key in list(item.keys()):
-                if key.startswith("observation.images.") and isinstance(item[key], torch.Tensor):
-                    with torch.random.fork_rng(devices=[]):
-                        torch.manual_seed(seed)
-                        item[key] = self._lola_image_transforms(item[key])
+        item = self._apply_image_transforms(item)
 
         # 获取episode信息
         ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]

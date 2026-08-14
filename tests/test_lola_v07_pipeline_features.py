@@ -73,6 +73,39 @@ import pickle
 aug_rt = pickle.loads(pickle.dumps(aug))
 check("可 pickle", aug_rt.brightness == aug.brightness and aug_rt.scale_max == aug.scale_max)
 
+# 回归 (2026-08-14 事故): delta_indices 开启时 item 含 "observation.images.{cam}_is_pad"
+# 1-D 布尔标记, 增强必须只作用在 camera_keys 上
+import types as _types
+from lerobot.datasets.lola_dataset import LoLADataset
+
+ds = object.__new__(LoLADataset)  # 绕过重型 __init__
+ds._lola_image_transforms = aug
+ds.meta = _types.SimpleNamespace(
+    camera_keys=["observation.images.top", "observation.images.gripper"])
+item = {
+    "observation.images.top": torch.full((2, 3, 16, 16), 0.5),      # (T,C,H,W)
+    "observation.images.gripper": torch.full((3, 16, 16), 0.5),     # (C,H,W)
+    "observation.images.top_is_pad": torch.zeros(2, dtype=torch.bool),      # 1-D 标记
+    "observation.images.gripper_is_pad": torch.zeros(2, dtype=torch.bool),  # 1-D 标记
+    "observation.state": torch.zeros(7),
+}
+item_out = ds._apply_image_transforms(item)
+check("_is_pad 键原样保留 (未崩未动)",
+      item_out["observation.images.top_is_pad"].dtype == torch.bool
+      and item_out["observation.images.top_is_pad"].ndim == 1)
+check("非相机键未被动过", torch.equal(item_out["observation.state"], torch.zeros(7)))
+check("两相机同 seed 同参数 (常数图输出一致)",
+      torch.allclose(item_out["observation.images.top"][0],
+                     item_out["observation.images.gripper"], atol=1e-6))
+check("相机图仍被增强 (非恒等)",
+      not torch.allclose(item_out["observation.images.top"],
+                         torch.full((2, 3, 16, 16), 0.5), atol=1e-3))
+# transforms=None 时直通
+ds2 = object.__new__(LoLADataset)
+ds2._lola_image_transforms = None
+ds2.meta = ds.meta
+check("transforms=None 原样直通", ds2._apply_image_transforms(item) is item)
+
 
 # ---------------------------------------------------------------- 2. EMA 分片
 print("[2] Trainer EMA 分片方法 (toy model)")
