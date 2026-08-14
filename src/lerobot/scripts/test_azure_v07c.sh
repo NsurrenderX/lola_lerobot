@@ -544,9 +544,16 @@ while [[ $# -gt 0 ]]; do
             ;;
 
         # Resume
+        # 值可选: 省略路径时回退到 CKPT_DIR (原地续训), 并容忍 --resume 位于
+        # 参数末尾 ($2 缺失时 shift 2 越界 + set -e = 静默退出, 2026-08-14 事故)
         --resume)
-            RESUME="$2"
-            shift 2
+            if [[ $# -ge 2 && "$2" != --* ]]; then
+                RESUME="$2"
+                shift 2
+            else
+                RESUME="__CKPT_DIR__"
+                shift
+            fi
             ;;
         --deepspeed_config)
             DEEPSPEED_CONFIG="$2"
@@ -728,6 +735,10 @@ DATASET_ROOT="${DATASET_ROOT%/}"
 VLM_PATH="${VLM_PATH%/}"
 CKPT_DIR="${CKPT_DIR%/}"
 RESUME="${RESUME%/}"
+if [ "$RESUME" = "__CKPT_DIR__" ]; then
+    RESUME="$CKPT_DIR"
+    echo "[args] --resume 未带路径, 回退到 ckpt_dir 原地续训: $RESUME"
+fi
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WATCHER_PID=""
