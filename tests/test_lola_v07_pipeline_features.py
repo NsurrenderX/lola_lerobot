@@ -5,6 +5,7 @@
 2. Trainer EMA 分片方法 (_ema_register / _ema_update / _ema_rebind) 数学正确性
 3. LoLAV07Config.observation_delta_indices override (obs_prev_chunk_frame)
 4. LoLAV07Policy.inject_prev_chunk_frame chunk 边界缓存行为
+5. Trainer 独立 timer checkpoint 调度语义
 
 运行: python tests/test_lola_v07_pipeline_features.py
 """
@@ -253,6 +254,33 @@ policy._prev_chunk_frames = {"observation.images.top": cam1}
 policy._prev_chunk_frames = None
 out5 = policy.inject_prev_chunk_frame({"observation.images.top": cam4})
 check("缓存清空后首 chunk 自复制", torch.allclose(out5["observation.images.top"][0], cam4))
+
+
+# ------------------------------------------------------- 5. checkpoint timer
+print("[5] Trainer checkpoint timer 调度")
+timer_trainer = object.__new__(LoLAV07Trainer)
+timer_trainer.save_every_n_steps = 10
+timer_trainer.save_every_n_epochs = 2
+timer_trainer.save_every_n_seconds = 3600.0
+timer_trainer.global_step = 20
+timer_trainer.is_main_process = True
+timer_trainer.is_distributed = False
+timer_trainer.device = torch.device("cpu")
+timer_trainer._last_checkpoint_time = 100.0
+timer_trainer._checkpoint_timer_signal = None
+
+reasons = timer_trainer._checkpoint_reasons(batch_idx=3, epoch=1, now=3699.9)
+check("timer 阈值前不触发", reasons == ["step"], str(reasons))
+reasons = timer_trainer._checkpoint_reasons(batch_idx=3, epoch=1, now=3700.0)
+check("timer 到期与 step 合并为一次保存", reasons == ["step", "timer"], str(reasons))
+
+timer_trainer._mark_checkpoint_saved(now=5000.0)
+check("任意成功保存重置 timer", timer_trainer._last_checkpoint_time == 5000.0)
+timer_trainer.global_step = 21
+reasons = timer_trainer._checkpoint_reasons(batch_idx=1, epoch=1, now=8599.9)
+check("重置后重新累计完整 interval", reasons == [], str(reasons))
+reasons = timer_trainer._checkpoint_reasons(batch_idx=0, epoch=2, now=8600.0)
+check("epoch 固定点与 timer 可同时触发", reasons == ["epoch", "timer"], str(reasons))
 
 
 print()

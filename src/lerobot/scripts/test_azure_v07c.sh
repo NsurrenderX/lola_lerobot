@@ -61,6 +61,7 @@ LEARNING_RATE=2.5e-5
 LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=''
 SAVE_EVERY_N_EPOCHS=""
+SAVE_EVERY_N_SECONDS=5400
 GRADIENT_CLIP_VAL=1.0
 
 # 数据集参数
@@ -256,6 +257,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --save_every_n_epochs)
             SAVE_EVERY_N_EPOCHS="$2"
+            shift 2
+            ;;
+        --save_every_n_seconds)
+            SAVE_EVERY_N_SECONDS="$2"
             shift 2
             ;;
         --gradient_clip_val)
@@ -647,6 +652,7 @@ LAUNCH_ARGS+=(
     --batch_size "${BATCH_SIZE}"
     --learning_rate "${LEARNING_RATE}"
     --log_every_n_steps "${LOG_EVERY_N_STEPS}"
+    --save_every_n_seconds "${SAVE_EVERY_N_SECONDS}"
     --gradient_clip_val "${GRADIENT_CLIP_VAL}"
     --vlm_backbone "${VLM_BACKBONE}"
     --action_dim "${ACTION_DIM}"
@@ -1074,6 +1080,9 @@ if [ -n "$SAVE_INTERVAL" ]; then
 fi
 if [ -n "$SAVE_EVERY_N_EPOCHS" ]; then
     cmd="${cmd} --save_every_n_epochs ${SAVE_EVERY_N_EPOCHS}"
+fi
+if [ -n "$SAVE_EVERY_N_SECONDS" ]; then
+    cmd="${cmd} --save_every_n_seconds ${SAVE_EVERY_N_SECONDS}"
 fi
 
 # 数据集参数

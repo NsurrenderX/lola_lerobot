@@ -830,6 +830,7 @@ class LoLAV07Trainer:
         ckpt_dir: str = "/data_16T/deepseek/checkpoints/lola",
         save_every_n_steps: int | None = 500,
         save_every_n_epochs: int | None = None,
+        save_every_n_seconds: float | None = None,
         log_every_n_steps: int = 10,
         # Wandb 参数
         wandb_project: str = "lola-azure",
@@ -862,6 +863,7 @@ class LoLAV07Trainer:
         self.ckpt_dir = ckpt_dir
         self.save_every_n_steps = save_every_n_steps
         self.save_every_n_epochs = save_every_n_epochs
+        self.save_every_n_seconds = save_every_n_seconds
         self.log_every_n_steps = log_every_n_steps
         self.current_epoch = 0
         # 原地续训 (方案 B): main() 判定 resume 配置匹配后赋值为被续训的 run 目录,
@@ -927,6 +929,11 @@ class LoLAV07Trainer:
         # _ema_rebind 以当前权重初始化 VLM 分片并继续跟踪。
         self._ema_state = None
 
+        # Wall-clock checkpoint timer is rank-0-owned. The trigger is broadcast
+        # so every rank enters DeepSpeed's collective save on the same step.
+        self._last_checkpoint_time = None
+        self._checkpoint_timer_signal = None
+
     # ────────────────────────────────────────────────────────────────
     # EMA (全模型, ZeRO-3 分片本地维护)
     # ────────────────────────────────────────────────────────────────
@@ -979,6 +986,42 @@ class LoLAV07Trainer:
                 n_reinit += 1
         self._ema_state = new_state
         _log(f"[EMA] engine 重建后重绑: 保留 {n_kept}, 新增 {n_new} (VLM), 重启 {n_reinit}")
+
+    def _timer_checkpoint_due(self, now: float | None = None) -> bool:
+        """Return a rank-consistent wall-clock checkpoint decision."""
+        if self.save_every_n_seconds is None:
+            return False
+
+        timer_due = False
+        if self.is_main_process and self._last_checkpoint_time is not None:
+            current_time = time.monotonic() if now is None else now
+            timer_due = current_time - self._last_checkpoint_time >= self.save_every_n_seconds
+
+        if self.is_distributed:
+            if self._checkpoint_timer_signal is None:
+                self._checkpoint_timer_signal = torch.zeros(1, dtype=torch.uint8, device=self.device)
+            if self.is_main_process:
+                self._checkpoint_timer_signal.fill_(timer_due)
+            dist.broadcast(self._checkpoint_timer_signal, src=0)
+            timer_due = bool(self._checkpoint_timer_signal.item())
+
+        return timer_due
+
+    def _checkpoint_reasons(self, batch_idx: int, epoch: int, now: float | None = None) -> list[str]:
+        """Collect periodic checkpoint triggers, coalescing overlaps into one save."""
+        reasons = []
+        if self.save_every_n_steps is not None and self.global_step % self.save_every_n_steps == 0:
+            reasons.append("step")
+        if self.save_every_n_epochs is not None and batch_idx == 0 and epoch % self.save_every_n_epochs == 0:
+            reasons.append("epoch")
+        if self._timer_checkpoint_due(now):
+            reasons.append("timer")
+        return reasons
+
+    def _mark_checkpoint_saved(self, now: float | None = None):
+        """Restart the rank-0 wall-clock interval after any successful periodic save."""
+        if self.is_main_process and self.save_every_n_seconds is not None:
+            self._last_checkpoint_time = time.monotonic() if now is None else now
 
     def setup_model(self):
         # Enable cuDNN SDPA backend for Blackwell GPUs (cuDNN 9.10+ has dedicated kernels)
@@ -2033,6 +2076,12 @@ class LoLAV07Trainer:
 
                 self.global_step += 1
 
+                # Start the wall-clock interval at the first productive update.
+                # Resume batch skipping and model setup time do not consume the interval.
+                if (self.is_main_process and self.save_every_n_seconds is not None
+                        and self._last_checkpoint_time is None):
+                    self._last_checkpoint_time = time.monotonic()
+
                 # EMA 更新 (optimizer.step 之后, 本地 shard 原地更新, 无通信)
                 if self._ema_state is not None:
                     self._ema_update()
@@ -2184,17 +2233,31 @@ class LoLAV07Trainer:
                                 log_dict[f"memory/gpu{i}_alloc_pct"] = a.item()
                             wandb.log(log_dict)
 
-                # 保存 checkpoint
-                should_save = False
-                if self.save_every_n_steps is not None and self.global_step % self.save_every_n_steps == 0:
-                    should_save = True
-                if self.save_every_n_epochs is not None and batch_idx == 0 and epoch % self.save_every_n_epochs == 0:
-                    should_save = True
+                # 保存 checkpoint: step/epoch 是固定评估点, timer 是独立的最大保存间隔兜底。
+                # 任意触发成功后都会重置 timer; 同一步多条件命中只保存一次。
+                checkpoint_reasons = self._checkpoint_reasons(batch_idx, epoch)
+                should_save = bool(checkpoint_reasons)
+                checkpoint_start = None
+                if should_save and self.is_main_process:
+                    checkpoint_start = time.monotonic()
+                    _log(f"Checkpoint triggered at step {self.global_step}: "
+                         f"reasons={'+'.join(checkpoint_reasons)}")
                 if self.strategy == "deepspeed":
                     if should_save:
-                        self.save_checkpoint(ckpt_dir, self.global_step)
+                        self.save_checkpoint(
+                            ckpt_dir, self.global_step, checkpoint_reasons=checkpoint_reasons
+                        )
                 elif should_save and self.is_main_process:
-                    self.save_checkpoint(ckpt_dir, self.global_step)
+                    self.save_checkpoint(
+                        ckpt_dir, self.global_step, checkpoint_reasons=checkpoint_reasons
+                    )
+                if should_save:
+                    checkpoint_completed = time.monotonic()
+                    self._mark_checkpoint_saved(checkpoint_completed)
+                    if self.is_main_process:
+                        _log(f"Checkpoint completed at step {self.global_step}: "
+                             f"duration={checkpoint_completed - checkpoint_start:.1f}s, "
+                             f"timer reset")
 
         # 保存最终 checkpoint
         if self.strategy == "deepspeed":
@@ -2211,15 +2274,27 @@ class LoLAV07Trainer:
         if self.use_wandb:
             wandb.finish()
 
-    def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
+    def save_checkpoint(
+        self,
+        ckpt_dir: str,
+        step: int,
+        is_final: bool = False,
+        checkpoint_reasons: list[str] | None = None,
+    ):
         """保存 checkpoint"""
-        extra_state = {"vlm_unfrozen": self._vlm_unfrozen, "global_step": self.global_step}
+        checkpoint_reasons = checkpoint_reasons or (["final"] if is_final else [])
+        extra_state = {
+            "vlm_unfrozen": self._vlm_unfrozen,
+            "global_step": self.global_step,
+            "checkpoint_reasons": checkpoint_reasons,
+        }
         if self.strategy == "deepspeed":
             tag = f"step_{step:06d}" if not is_final else "final"
             client_state = {
                 "step": step,
                 "epoch": self.current_epoch,
                 "vlm_unfrozen": self._vlm_unfrozen,
+                "checkpoint_reasons": checkpoint_reasons,
             }
             self.model.save_checkpoint(
                 save_dir=ckpt_dir,
@@ -2289,6 +2364,7 @@ class LoLAV07Trainer:
                 "vlm_unfrozen": self._vlm_unfrozen,
                 "global_step": self.global_step,
                 "ema_state": self._ema_state,
+                "checkpoint_reasons": checkpoint_reasons,
             }, ckpt_path)
 
         _log(f"Checkpoint saved: {ckpt_path}")
@@ -2559,6 +2635,8 @@ def build_arg_parser():
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--save_every_n_steps", type=int, default=None, help="Save checkpoint every N steps (mutually exclusive with --save_every_n_epochs)")
     parser.add_argument("--save_every_n_epochs", type=int, default=None, help="Save checkpoint every N epochs (mutually exclusive with --save_every_n_steps)")
+    parser.add_argument("--save_every_n_seconds", type=float, default=None,
+                        help="Maximum wall-clock seconds between periodic checkpoints; independent of step/epoch saves")
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
 
     # 模型参数
@@ -2786,6 +2864,8 @@ def main():
     # 检查保存间隔参数
     if args.save_every_n_steps is not None and args.save_every_n_epochs is not None:
         raise ValueError("--save_every_n_steps and --save_every_n_epochs are mutually exclusive. Please specify only one.")
+    if args.save_every_n_seconds is not None and args.save_every_n_seconds <= 0:
+        raise ValueError("--save_every_n_seconds must be positive when provided.")
 
     # 检查 DeepSpeed 可用性
     if args.strategy == "deepspeed" and not HAS_DEEPSPEED:
@@ -2972,6 +3052,7 @@ def main():
         ckpt_dir=args.ckpt_dir,
         save_every_n_steps=args.save_every_n_steps,
         save_every_n_epochs=args.save_every_n_epochs,
+        save_every_n_seconds=args.save_every_n_seconds,
         log_every_n_steps=args.log_every_n_steps,
         # Wandb 参数
         wandb_project=args.wandb_project,
