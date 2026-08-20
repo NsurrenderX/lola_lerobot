@@ -95,6 +95,9 @@ class LoLAConfig(PreTrainedConfig):
     vlm_unfreeze_v_loss_threshold: float = 0.3  # v_loss < threshold 时动态解冻 VLM（0 = 禁用自动解冻；仅在 train_vlm=True 时生效）
     vlm_lr_mult: float = 1.5  # VLM 解冻后峰值 LR = base_lr × 此倍率
     use_special_tokens: bool = False  # 是否在 DiT 序列中插入 5 个特殊 token（vlm_start/end, hist_start/end, previous_task_end）
+    use_previous_task_end: bool = True  # False 时禁用 transition/task 拆分与 previous_task_end token（方案B）：
+                                        # 历史作为连续序列（hist_start + all chunks + hist_end），
+                                        # 边界语义交给 completed-task 文本。仅在 use_special_tokens=True 时有意义。
     
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None

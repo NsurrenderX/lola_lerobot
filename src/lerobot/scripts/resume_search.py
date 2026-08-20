@@ -61,6 +61,29 @@ LOLA_CONFIG_EXCLUDE_KEYS = frozenset({
     "dit_gradient_checkpointing",
 })
 
+# 候选 training_config.json 缺失键的回填默认值 = 该字段引入前的旧行为。
+# (新增 lola_config 字段会自动纳入比较, 但改动前的存量 run 的 json 里没有该键,
+#  不回填则全部假失配; 回填值必须与字段引入前的实际行为一致, 而非当前默认值)
+LOLA_CONFIG_LEGACY_DEFAULTS = {
+    # 2026-08-20 引入: 禁用 transition/task 拆分与 previous_task_end 的方案B 旋钮。
+    # 引入前所有 run 均为拆分 + previous_task_end 行为 (=True)。
+    "use_previous_task_end": True,
+}
+
+
+def resolve_merge_history_stream(ta: dict) -> bool:
+    """merge_history_stream 三态解析 (快照与 train main 同源, 保证判定=实际行为)。
+
+    显式 --merge_history_stream > 显式 --no_merge_history_stream > 跟随
+    --no_previous_task_end 旋钮 > 默认 False。候选 json 三键全缺 (字段引入前的
+    存量 run) → False, 即旧两段式数据行为。
+    """
+    if ta.get("merge_history_stream"):
+        return True
+    if ta.get("no_merge_history_stream"):
+        return False
+    return bool(ta.get("no_previous_task_end", False))
+
 # training_args 比较白名单: 影响训练语义或 checkpoint 兼容性的键。
 # 语义覆盖说明: 大部分模型/训练超参住在 lola_config 里 (全量比较), 这里只补
 # lola_config 之外的训练语义。排除: 路径 (dataset_root/ckpt_dir/resume/vlm_path),
@@ -118,30 +141,38 @@ def build_current_snapshot(args, lola_config, dataset_metadata_dict, world_size)
         world_size: 分布式总进程数
     """
     ta = vars(args)
+    training_args = {k: canon(ta[k]) for k in sorted(TRAINING_ARGS_INCLUDE_KEYS) if k in ta}
+    # merge_history_stream: 数据流语义 (两段式 vs 连续流), 以解析后布尔值入快照。
+    # 不用原始三态键 — 同一语义的多种 CLI 写法 (旋钮联动 vs 显式指定) 不能假失配
+    training_args["merge_history_stream"] = resolve_merge_history_stream(ta)
     return {
         "lola_config": {
             k: v for k, v in canon(dataclasses.asdict(lola_config)).items()
             if k not in LOLA_CONFIG_EXCLUDE_KEYS
         },
-        "training_args": {
-            k: canon(ta[k]) for k in sorted(TRAINING_ARGS_INCLUDE_KEYS) if k in ta
-        },
+        "training_args": training_args,
         "distributed": {"world_size": int(world_size)},
         "dataset_metadata": canon(dataset_metadata_dict),
     }
 
 
 def _candidate_comparable(candidate_json):
-    """从磁盘 training_config.json 提取可比较子集 (与 build_current_snapshot 同构)。"""
+    """从磁盘 training_config.json 提取可比较子集 (与 build_current_snapshot 同构)。
+
+    缺失键按"字段引入前的旧行为"回填: 改动前的存量 run 不会因新字段引入而假失配。
+    """
+    cand_cfg = {
+        k: v for k, v in (candidate_json.get("lola_config") or {}).items()
+        if k not in LOLA_CONFIG_EXCLUDE_KEYS
+    }
+    for k, v in LOLA_CONFIG_LEGACY_DEFAULTS.items():
+        cand_cfg.setdefault(k, v)
+    cand_ta = candidate_json.get("training_args") or {}
+    training_args = {k: v for k, v in cand_ta.items() if k in TRAINING_ARGS_INCLUDE_KEYS}
+    training_args["merge_history_stream"] = resolve_merge_history_stream(cand_ta)
     return {
-        "lola_config": {
-            k: v for k, v in (candidate_json.get("lola_config") or {}).items()
-            if k not in LOLA_CONFIG_EXCLUDE_KEYS
-        },
-        "training_args": {
-            k: v for k, v in (candidate_json.get("training_args") or {}).items()
-            if k in TRAINING_ARGS_INCLUDE_KEYS
-        },
+        "lola_config": cand_cfg,
+        "training_args": training_args,
         "distributed": {
             "world_size": (candidate_json.get("distributed") or {}).get("world_size")
         },

@@ -114,6 +114,11 @@ VLM_LR_MULT=1.5
 
 # Special tokens
 USE_SPECIAL_TOKENS=false
+# 方案B: false 时禁用 transition/task 拆分与 previous_task_end token,
+# 历史走连续序列 (hist_start + all chunks + hist_end), 边界语义交给 completed-task 文本
+USE_PREVIOUS_TASK_END=true
+# 方案B 数据集侧: auto=跟随 USE_PREVIOUS_TASK_END (false->合并), true/false=显式覆盖 (消融用)
+MERGE_HISTORY_STREAM=auto
 
 # 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
 NORM_MODE="zscore"
@@ -410,6 +415,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --use_special_tokens)
             USE_SPECIAL_TOKENS=true
+            shift
+            ;;
+        --no_previous_task_end)
+            USE_PREVIOUS_TASK_END=false
+            shift
+            ;;
+        --merge_history_stream)
+            MERGE_HISTORY_STREAM=true
+            shift
+            ;;
+        --no_merge_history_stream)
+            MERGE_HISTORY_STREAM=false
             shift
             ;;
 
@@ -714,6 +731,14 @@ fi
 # Special tokens
 if [ "$USE_SPECIAL_TOKENS" = true ]; then
     cmd="${cmd} --use_special_tokens"
+fi
+if [ "$USE_PREVIOUS_TASK_END" = false ]; then
+    cmd="${cmd} --no_previous_task_end"
+fi
+if [ "$MERGE_HISTORY_STREAM" = true ]; then
+    cmd="${cmd} --merge_history_stream"
+elif [ "$MERGE_HISTORY_STREAM" = false ]; then
+    cmd="${cmd} --no_merge_history_stream"
 fi
 
 echo "Running: $cmd"

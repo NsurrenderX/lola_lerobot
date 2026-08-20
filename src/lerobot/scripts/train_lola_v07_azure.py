@@ -92,7 +92,13 @@ from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.factory import make_pre_post_processors
 
 # resume 搜索 (同目录模块; run 集合目录 → 按训练配置匹配并选步数最多者)
-from resume_search import build_current_snapshot, diff_snapshot, make_serializable, resolve_resume_auto
+from resume_search import (
+    build_current_snapshot,
+    diff_snapshot,
+    make_serializable,
+    resolve_merge_history_stream,
+    resolve_resume_auto,
+)
 
 # 设置日志
 logging.basicConfig(
@@ -568,6 +574,8 @@ def create_lola_dataset(
     completed_tasks_use_ann: bool = True,
     completed_tasks_history_len: int = 5,
     max_transition_len: int = 64,
+    # 方案B: 合并 transition + task 为连续历史流
+    merge_history_stream: bool = False,
     # Stats mode for z-score normalization
     stats_mode: str = "original",
 ) -> LeRobotDataset | LoLADataset:
@@ -608,6 +616,7 @@ def create_lola_dataset(
             completed_tasks_history_len=completed_tasks_history_len,
             hist_action_token_drop_rate=config.hist_action_token_drop_rate,
             max_transition_len=max_transition_len,
+            merge_history_stream=merge_history_stream,
             stats_mode=stats_mode,
         )
     else:
@@ -658,7 +667,7 @@ class _ZScoreActionDataset:
         return item
 
 
-def make_collate_fn(static_max_len: int | None = None):
+def make_collate_fn(static_max_len: int | None = None, chunk_size: int | None = None):
     """Create a collate function with optional static padding length.
 
     If static_max_len is provided, hist_actions_full and hist_actions_mask
@@ -667,10 +676,37 @@ def make_collate_fn(static_max_len: int | None = None):
     DeepSpeed ZeRO-2 reduce-scatter timing.
 
     If static_max_len is None, falls back to dynamic per-batch padding.
+
+    Padding scheme ("middle padding", requires chunk_size):
+    Each item's history is laid out as [transition_padded | task_padded] with
+    the transition block starting at index 0 (see LoLADataset). The model
+    locates the transition/task boundary by slicing the FIRST max_n_tc chunks,
+    so blanket left-padding of the merged sequence would shift the boundary
+    and feed zero-padding as "transition" context. Instead, each segment is
+    left-padded INDEPENDENTLY:
+
+        [t_left_pad | transition | k_left_pad | task]
+         └─ to batch max_n_tc ──┘  └─ right-aligned ──┘
+
+    In static mode, total length = static_max_len every step:
+    t_target = batch_max_n_tc * chunk_size, k_target = static_max_len - t_target
+    (the boundary moves per step but the tensor SHAPE is constant, and the
+    model reads max_n_tc from the batch so the two stay consistent).
     """
     variable_length_keys = {"hist_actions_full", "hist_actions_mask", "hist_states_full", "hist_states_mask"}
 
     def collate_fn(batch):
+        # Per-sample transition chunk counts (0 when key absent, e.g. LeRobotDataset)
+        n_tc_list = []
+        for item in batch:
+            n_tc = item.get("n_transition_chunks", 0)
+            n_tc_list.append(int(n_tc.item()) if isinstance(n_tc, torch.Tensor) else int(n_tc))
+        has_transition_info = any("n_transition_chunks" in item for item in batch)
+        # Middle padding applies only when we know chunk_size and the dataset
+        # provides transition boundaries; otherwise fall back to legacy left pad.
+        use_middle_padding = chunk_size is not None and has_transition_info
+        t_target = (max(n_tc_list) * chunk_size) if use_middle_padding else 0
+
         result = {}
         for key in batch[0].keys():
             values = [item[key] for item in batch]
@@ -682,19 +718,48 @@ def make_collate_fn(static_max_len: int | None = None):
             elif key.startswith("observation.images."):
                 result[key] = values
             elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
-                max_len = static_max_len if static_max_len is not None else max(v.shape[0] for v in values)
                 padded_values = []
-                for v in values:
-                    if v.shape[0] < max_len:
-                        pad_len = max_len - v.shape[0]
-                        if key in {"hist_actions_full", "hist_states_full"}:
-                            padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
-                        else:
-                            padding = torch.zeros(pad_len, dtype=v.dtype)
-                        v = torch.cat([padding, v], dim=0)  # left padding
-                    elif v.shape[0] > max_len:
-                        v = v[-max_len:]  # truncate from left (keep most recent)
-                    padded_values.append(v)
+                if use_middle_padding:
+                    # Per-segment targets; k_target absorbs the rest of the budget
+                    if static_max_len is not None:
+                        k_target = max(static_max_len - t_target, 0)
+                    else:
+                        k_target = max(
+                            v.shape[0] - n_tc * chunk_size for v, n_tc in zip(values, n_tc_list)
+                        )
+                    for v, n_tc in zip(values, n_tc_list):
+                        t_len = n_tc * chunk_size
+                        t_part, k_part = v[:t_len], v[t_len:]
+
+                        # Transition segment: left-pad to t_target (never longer by construction)
+                        t_pad = t_target - t_part.shape[0]
+                        if t_pad > 0:
+                            pad_shape = (t_pad,) + tuple(t_part.shape[1:])
+                            t_part = torch.cat([torch.zeros(pad_shape, dtype=v.dtype), t_part], dim=0)
+
+                        # Task segment: left-pad (or left-truncate, keep most recent) to k_target
+                        if k_part.shape[0] < k_target:
+                            k_pad = k_target - k_part.shape[0]
+                            pad_shape = (k_pad,) + tuple(k_part.shape[1:])
+                            k_part = torch.cat([torch.zeros(pad_shape, dtype=v.dtype), k_part], dim=0)
+                        elif k_part.shape[0] > k_target:
+                            k_part = k_part[-k_target:] if k_target > 0 else k_part[:0]
+
+                        padded_values.append(torch.cat([t_part, k_part], dim=0))
+                else:
+                    # Legacy: left-pad the merged sequence
+                    max_len = static_max_len if static_max_len is not None else max(v.shape[0] for v in values)
+                    for v in values:
+                        if v.shape[0] < max_len:
+                            pad_len = max_len - v.shape[0]
+                            if key in {"hist_actions_full", "hist_states_full"}:
+                                padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
+                            else:
+                                padding = torch.zeros(pad_len, dtype=v.dtype)
+                            v = torch.cat([padding, v], dim=0)  # left padding
+                        elif v.shape[0] > max_len:
+                            v = v[-max_len:]  # truncate from left (keep most recent)
+                        padded_values.append(v)
                 result[key] = torch.stack(padded_values)
             elif isinstance(values[0], torch.Tensor):
                 result[key] = torch.stack(values)
@@ -2551,6 +2616,7 @@ def build_lola_config(args, dataset_metadata):
         vlm_unfreeze_v_loss_threshold=args.vlm_unfreeze_v_loss_threshold,
         vlm_lr_mult=args.vlm_lr_mult,
         use_special_tokens=args.use_special_tokens,
+        use_previous_task_end=not args.no_previous_task_end,
         max_image_pixels=args.max_image_pixels,
         min_image_pixels=args.min_image_pixels,
         gripper_loss_weight=args.gripper_loss_weight,
@@ -2696,6 +2762,13 @@ def build_arg_parser():
                         help="VLM LR multiplier after unfreezing: peak_lr = base_lr * vlm_lr_mult")
     parser.add_argument("--use_special_tokens", action="store_true",
                         help="Insert 5 special tokens in DiT sequence (vlm_start/end, hist_start/end, previous_task_end)")
+    parser.add_argument("--no_previous_task_end", action="store_true",
+                        help="方案B: 禁用 transition/task 拆分与 previous_task_end token, "
+                             "历史走连续序列 (hist_start + all chunks + hist_end), 边界语义交给 completed-task 文本")
+    parser.add_argument("--merge_history_stream", action="store_true", default=None,
+                        help="方案B 数据集侧: 合并 transition+task 为连续历史流 (默认跟随 --no_previous_task_end)")
+    parser.add_argument("--no_merge_history_stream", action="store_true",
+                        help="显式关闭合并历史流 (用于消融: 方案B模型 + 两段式数据)")
     parser.add_argument("--max_image_pixels", type=int, default=230400,
                         help="每张图片最大像素数（控制 visual token 数）")
     parser.add_argument("--min_image_pixels", type=int, default=65536,
@@ -2981,6 +3054,14 @@ def main():
              f"c={args.image_aug_contrast} s={args.image_aug_saturation} "
              f"t={args.image_aug_translate} scale=[{args.image_aug_scale_min}, {args.image_aug_scale_max}]")
 
+    # 方案B 数据集侧: 合并历史流默认跟随 --no_previous_task_end 旋钮,
+    # 可用 --merge_history_stream / --no_merge_history_stream 显式覆盖 (消融用)。
+    # 解析与 resume 快照同源 (resume_search.resolve_merge_history_stream),
+    # 保证"实际训练行为"与"resume 匹配判定"一致
+    merge_history_stream = resolve_merge_history_stream(vars(args))
+    if merge_history_stream:
+        _log("merge_history_stream enabled: transition+task merged into one continuous history stream")
+
     train_dataset = create_lola_dataset(
         repo_id=args.dataset_repo_id,
         config=config,
@@ -3003,6 +3084,7 @@ def main():
         completed_tasks_use_ann=config.completed_tasks_use_ann,
         completed_tasks_history_len=config.completed_tasks_history_len,
         max_transition_len=config.max_transition_len,
+        merge_history_stream=merge_history_stream,
         stats_mode=args.stats_mode,
     )
     _log(f"Dataset size: {len(train_dataset)}")
@@ -3024,7 +3106,7 @@ def main():
     static_max_len = args.max_history_length if use_static_padding else None
     if static_max_len is not None:
         _log(f"Using static collate padding to max_history_length={static_max_len}")
-    collate = make_collate_fn(static_max_len=static_max_len)
+    collate = make_collate_fn(static_max_len=static_max_len, chunk_size=args.action_chunk_size)
 
     train_loader = DataLoader(
         train_dataset,

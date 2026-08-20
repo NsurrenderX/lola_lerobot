@@ -504,6 +504,11 @@ class LoLAV07Pytorch(nn.Module):
             max_n_tc = n_transition_chunks  # already batch-max from Policy layer
             n_tc_batch = n_transition_chunks_batch  # [B] tensor for per-sample mask
 
+            # 方案B 旋钮: 禁用 transition/task 拆分与 previous_task_end,
+            # 历史走连续序列 (hist_start + all chunks + hist_end), 边界语义交给文本
+            if not getattr(self.config, "use_previous_task_end", True):
+                max_n_tc = 0
+
             # 提升 expand 到单次调用: 同一 Parameter 在计算图中只被消费一次
             # (ZeRO-3 resume 后, 双重 AccumulateGrad 会命中 grad 分区视图的 shape 失配)
             hist_start = self.dit.hist_start_emb.expand(b, -1, -1)
@@ -517,9 +522,12 @@ class LoLAV07Pytorch(nn.Module):
                 grip_transition = grip_hist[:, :max_n_tc, :]
                 grip_task = grip_hist[:, max_n_tc:, :]
 
-                # Per-sample transition validity mask [B, max_n_tc]
-                tc_range = torch.arange(max_n_tc, device=device).unsqueeze(0)  # [1, max_n_tc]
-                tc_valid = tc_range < n_tc_batch.unsqueeze(1)  # [B, max_n_tc]
+                # Per-sample transition validity 不再使用独立的 tc_valid 层:
+                # 历史数据在 transition 槽位内是右对齐的 (dataset + collate 均左 pad),
+                # 而 tc_valid = arange < n_tc 标记的是左端 (pad 区), 方向相反 —
+                # 非 batch-max 样本的 transition 上下文会被整体误杀。
+                # 真实 chunk mask 随数据走、无方向问题, 且已编码 pad 与
+                # transition_mask_rate 的 drop, 直接作为 transition 段 mask。
 
                 # previous_task_end validity: per-sample, only if n_tc > 0 for that sample
                 pte_valid = (n_tc_batch > 0)  # [B]
@@ -532,9 +540,10 @@ class LoLAV07Pytorch(nn.Module):
                     arm_task,
                     hist_end,
                 ], dim=1)
+                # transition 段 mask 直接用真实 chunk mask (随数据右对齐, 含 pad/drop 信息)
                 arm_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
-                    tc_valid,                                          # transition chunks (per-sample)
+                    arm_hist_mask_base[:, :max_n_tc],                   # transition chunks (per-sample)
                     pte_valid.unsqueeze(1),                            # previous_task_end
                     arm_hist_mask_base[:, max_n_tc:],                 # task chunks
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
@@ -550,7 +559,7 @@ class LoLAV07Pytorch(nn.Module):
                 ], dim=1)
                 grip_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_start
-                    tc_valid,                                          # transition chunks (per-sample)
+                    grip_hist_mask_base[:, :max_n_tc],                  # transition chunks (per-sample)
                     pte_valid.unsqueeze(1),                            # previous_task_end
                     grip_hist_mask_base[:, max_n_tc:],                 # task chunks
                     torch.ones(b, 1, dtype=torch.bool, device=device),  # hist_end
@@ -746,6 +755,9 @@ class LoLAV07Pytorch(nn.Module):
         # Handle n_transition_chunks default
         if n_transition_chunks is None:
             n_transition_chunks = 0
+        # 方案B 旋钮: 推理同样禁用 transition/task 拆分
+        if not getattr(self.config, "use_previous_task_end", True):
+            n_transition_chunks = 0
 
         # ── Special token handling for inference ──
         use_st = self.config.use_special_tokens
@@ -811,7 +823,7 @@ class LoLAV07Pytorch(nn.Module):
                 ], dim=1)
             else:
                 arm_stream = torch.cat([
-                    hist_start,
+                    self.dit.hist_start_emb.expand(b, -1, -1),
                     arm_hist,
                     self.dit.hist_end_emb.expand(b, -1, -1),
                 ], dim=1)
@@ -821,7 +833,7 @@ class LoLAV07Pytorch(nn.Module):
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                 ], dim=1)
                 grip_stream = torch.cat([
-                    hist_start,
+                    self.dit.hist_start_emb.expand(b, -1, -1),
                     grip_hist,
                     self.dit.hist_end_emb.expand(b, -1, -1),
                 ], dim=1)

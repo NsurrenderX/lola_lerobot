@@ -148,6 +148,8 @@ class LoLADataset(LeRobotDataset):
         hist_action_token_drop_rate: float = 0.0,
         max_transition_len: int = 64,
         completed_tasks_history_len: int = 5,
+        # 方案B: 合并 transition + task 为连续历史流 (不再两段式分别 padding)
+        merge_history_stream: bool = False,
         # Stats mode for z-score normalization
         stats_mode: str = "original",  # "original" or "incremental"
     ):
@@ -202,6 +204,10 @@ class LoLADataset(LeRobotDataset):
         self.completed_tasks_use_ann = completed_tasks_use_ann
         self.hist_action_token_drop_rate = hist_action_token_drop_rate
         self.completed_tasks_history_len = completed_tasks_history_len
+        # 方案B: True 时历史为 [transition_raw | task_raw] 连续流, 整体左截断 +
+        # 单次左 pad, 无段间 mask 空洞; n_transition_chunks 恒为 0。
+        # drop rate 仍在合并前按来源分段施加, 语义与两段式一致。
+        self.merge_history_stream = merge_history_stream
 
         # Z-score normalization stats (computed from dataset metadata)
         # stats_mode: "original" uses default stats keys, "incremental" uses _incremental keys
@@ -301,6 +307,7 @@ class LoLADataset(LeRobotDataset):
         print(f"[LoLADataset] max_history_length: {max_history_length}")
         print(f"[LoLADataset] action_chunk_size: {action_chunk_size}")
         print(f"[LoLADataset] history_padding_side: {history_padding_side}")
+        print(f"[LoLADataset] merge_history_stream: {self.merge_history_stream}")
         print(f"[LoLADataset] action_dim: {self.action_dim}")
         print(f"[LoLADataset] stats_mode: {self.stats_mode}")
 
@@ -487,46 +494,93 @@ class LoLADataset(LeRobotDataset):
                 mask = torch.cat([padding_mask, mask], dim=0)
             return data, mask, padded_length
 
-        # ── Transition part ──
-        if transition_data is not None and n_transition > 0:
-            t_mask = torch.ones(n_transition, dtype=torch.bool)
-            # Pure transition chunks: apply transition_mask_rate per chunk
-            if self.transition_mask_rate > 0 and n_transition >= chunk_size:
-                num_t_chunks = n_transition // chunk_size
-                for ci in range(num_t_chunks):
-                    if random.random() < self.transition_mask_rate:
-                        t_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
-                # Ensure at least one valid chunk
-                if int(t_mask.sum().item()) == 0 and n_transition >= chunk_size:
-                    t_mask[:chunk_size] = True
-            t_max = max_total_len  # transition can use up to full max_history_length
-            t_data, t_mask, t_padded_len = _pad_to_chunk_size(transition_data, t_mask, chunk_size, t_max)
-            n_transition_chunks = t_padded_len // chunk_size
-        else:
+        if self.merge_history_stream:
+            # ── 方案B: 连续历史流 ──
+            # drop mask 在合并前按来源分段施加 (语义与两段式一致),
+            # 合并后整体左截断 + 单次左 pad — 无段间 mask 空洞, 无双倍 pad 预算浪费。
             dim = self.state_dim if self.history_type == "state" else self.action_dim
-            t_data = torch.zeros(0, dim, dtype=torch.float32)
-            t_mask = torch.zeros(0, dtype=torch.bool)
+            seg_data, seg_mask = [], []
+            if transition_data is not None and n_transition > 0:
+                t_mask = torch.ones(n_transition, dtype=torch.bool)
+                # Pure transition chunks: apply transition_mask_rate per chunk
+                if self.transition_mask_rate > 0 and n_transition >= chunk_size:
+                    num_t_chunks = n_transition // chunk_size
+                    for ci in range(num_t_chunks):
+                        if random.random() < self.transition_mask_rate:
+                            t_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                    # Ensure at least one valid chunk
+                    if int(t_mask.sum().item()) == 0 and n_transition >= chunk_size:
+                        t_mask[:chunk_size] = True
+                seg_data.append(transition_data)
+                seg_mask.append(t_mask)
+            if task_data is not None and task_data.shape[0] > 0:
+                task_len = task_data.shape[0]
+                k_mask = torch.ones(task_len, dtype=torch.bool)
+                # Pure task chunks: apply hist_action_token_drop_rate per chunk
+                if self.hist_action_token_drop_rate > 0 and task_len >= chunk_size:
+                    num_k_chunks = task_len // chunk_size
+                    for ci in range(num_k_chunks):
+                        if random.random() < self.hist_action_token_drop_rate:
+                            k_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                    # Ensure at least one valid chunk
+                    if int(k_mask.sum().item()) == 0 and task_len >= chunk_size:
+                        k_mask[:chunk_size] = True
+                seg_data.append(task_data)
+                seg_mask.append(k_mask)
+            if seg_data:
+                m_data = torch.cat(seg_data, dim=0)
+                m_mask = torch.cat(seg_mask, dim=0)
+                # Step 2 已保证总长 <= max_total_len, 这里只做单次左 pad 到 chunk 倍数
+                t_data, t_mask, _ = _pad_to_chunk_size(m_data, m_mask, chunk_size, max_total_len)
+            else:
+                t_data = torch.zeros(0, dim, dtype=torch.float32)
+                t_mask = torch.zeros(0, dtype=torch.bool)
+            # 连续流无 transition/task 边界: n_transition_chunks 恒 0
+            # (collate 中间 padding 退化为整体左 pad, 模型侧不拆分)
             n_transition_chunks = 0
-
-        # ── Task part ──
-        if task_data is not None and task_data.shape[0] > 0:
-            task_len = task_data.shape[0]
-            k_mask = torch.ones(task_len, dtype=torch.bool)
-            # Pure task chunks: apply hist_action_token_drop_rate per chunk
-            if self.hist_action_token_drop_rate > 0 and task_len >= chunk_size:
-                num_k_chunks = task_len // chunk_size
-                for ci in range(num_k_chunks):
-                    if random.random() < self.hist_action_token_drop_rate:
-                        k_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
-                # Ensure at least one valid chunk
-                if int(k_mask.sum().item()) == 0 and task_len >= chunk_size:
-                    k_mask[:chunk_size] = True
-            k_max = max_total_len - t_data.shape[0]  # remaining space after transition
-            k_data, k_mask, k_padded_len = _pad_to_chunk_size(task_data, k_mask, chunk_size, k_max)
-        else:
-            dim = self.state_dim if self.history_type == "state" else self.action_dim
             k_data = torch.zeros(0, dim, dtype=torch.float32)
             k_mask = torch.zeros(0, dtype=torch.bool)
+        else:
+            # ── Transition part ──
+            if transition_data is not None and n_transition > 0:
+                t_mask = torch.ones(n_transition, dtype=torch.bool)
+                # Pure transition chunks: apply transition_mask_rate per chunk
+                if self.transition_mask_rate > 0 and n_transition >= chunk_size:
+                    num_t_chunks = n_transition // chunk_size
+                    for ci in range(num_t_chunks):
+                        if random.random() < self.transition_mask_rate:
+                            t_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                    # Ensure at least one valid chunk
+                    if int(t_mask.sum().item()) == 0 and n_transition >= chunk_size:
+                        t_mask[:chunk_size] = True
+                t_max = max_total_len  # transition can use up to full max_history_length
+                t_data, t_mask, t_padded_len = _pad_to_chunk_size(transition_data, t_mask, chunk_size, t_max)
+                n_transition_chunks = t_padded_len // chunk_size
+            else:
+                dim = self.state_dim if self.history_type == "state" else self.action_dim
+                t_data = torch.zeros(0, dim, dtype=torch.float32)
+                t_mask = torch.zeros(0, dtype=torch.bool)
+                n_transition_chunks = 0
+
+            # ── Task part ──
+            if task_data is not None and task_data.shape[0] > 0:
+                task_len = task_data.shape[0]
+                k_mask = torch.ones(task_len, dtype=torch.bool)
+                # Pure task chunks: apply hist_action_token_drop_rate per chunk
+                if self.hist_action_token_drop_rate > 0 and task_len >= chunk_size:
+                    num_k_chunks = task_len // chunk_size
+                    for ci in range(num_k_chunks):
+                        if random.random() < self.hist_action_token_drop_rate:
+                            k_mask[ci * chunk_size : (ci + 1) * chunk_size] = False
+                    # Ensure at least one valid chunk
+                    if int(k_mask.sum().item()) == 0 and task_len >= chunk_size:
+                        k_mask[:chunk_size] = True
+                k_max = max_total_len - t_data.shape[0]  # remaining space after transition
+                k_data, k_mask, k_padded_len = _pad_to_chunk_size(task_data, k_mask, chunk_size, k_max)
+            else:
+                dim = self.state_dim if self.history_type == "state" else self.action_dim
+                k_data = torch.zeros(0, dim, dtype=torch.float32)
+                k_mask = torch.zeros(0, dtype=torch.bool)
 
         # ── Step 4: Merge ──
         # Concatenate as [transition_padded | task_padded]
