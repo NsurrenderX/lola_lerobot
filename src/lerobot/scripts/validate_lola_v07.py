@@ -104,14 +104,8 @@ def extract_special_fields(batch):
     经过 preprocessor (任务文本模板在 processor 内组装)。
     """
     special_data = {}
-    keys_to_extract = [
-        "hist_actions_full", "hist_actions_mask", "hist_actions_length",
-        "hist_states_full", "hist_states_mask", "hist_states_length",
-        "n_transition", "n_transition_chunks",
-    ]
-    for key in keys_to_extract:
-        if key in batch:
-            special_data[key] = batch.pop(key)
+    for key in [k for k in batch if k.startswith(("hist_", "n_transition"))]:
+        special_data[key] = batch.pop(key)
     if "action" in batch:
         special_data["action"] = batch.pop("action")
     return special_data

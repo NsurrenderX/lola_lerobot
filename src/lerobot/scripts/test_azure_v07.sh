@@ -120,6 +120,25 @@ USE_PREVIOUS_TASK_END=true
 # 方案B 数据集侧: auto=跟随 USE_PREVIOUS_TASK_END (false->合并), true/false=显式覆盖 (消融用)
 MERGE_HISTORY_STREAM=auto
 
+# ── 双 Segment Summary (2026-08-23) ──
+# segment_summary 要求: HISTORY_TYPE=state, STATE_ENCODER_MODE=unified,
+# USE_SPECIAL_TOKENS=true, USE_PREVIOUS_TASK_END=true, COMPLETED_TASKS_HISTORY_LEN=4,
+# TRANSITION_MASK_RATE=0, HIST_ACTION_TOKEN_DROP_RATE=0 (config 会硬校验)
+HISTORY_TOKENIZATION_MODE="chunks"          # chunks | segment_summary
+HISTORY_SUMMARY_NUM_HEADS=8
+MAX_TRANSITION_SUMMARY_FRAMES=32
+MAX_TASK_SUMMARY_FRAMES=32
+TRANSITION_SUMMARY_DROP_RATE=0.7
+TASK_SUMMARY_DROP_RATE=0.7
+HISTORY_CHAIN_POSITION_MODE="none"          # none | uniform_0_4
+HISTORY_CHAIN_MAX_POSITION=4
+HISTORY_SUMMARY_LAST_CHUNK_RESIDUAL=true
+HISTORY_SUMMARY_LAST_GATE_INIT=-4.0
+TRANSITION_SUMMARY_LENGTH_ENCODING=false
+TASK_SUMMARY_LENGTH_ENCODING=true
+HISTORY_SUMMARY_TOTAL_LENGTH_CAP=64
+SEED=0
+
 # 归一化参数 (default=LoLA默认MEAN_STD, robovlm=min-max→[-1,1]全IDENTITY, zscore=arm=z-score/gripper=二值化{0,1})
 NORM_MODE="zscore"
 NORM_MIN=-0.65
@@ -428,6 +447,64 @@ while [[ $# -gt 0 ]]; do
         --no_merge_history_stream)
             MERGE_HISTORY_STREAM=false
             shift
+            ;;
+
+        # 双 Segment Summary
+        --history_tokenization_mode)
+            HISTORY_TOKENIZATION_MODE="$2"
+            shift 2
+            ;;
+        --history_summary_num_heads)
+            HISTORY_SUMMARY_NUM_HEADS="$2"
+            shift 2
+            ;;
+        --max_transition_summary_frames)
+            MAX_TRANSITION_SUMMARY_FRAMES="$2"
+            shift 2
+            ;;
+        --max_task_summary_frames)
+            MAX_TASK_SUMMARY_FRAMES="$2"
+            shift 2
+            ;;
+        --transition_summary_drop_rate)
+            TRANSITION_SUMMARY_DROP_RATE="$2"
+            shift 2
+            ;;
+        --task_summary_drop_rate)
+            TASK_SUMMARY_DROP_RATE="$2"
+            shift 2
+            ;;
+        --history_chain_position_mode)
+            HISTORY_CHAIN_POSITION_MODE="$2"
+            shift 2
+            ;;
+        --history_chain_max_position)
+            HISTORY_CHAIN_MAX_POSITION="$2"
+            shift 2
+            ;;
+        --no_history_summary_last_chunk_residual)
+            HISTORY_SUMMARY_LAST_CHUNK_RESIDUAL=false
+            shift
+            ;;
+        --history_summary_last_gate_init)
+            HISTORY_SUMMARY_LAST_GATE_INIT="$2"
+            shift 2
+            ;;
+        --transition_summary_length_encoding)
+            TRANSITION_SUMMARY_LENGTH_ENCODING=true
+            shift
+            ;;
+        --no_task_summary_length_encoding)
+            TASK_SUMMARY_LENGTH_ENCODING=false
+            shift
+            ;;
+        --history_summary_total_length_cap)
+            HISTORY_SUMMARY_TOTAL_LENGTH_CAP="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
+            shift 2
             ;;
 
         # 归一化参数
@@ -739,6 +816,28 @@ if [ "$MERGE_HISTORY_STREAM" = true ]; then
     cmd="${cmd} --merge_history_stream"
 elif [ "$MERGE_HISTORY_STREAM" = false ]; then
     cmd="${cmd} --no_merge_history_stream"
+fi
+
+# 双 Segment Summary (标量参数无条件透传, 保证 training_config.json 完整可比)
+cmd="${cmd} --history_tokenization_mode ${HISTORY_TOKENIZATION_MODE}"
+cmd="${cmd} --history_summary_num_heads ${HISTORY_SUMMARY_NUM_HEADS}"
+cmd="${cmd} --max_transition_summary_frames ${MAX_TRANSITION_SUMMARY_FRAMES}"
+cmd="${cmd} --max_task_summary_frames ${MAX_TASK_SUMMARY_FRAMES}"
+cmd="${cmd} --transition_summary_drop_rate ${TRANSITION_SUMMARY_DROP_RATE}"
+cmd="${cmd} --task_summary_drop_rate ${TASK_SUMMARY_DROP_RATE}"
+cmd="${cmd} --history_chain_position_mode ${HISTORY_CHAIN_POSITION_MODE}"
+cmd="${cmd} --history_chain_max_position ${HISTORY_CHAIN_MAX_POSITION}"
+cmd="${cmd} --history_summary_last_gate_init ${HISTORY_SUMMARY_LAST_GATE_INIT}"
+cmd="${cmd} --history_summary_total_length_cap ${HISTORY_SUMMARY_TOTAL_LENGTH_CAP}"
+cmd="${cmd} --seed ${SEED}"
+if [ "$HISTORY_SUMMARY_LAST_CHUNK_RESIDUAL" = false ]; then
+    cmd="${cmd} --no_history_summary_last_chunk_residual"
+fi
+if [ "$TRANSITION_SUMMARY_LENGTH_ENCODING" = true ]; then
+    cmd="${cmd} --transition_summary_length_encoding"
+fi
+if [ "$TASK_SUMMARY_LENGTH_ENCODING" = false ]; then
+    cmd="${cmd} --no_task_summary_length_encoding"
 fi
 
 echo "Running: $cmd"

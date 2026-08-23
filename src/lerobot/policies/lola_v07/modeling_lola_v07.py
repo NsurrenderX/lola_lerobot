@@ -159,6 +159,160 @@ class LolaV07ActionEncoder(nn.Module):
 # State Encoder with Bottleneck
 # ---------------------------------------------------------------------------
 
+def _sinusoidal_embedding(pos: torch.Tensor, dim: int, max_period: float = 1000.0) -> torch.Tensor:
+    """标准正弦编码, pos 为任意实数张量 [...] -> [..., dim] (dim 必须为偶数)。
+
+    不使用 learned table, 因此 frame budget / length cap 改变时参数 shape 不变。
+    """
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(half, device=pos.device, dtype=torch.float32)
+        / max(half - 1, 1)
+    )
+    args = pos.float().unsqueeze(-1) * freqs
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+class _SegmentAttentionPool(nn.Module):
+    """learned-query 多头注意力池化: [B, n_chunks, H] -> [B, H]。"""
+
+    def __init__(self, hidden: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden // num_heads
+        self.q_proj = nn.Linear(hidden, hidden)
+        # k 不带 bias: 它给每个 key 加同一个常量, 所有 logit 同步平移 ⇒ softmax 不变
+        # ⇒ 梯度恒为零 (ZeRO-3 集成测试实测确认)
+        self.k_proj = nn.Linear(hidden, hidden, bias=False)
+        self.v_proj = nn.Linear(hidden, hidden)
+        self.out_proj = nn.Linear(hidden, hidden)
+
+    def forward(self, query: torch.Tensor, chunks: torch.Tensor,
+                chunk_mask: torch.Tensor) -> torch.Tensor:
+        b, n, _ = chunks.shape
+        q = self.q_proj(query).view(b, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(chunks).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(chunks).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        # SDPA 布尔约定: True = 参与注意力
+        attn_mask = chunk_mask[:, None, None, :]
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        return self.out_proj(out.transpose(1, 2).reshape(b, 1, -1).squeeze(1))
+
+
+class SegmentHistoryPool(nn.Module):
+    """把 transition / task 两段的 chunk 序列各压缩成 1 个 summary token (方案 §10)。
+
+    ZeRO-3 约束: 每个叶子 Parameter 在一次 forward 中只被消费一次 —— 所有 bank 都是
+    先整体 materialize 成非叶子张量再切片, arm/grip pool 各只调用一次, length MLP 与
+    output norm 各只调用一次 (方案 §13)。
+    """
+
+    def __init__(self, config: LoLAV07Config):
+        super().__init__()
+        self.config = config
+        hidden = config.dit_hidden_size
+        self.hidden = hidden
+        self.length_feat_dim = 64
+
+        # modality 分开 (arm 256d / grip 128d 两条瓶颈支路分布不同), segment 共享
+        self.arm_pool = _SegmentAttentionPool(hidden, config.history_summary_num_heads)
+        self.grip_pool = _SegmentAttentionPool(hidden, config.history_summary_num_heads)
+
+        # bank 维度统一为 [segment(transition/task), modality(arm/grip), ...]
+        self.summary_queries = nn.Parameter(torch.randn(2, 2, hidden) * 0.02)
+        self.segment_type_embeddings = nn.Parameter(torch.randn(2, 2, hidden) * 0.02)
+        self.last_chunk_gates = nn.Parameter(
+            torch.full((2, 2), float(config.history_summary_last_gate_init))
+        )
+
+        # flag 只门控 forward, 参数恒建 —— 开关切换不改变参数拓扑 (方案 §6.4)
+        self.length_mlp = nn.Sequential(
+            nn.Linear(self.length_feat_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2 * hidden),
+        )
+        self.output_norm = nn.LayerNorm(hidden, eps=1e-6)
+
+    def _chunk_positions(self, num_chunks: int, device) -> torch.Tensor:
+        """从最新往回数: 最新槽位恒为 position 0 (方案 §10.6)。
+
+        不能按绝对槽位编码 —— 不等 budget 下两段 pad 到同一 P 后, 真实 chunk 会落在
+        不同的绝对槽位上, 位置语义不可比。
+        """
+        slots = torch.arange(num_chunks, device=device)
+        return (num_chunks - 1) - slots
+
+    def forward(self, arm_chunks, grip_chunks, frame_mask, total_length, batch_size):
+        """输入沿 batch 合并为 2B: 前 B 行 = transition, 后 B 行 = task。
+
+        Args:
+            arm_chunks / grip_chunks: [2B, n_chunks, H]
+            frame_mask: [2B, P] bool
+            total_length: [2B] long, 已 clamp
+            batch_size: B
+        Returns:
+            (arm_summary, grip_summary) 各 [2B, H], 以及诊断字典
+        """
+        b2, n_chunks, hidden = arm_chunks.shape
+        b = batch_size
+        device = arm_chunks.device
+        chunk_size = self.config.action_chunk_size
+
+        # ── chunk mask 与 absent fallback ──
+        chunk_mask = frame_mask.view(b2, n_chunks, chunk_size).any(dim=-1)
+        valid_fraction = frame_mask.view(b2, n_chunks, chunk_size).float().mean(dim=-1)
+        present = chunk_mask.any(dim=-1)                       # [2B]
+        # 全 False 会让 SDPA 产生 NaN: 显式打开最新槽位, 其内容是 encoder 对 null 的编码
+        last_slot = torch.zeros(n_chunks, dtype=torch.bool, device=device)
+        last_slot[-1] = True
+        chunk_mask = chunk_mask | (~present).unsqueeze(-1) & last_slot
+
+        # ── chunk 位置 (无参数, budget 变化不改 shape) ──
+        pos = self._chunk_positions(n_chunks, device)
+        pos_emb = _sinusoidal_embedding(pos, hidden).to(arm_chunks.dtype).unsqueeze(0)
+        arm_chunks = arm_chunks + pos_emb
+        grip_chunks = grip_chunks + pos_emb
+
+        # ── bank: 各消费一次叶子 Parameter, 之后只切非叶子视图 ──
+        queries = self.summary_queries.repeat_interleave(b, dim=0)          # [2B, 2, H]
+        type_emb = self.segment_type_embeddings.repeat_interleave(b, dim=0)  # [2B, 2, H]
+        gates = torch.sigmoid(self.last_chunk_gates).repeat_interleave(b, dim=0)  # [2B, 2]
+
+        arm_summary = self.arm_pool(queries[:, 0].unsqueeze(1), arm_chunks, chunk_mask)
+        grip_summary = self.grip_pool(queries[:, 1].unsqueeze(1), grip_chunks, chunk_mask)
+
+        arm_summary = arm_summary + type_emb[:, 0]
+        grip_summary = grip_summary + type_emb[:, 1]
+
+        # ── last-valid residual: 左 pad ⇒ 最新槽位恒为最后一个; absent 时整体置零 ──
+        if self.config.history_summary_last_chunk_residual:
+            keep = present.to(arm_chunks.dtype).unsqueeze(-1)
+            arm_summary = arm_summary + gates[:, 0:1] * arm_chunks[:, -1] * keep
+            grip_summary = grip_summary + gates[:, 1:2] * grip_chunks[:, -1] * keep
+
+        # ── length encoding: MLP 只调用一次, 两段的开关分别门控输出 ──
+        len_feat = _sinusoidal_embedding(total_length, self.length_feat_dim).to(arm_chunks.dtype)
+        len_emb = self.length_mlp(len_feat)                                  # [2B, 2H]
+        len_gate = torch.cat([
+            arm_chunks.new_full((b, 1), float(self.config.transition_summary_length_encoding)),
+            arm_chunks.new_full((b, 1), float(self.config.task_summary_length_encoding)),
+        ], dim=0)
+        arm_summary = arm_summary + len_gate * len_emb[:, :hidden]
+        grip_summary = grip_summary + len_gate * len_emb[:, hidden:]
+
+        # ── output norm 一次调用 ──
+        stacked = self.output_norm(torch.stack([arm_summary, grip_summary], dim=1))
+        diagnostics = {
+            "summary_present": present,
+            "summary_valid_fraction": valid_fraction,
+            "summary_last_gates": torch.sigmoid(self.last_chunk_gates).detach(),
+        }
+        return stacked[:, 0], stacked[:, 1], diagnostics
+
+
+# ---------------------------------------------------------------------------
+
 class LolaV07StateEncoder(nn.Module):
     """State History Encoder with Bottleneck, compatible with 5-stream DiT.
 
@@ -252,6 +406,44 @@ class LolaV07StateEncoder(nn.Module):
         self.arm_ctx_state_emb = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
         self.grip_ctx_state_emb = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
 
+        # segment_summary 专属: 条件构造。chunks 模式既不建 pool 也不注册 buffer,
+        # 旧 checkpoint 的 state-dict key 集合完全不变 (方案 §9.1 / §10.1)。
+        if config.history_tokenization_mode == "segment_summary":
+            self.register_buffer(
+                "history_null_state",
+                torch.zeros(self.state_dim, dtype=torch.float32),
+                persistent=True,
+            )
+            self.segment_pool = SegmentHistoryPool(config)
+            self._history_null_state_initialized = False
+        else:
+            self.segment_pool = None
+
+    @torch.no_grad()
+    def initialize_history_null_state(self, state_mean, state_std):
+        """用 dataset 实际使用的 stats 填 buffer (方案 §9.2 / §9.3)。
+
+        必须在 DDP/FSDP/DeepSpeed wrapping 之前调用; 不能硬编码
+        `observation.state` stats key —— 否则 stats_mode=incremental 时
+        buffer 不再等于 dataset 的 normalize(raw_zero)。
+
+        注: DeepSpeed 开 bf16 时会把这个浮点 buffer 一并 cast 成 bf16
+        (相对误差 ~2.6e-3), 因此与 dataset 侧 fp32 padding 只在 bf16 精度上相等。
+        """
+        if self.segment_pool is None:
+            return
+        mean = torch.as_tensor(state_mean, dtype=torch.float32).reshape(-1)
+        std = torch.as_tensor(state_std, dtype=torch.float32).reshape(-1)
+        if mean.numel() != self.state_dim or std.numel() != self.state_dim:
+            raise ValueError(
+                f"history_null_state stats dim mismatch: expected {self.state_dim}, "
+                f"got mean={mean.numel()} std={std.numel()}"
+            )
+        self.history_null_state.copy_(
+            ((0.0 - mean) / (std + 1e-8)).to(self.history_null_state.device)
+        )
+        self._history_null_state_initialized = True
+
     def _pad_and_chunk(self, states: torch.Tensor, dim_size: int) -> torch.Tensor:
         b, seq_len, d = states.shape
         remainder = seq_len % self.chunk_size
@@ -261,7 +453,8 @@ class LolaV07StateEncoder(nn.Module):
             seq_len += pad_len
         return states.view(b, seq_len // self.chunk_size, self.chunk_size * dim_size)
 
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
+    def _encode_chunks(self, states: torch.Tensor):
+        """[B, seq, state_dim] -> (arm_tokens, grip_tokens) 各 [B, num_chunks, hidden]。"""
         if self.mode == "unified":
             state_chunked = self._pad_and_chunk(states, self.state_dim)
             projected = self.state_proj(state_chunked)  # [B, num_chunks, 2 * hidden]
@@ -287,7 +480,86 @@ class LolaV07StateEncoder(nn.Module):
             grip_latent = self.grip_state_enc2(self.grip_state_enc1(grip_chunked))
             grip_tokens = self.grip_state_dec(grip_latent) + self.grip_ctx_state_emb
 
+        return arm_tokens, grip_tokens
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        arm_tokens, grip_tokens = self._encode_chunks(states)
         return torch.cat([arm_tokens, grip_tokens], dim=1)  # [B, 2*num_chunks, hidden]
+
+    # ------------------------------------------------------------------
+    # segment_summary 入口
+    # ------------------------------------------------------------------
+
+    def _left_pad_to(self, states: torch.Tensor, mask: torch.Tensor, target: int):
+        """不等 budget 时把较短的一段左 pad 到公共 P (方案 §10.3)。
+
+        pad 内容为 null state / mask=False, 不参与 attention; 目的是让两段能沿 batch
+        合并成一次 encoder 前向, 保住 ZeRO-3 的单次模块调用约束。
+        """
+        cur = states.shape[1]
+        if cur == target:
+            return states, mask
+        pad = target - cur
+        b = states.shape[0]
+        pad_states = self.history_null_state.to(states.dtype).view(1, 1, -1).expand(b, pad, -1)
+        pad_mask = mask.new_zeros(b, pad)
+        return torch.cat([pad_states, states], dim=1), torch.cat([pad_mask, mask], dim=1)
+
+    def encode_segment_summaries(
+        self,
+        transition_states, transition_frame_mask, transition_total_length,
+        task_states, task_frame_mask, task_total_length,
+        transition_drop=None, task_drop=None,
+    ):
+        """两段各产出 arm/grip 各 1 个 summary token。
+
+        `*_drop` 是 [B] bool: transition 侧已包含 chain-context reset (方案 §11.3),
+        所有 null 替换都在这里用同一个 buffer 完成, trainer 不得改写 states。
+        """
+        if self.segment_pool is None:
+            raise RuntimeError("encode_segment_summaries requires history_tokenization_mode='segment_summary'")
+        b = transition_states.shape[0]
+        cap = self.config.history_summary_total_length_cap
+        null = self.history_null_state.to(transition_states.dtype)
+
+        def _apply_drop(states, drop):
+            if drop is None:
+                return states.contiguous()
+            # .contiguous() 不可省: budget 整除 chunk_size 时 _pad_and_chunk 不走 F.pad,
+            # 会直接 .view(), broadcast 产物会 RuntimeError
+            return torch.where(drop.view(-1, 1, 1), null.view(1, 1, -1), states).contiguous()
+
+        # chain-context reset 与自然缺失都走同一条 null 填充路径 (方案 §11.3):
+        # trainer 只把 total_length 置 0, reset 语义在这里派生, 评测端无需额外字段。
+        chain_reset = transition_total_length <= 0
+        transition_drop = chain_reset if transition_drop is None else (transition_drop | chain_reset)
+
+        transition_states = _apply_drop(transition_states, transition_drop)
+        task_states = _apply_drop(task_states, task_drop)
+
+        target = self.config.summary_padded_frames
+        transition_states, transition_frame_mask = self._left_pad_to(
+            transition_states, transition_frame_mask, target)
+        task_states, task_frame_mask = self._left_pad_to(
+            task_states, task_frame_mask, target)
+
+        merged_states = torch.cat([transition_states, task_states], dim=0)
+        merged_mask = torch.cat([transition_frame_mask, task_frame_mask], dim=0).bool()
+        merged_len = torch.cat([transition_total_length, task_total_length], dim=0).clamp(0, cap)
+
+        arm_chunks, grip_chunks = self._encode_chunks(merged_states)
+        arm_summary, grip_summary, diagnostics = self.segment_pool(
+            arm_chunks, grip_chunks, merged_mask, merged_len, b
+        )
+        return {
+            "transition_arm": arm_summary[:b],
+            "transition_grip": grip_summary[:b],
+            "task_arm": arm_summary[b:],
+            "task_grip": grip_summary[b:],
+            "transition_present": diagnostics["summary_present"][:b],
+            "task_present": diagnostics["summary_present"][b:],
+            "diagnostics": diagnostics,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +648,27 @@ class LoLAV07Pytorch(nn.Module):
             return self.vlm_bridge(hidden_states_all_layers, attention_mask=vlm_attention_mask)
         return self.vlm_bridge(hidden_states_all_layers)
 
+    def _encode_segment_history(self, segment_history: dict):
+        """六字段 -> DiT 期望的 [arm_half | grip_half] chunk 表示 (方案 §12)。
+
+        每条流打包成 2 个 content token 后, 直接复用既有的 special-token 组装路径:
+        max_n_tc=1 恰好得到 hist_start | transition | PTE | task | hist_end。
+        训练与推理因此共用同一段组装代码, parity 结构上成立; chunks 分支不受影响。
+        """
+        out = self.state_encoder.encode_segment_summaries(**segment_history)
+        arm = torch.stack([out["transition_arm"], out["task_arm"]], dim=1)     # [B, 2, H]
+        grip = torch.stack([out["transition_grip"], out["task_grip"]], dim=1)
+        packed = torch.cat([arm, grip], dim=1)                                  # [B, 4, H]
+        b = packed.shape[0]
+        # summary token 的 K/V 恒可见; 缺失语义只由 PTE 表达 (方案 §12)
+        chunks_mask = torch.ones(b, 4, dtype=torch.float32, device=packed.device)
+        n_tc_batch = out["transition_present"].long()
+        return packed, chunks_mask, n_tc_batch, out
+
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
                 hist_actions_mask=None, vlm_attention_mask=None, time=None, noise=None, state_emb=None,
-                n_transition_chunks=0, n_transition_chunks_batch=None, return_per_sample=False):
+                n_transition_chunks=0, n_transition_chunks_batch=None, return_per_sample=False,
+                segment_history=None):
         """Training forward with Latent Flow Matching.
 
         v-loss is computed in Bottleneck latent space (256D/128D), not 1024D.
@@ -388,6 +678,7 @@ class LoLAV07Pytorch(nn.Module):
             n_transition_chunks_batch: per-sample [B] tensor for attention mask construction
             return_per_sample: 额外返回未聚合的逐样本 loss 张量 ([B], keys 以 "_per_sample" 结尾),
                 供 t-网格探针在 CRN 固定噪声下记录逐样本逐 t 曲线
+            segment_history: segment_summary 模式的六字段 + 两个 drop 决策 (None = chunks 模式)
         """
         b = target_actions.shape[0]
         device = target_actions.device
@@ -397,8 +688,14 @@ class LoLAV07Pytorch(nn.Module):
         target_dtype = vlm_features.dtype
 
         # 2. History encoding (force FP32 to survive DeepSpeed BF16 autocast)
+        summary_out, summary_chunks_mask = None, None
         with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
-            if self.state_encoder is not None:
+            if segment_history is not None:
+                hist_chunks, summary_chunks_mask, n_transition_chunks_batch, summary_out = \
+                    self._encode_segment_history(segment_history)
+                n_transition_chunks = 1
+                hist_actions_mask = None
+            elif self.state_encoder is not None:
                 hist_chunks = self.state_encoder(hist_actions)
             else:
                 hist_chunks = self.action_encoder(hist_actions)
@@ -426,6 +723,8 @@ class LoLAV07Pytorch(nn.Module):
             hist_actions_mask_reshaped = hist_actions_mask.view(b, num_chunks, chunk_size)
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()
             hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)
+        if summary_chunks_mask is not None:
+            hist_chunks_mask = summary_chunks_mask
 
         # 5. Flow Matching in latent space (BF16)
         if noise is None:
@@ -686,6 +985,8 @@ class LoLAV07Pytorch(nn.Module):
             "gripper_loss": gripper_loss.float(),
             "arm_loss_per_dim": arm_loss_per_dim.float(),
         }
+        if summary_out is not None:
+            result["summary_diagnostics"] = summary_out["diagnostics"]
 
         # 13. Per-sample losses (t-网格探针用: CRN 固定噪声下逐样本逐 t 记录)
         # 与 step 9/11/12 相同的公式, 仅去掉 batch 维度的聚合
@@ -717,21 +1018,33 @@ class LoLAV07Pytorch(nn.Module):
     @torch.no_grad()
     def sample_actions(self, hidden_states_all_layers, hist_actions, hist_actions_mask=None,
                        state_emb=None,
-                       n_transition_chunks=None):
+                       n_transition_chunks=None, segment_history=None):
         """Inference: Euler integration in latent space.
 
         Args:
             n_transition_chunks: number of transition chunks (None = auto-detect 0)
+            segment_history: segment_summary 模式的六字段 (None = chunks 模式)
         """
-        b = hist_actions.shape[0]
-        device = hist_actions.device
+        summary_chunks_mask, pte_mask = None, None
+        if segment_history is not None:
+            b = segment_history["transition_states"].shape[0]
+            device = segment_history["transition_states"].device
+        else:
+            b = hist_actions.shape[0]
+            device = hist_actions.device
 
         vlm_features, empty_emb = self._run_vlm_bridge(hidden_states_all_layers)
         target_dtype = vlm_features.dtype
 
         # History encoding (force FP32 to survive DeepSpeed BF16 autocast)
         with torch.amp.autocast("cuda", dtype=torch.float32, enabled=True):
-            if self.state_encoder is not None:
+            if segment_history is not None:
+                hist_chunks, summary_chunks_mask, n_tc_batch, _ = \
+                    self._encode_segment_history(segment_history)
+                n_transition_chunks = 1
+                hist_actions_mask = None
+                pte_mask = (n_tc_batch > 0).unsqueeze(1)
+            elif self.state_encoder is not None:
                 hist_chunks = self.state_encoder(hist_actions)
             else:
                 hist_chunks = self.action_encoder(hist_actions)
@@ -751,6 +1064,8 @@ class LoLAV07Pytorch(nn.Module):
             hist_actions_mask_reshaped = hist_actions_mask.view(b, num_chunks, chunk_size)
             hist_chunks_mask = hist_actions_mask_reshaped.any(dim=2).float()
             hist_chunks_mask = torch.cat([hist_chunks_mask, hist_chunks_mask], dim=1)
+        if summary_chunks_mask is not None:
+            hist_chunks_mask = summary_chunks_mask
 
         # Handle n_transition_chunks default
         if n_transition_chunks is None:
@@ -792,40 +1107,46 @@ class LoLAV07Pytorch(nn.Module):
             ], dim=1)
 
             # Hist streams with special tokens
+            # 每个 special-token Parameter 只 expand 一次, 之后复用非叶子 tensor (方案 §13)
+            hist_start = self.dit.hist_start_emb.expand(b, -1, -1)
+            prev_task_end = self.dit.previous_task_end_emb.expand(b, -1, -1)
+            hist_end = self.dit.hist_end_emb.expand(b, -1, -1)
+            if pte_mask is None:
+                pte_mask = torch.ones(b, 1, dtype=torch.bool, device=device)
             if n_transition_chunks > 0:
                 arm_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     arm_hist[:, :n_transition_chunks, :],
-                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    prev_task_end,
                     arm_hist[:, n_transition_chunks:, :],
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 arm_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                     arm_hist_mask_base[:, :n_transition_chunks],
-                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    pte_mask,
                     arm_hist_mask_base[:, n_transition_chunks:],
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                 ], dim=1)
                 grip_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     grip_hist[:, :n_transition_chunks, :],
-                    self.dit.previous_task_end_emb.expand(b, -1, -1),
+                    prev_task_end,
                     grip_hist[:, n_transition_chunks:, :],
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 grip_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                     grip_hist_mask_base[:, :n_transition_chunks],
-                    torch.ones(b, 1, dtype=torch.bool, device=device),
+                    pte_mask,
                     grip_hist_mask_base[:, n_transition_chunks:],
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                 ], dim=1)
             else:
                 arm_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     arm_hist,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 arm_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),
@@ -833,9 +1154,9 @@ class LoLAV07Pytorch(nn.Module):
                     torch.ones(b, 1, dtype=torch.bool, device=device),
                 ], dim=1)
                 grip_stream = torch.cat([
-                    self.dit.hist_start_emb.expand(b, -1, -1),
+                    hist_start,
                     grip_hist,
-                    self.dit.hist_end_emb.expand(b, -1, -1),
+                    hist_end,
                 ], dim=1)
                 grip_stream_mask = torch.cat([
                     torch.ones(b, 1, dtype=torch.bool, device=device),
@@ -1104,7 +1425,47 @@ class LoLAV07Policy(PreTrainedPolicy):
 
     # ---- Data preparation (same as LoLAPolicy) ----
 
+    def prepare_segment_history(self, batch: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """segment_summary 的六字段 + 两个训练期可选 drop 决策 (方案 §8.2)。
+
+        六字段缺任一就 fail-fast: 它们若未经 `_extract_special_fields()` 保护,
+        会被 `batch_to_transition()` 静默删除, 而静默退回单帧 state 会训出一个
+        看上去正常、实际没有历史的模型。
+        两个 drop 字段由 trainer 瞬态生成, 评测端不存在, 因此不纳入 fail-fast。
+        """
+        from lerobot.datasets.lola_dataset import SEGMENT_SUMMARY_REQUIRED_FIELDS
+
+        missing = [k for k in SEGMENT_SUMMARY_REQUIRED_FIELDS if k not in batch]
+        if missing:
+            raise KeyError(
+                f"segment_summary mode requires {missing} in batch; "
+                f"present hist_* keys: {sorted(k for k in batch if k.startswith('hist_'))}"
+            )
+
+        def _drop(key):
+            if not self.training:
+                return None
+            value = batch.get(key, None)
+            return value.bool() if value is not None else None
+
+        return {
+            "transition_states": batch["hist_transition_states"],
+            "transition_frame_mask": batch["hist_transition_frame_mask"].bool(),
+            "transition_total_length": batch["hist_transition_total_length"],
+            "task_states": batch["hist_task_states"],
+            "task_frame_mask": batch["hist_task_frame_mask"].bool(),
+            "task_total_length": batch["hist_task_total_length"],
+            "transition_drop": _drop("hist_transition_content_drop"),
+            "task_drop": _drop("hist_task_content_drop"),
+        }
+
     def prepare_hist_actions(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.config.is_segment_summary:
+            # 不得回退到单帧 state 的兼容路径 —— 静默降级比崩溃难发现得多
+            raise RuntimeError(
+                "prepare_hist_actions() is not valid in segment_summary mode; "
+                "use prepare_segment_history()"
+            )
         if self.config.history_type == "state":
             if "hist_states_full" in batch:
                 hist_input = batch["hist_states_full"]
@@ -1281,10 +1642,14 @@ class LoLAV07Policy(PreTrainedPolicy):
         noise: 可选 (noise_arm_latent, noise_grip_latent) 元组, 外部注入固定噪声 (CRN 探针用)。
         return_per_sample: loss_dict 额外携带逐样本 loss 张量 (keys 以 "_per_sample" 结尾)。
         """
-        hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
+        segment_history = None
+        hist_actions, hist_actions_mask = None, None
+        if self.config.is_segment_summary:
+            segment_history = self.prepare_segment_history(batch)
+        else:
+            hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
         target_actions = self.prepare_target_actions(batch)
         hidden_states_all_layers, input_ids = self.prepare_vlm_inputs(batch)
-
         vlm_attention_mask = (
             batch.get("attention_mask", None)
             or batch.get("observation.language.attention_mask", None)
@@ -1339,6 +1704,7 @@ class LoLAV07Policy(PreTrainedPolicy):
             n_transition_chunks=max_n_tc,
             n_transition_chunks_batch=n_transition_chunks_batch,
             return_per_sample=return_per_sample,
+            segment_history=segment_history,
         )
 
         loss = losses["total_loss"]
@@ -1360,7 +1726,12 @@ class LoLAV07Policy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: Dict[str, torch.Tensor], **kwargs) -> torch.Tensor:
         self.model.eval()
 
-        hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
+        segment_history = None
+        hist_actions, hist_actions_mask = None, None
+        if self.config.is_segment_summary:
+            segment_history = self.prepare_segment_history(batch)
+        else:
+            hist_actions, hist_actions_mask = self.prepare_hist_actions(batch)
         # v07: dtype conversion happens inside model
         if hist_actions_mask is not None:
             hist_actions_mask = hist_actions_mask.to(self.dtype)
@@ -1390,6 +1761,7 @@ class LoLAV07Policy(PreTrainedPolicy):
             hist_actions_mask=hist_actions_mask,
             state_emb=state_emb,
             n_transition_chunks=n_transition_chunks,
+            segment_history=segment_history,
         )
         return actions
 
@@ -1400,3 +1772,80 @@ class LoLAV07Policy(PreTrainedPolicy):
             for i in range(actions.shape[1]):
                 self._action_queue.append(actions[:, i, :])
         return self._action_queue.popleft()
+
+
+# ---------------------------------------------------------------------------
+# Optimizer 参数组: 单一构造入口 + 真覆盖断言
+# ---------------------------------------------------------------------------
+
+def assert_param_group_coverage(policy: nn.Module, param_groups: list) -> None:
+    """按参数 ID 校验优化器覆盖: 每个 trainable 参数恰好出现一次。
+
+    现有的 "requires_grad 参数数 / 全参数数" 日志统计的是模型而非优化器成员,
+    模块漏登记时照样打印 100% 覆盖, 不能作为覆盖证明 (方案 §14.3)。
+    """
+    trainable = {id(p): name for name, p in policy.named_parameters() if p.requires_grad}
+    seen: Dict[int, int] = {}
+    duplicated, frozen = [], []
+    for gi, group in enumerate(param_groups):
+        for p in group["params"]:
+            if not p.requires_grad:
+                frozen.append(gi)
+            if id(p) in seen:
+                duplicated.append(trainable.get(id(p), f"<id {id(p)}>"))
+            seen[id(p)] = gi
+
+    missing = [name for pid, name in trainable.items() if pid not in seen]
+    unknown = [pid for pid in seen if pid not in trainable]
+
+    problems = []
+    if missing:
+        problems.append(
+            f"{len(missing)} trainable params NOT in optimizer (会被静默冻结): {missing[:10]}"
+        )
+    if duplicated:
+        problems.append(f"{len(duplicated)} params appear in multiple groups: {duplicated[:10]}")
+    if frozen:
+        problems.append(f"{len(frozen)} frozen params leaked into groups {sorted(set(frozen))}")
+    if unknown:
+        problems.append(f"{len(unknown)} params in optimizer but not trainable on policy")
+    if problems:
+        raise RuntimeError("[optimizer coverage] " + "; ".join(problems))
+
+
+def build_lola_v07_param_groups(
+    policy: nn.Module,
+    config: LoLAV07Config,
+    base_lr: float,
+    vlm_lr: float | None = None,
+    include_vlm: bool = False,
+    strict: bool = True,
+) -> list:
+    """统一的 optimizer 参数组构造 (方案 §14.2)。
+
+    原先 6 处硬编码枚举 (azure 初始/DDP/两条 unfreeze + multigpu 初始/unfreeze) 收敛到
+    这里 —— 新增模块只要挂在被枚举的父模块下就自动进组, 不会再出现"漏登记 = 静默冻结"。
+    """
+    encoder_lr = base_lr * config.encoder_lr_mult
+    groups = [
+        {"params": list(policy.model.dit.parameters()), "lr": base_lr},
+        {"params": list(policy.model.vlm_bridge.parameters()), "lr": base_lr},
+        {"params": list(policy.model.action_encoder.parameters()), "lr": encoder_lr},
+        {"params": list(policy.model.arm_dit_to_latent.parameters()), "lr": encoder_lr},
+        {"params": list(policy.model.grip_dit_to_latent.parameters()), "lr": encoder_lr},
+    ]
+    # SegmentHistoryPool 是 state_encoder 的子模块, 因此自动包含在这一组里
+    if policy.model.state_encoder is not None:
+        groups.append({"params": list(policy.model.state_encoder.parameters()), "lr": encoder_lr})
+    if include_vlm and hasattr(policy, "vlm"):
+        if vlm_lr is None:
+            raise ValueError("include_vlm=True requires vlm_lr")
+        groups.append({"params": list(policy.vlm.parameters()), "lr": vlm_lr})
+
+    for group in groups:
+        group["params"] = [p for p in group["params"] if p.requires_grad]
+    groups = [g for g in groups if g["params"]]
+
+    if strict:
+        assert_param_group_coverage(policy, groups)
+    return groups

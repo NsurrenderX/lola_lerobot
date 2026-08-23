@@ -42,6 +42,7 @@ LoLA Azure 分布式训练脚本 - 使用原生 PyTorch DDP
 
 import argparse
 import datetime
+import json
 import logging
 import os
 import sys
@@ -86,18 +87,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.lola_dataset import LoLADataset
+from lerobot.datasets.lola_dataset import HISTORY_SPECIAL_PREFIXES, LoLADataset
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
+from lerobot.policies.lola_v07.modeling_lola_v07 import build_lola_v07_param_groups
 from lerobot.policies.factory import make_pre_post_processors
 
 # resume 搜索 (同目录模块; run 集合目录 → 按训练配置匹配并选步数最多者)
 from resume_search import (
+    LOLA_CONFIG_LEGACY_DEFAULTS,
     build_current_snapshot,
     diff_snapshot,
     make_serializable,
     resolve_merge_history_stream,
     resolve_resume_auto,
+)
+
+# checkpoint 能否加载由这组字段决定 (方案 §15.2)。它们改变参数拓扑或张量 shape,
+# 而 load_module_strict=False 会让缺失参数静默随机初始化 —— 必须在 load 之前拦住。
+ARCH_FINGERPRINT_KEYS = (
+    "history_architecture_version",
+    "history_tokenization_mode",
+    "state_dim",
+    "action_chunk_size",
+    "dit_hidden_size",
+    "state_encoder_mode",
+    "max_transition_summary_frames",
+    "max_task_summary_frames",
+    "history_summary_num_heads",
 )
 
 # 设置日志
@@ -617,6 +634,9 @@ def create_lola_dataset(
             hist_action_token_drop_rate=config.hist_action_token_drop_rate,
             max_transition_len=max_transition_len,
             merge_history_stream=merge_history_stream,
+            history_tokenization_mode=config.history_tokenization_mode,
+            max_transition_summary_frames=config.max_transition_summary_frames,
+            max_task_summary_frames=config.max_task_summary_frames,
             stats_mode=stats_mode,
         )
     else:
@@ -999,6 +1019,12 @@ class LoLAV07Trainer:
         self._last_checkpoint_time = None
         self._checkpoint_timer_signal = None
 
+        # (mean, std) 来自 dataset, 由 main() 在 setup_model() 之前注入 (方案 §9.2)
+        self.history_state_stats = None
+        self.seed = int((training_args or {}).get("seed", 0))
+        self._batches_per_epoch = None
+        self._last_history_aug_stats = {}
+
     # ────────────────────────────────────────────────────────────────
     # EMA (全模型, ZeRO-3 分片本地维护)
     # ────────────────────────────────────────────────────────────────
@@ -1102,6 +1128,19 @@ class LoLAV07Trainer:
         self.policy._device = self.device
         self.policy.model = self.policy.model.to(self.device)
         self.policy.vlm = self.policy.vlm.to(self.device)
+
+        # history_null_state 必须在 DDP/FSDP wrapping (本函数末尾) 之前写入。
+        # stats 取自 dataset 实际用过的那一份, 自动跟随 stats_mode —— 硬编码
+        # observation.state key 会在 incremental 模式下与 dataset 的 padding 值不一致。
+        if self.config.is_segment_summary:
+            if self.history_state_stats is None:
+                raise RuntimeError(
+                    "segment_summary requires trainer.history_state_stats=(mean, std) "
+                    "to be set before setup_model() — see 方案 §9.2"
+                )
+            self.policy.model.state_encoder.initialize_history_null_state(*self.history_state_stats)
+            _log(f"[history] history_null_state = "
+                 f"{self.policy.model.state_encoder.history_null_state.tolist()}")
 
         # 创建预处理器和后处理器
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -1247,23 +1286,11 @@ class LoLAV07Trainer:
             ds_config.update(custom_config)
 
         # v07: Separate parameter groups for DeepSpeed
-        encoder_lr_mult = self.config.encoder_lr_mult
-        base_lr = self.learning_rate
-        trainable_param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        if self.train_vlm and hasattr(self.policy, "vlm") and not self._vlm_delayed_unfreeze:
-            trainable_param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
-        # Filter out params that don't require grad, then remove empty groups
-        for group in trainable_param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
-        trainable_param_groups = [g for g in trainable_param_groups if g["params"]]
+        trainable_param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, self.learning_rate,
+            vlm_lr=self.vlm_lr,
+            include_vlm=self.train_vlm and not self._vlm_delayed_unfreeze,
+        )
 
         # DeepSpeed passes the basic (unwrapped) optimizer to this callable,
         # so OneCycleLR's isinstance(optimizer, Optimizer) check passes.
@@ -1378,26 +1405,11 @@ class LoLAV07Trainer:
             _log("VLM gradient checkpointing enabled")
 
         # 4. Rebuild optimizer + scheduler with VLM group included
-        encoder_lr_mult = self.config.encoder_lr_mult
-        vlm_lr_mult = self.config.vlm_lr_mult
-        base_lr = self.learning_rate
-
-        param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        # VLM group now included since unfrozen
-        param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
-
-        # Filter out params that don't require grad, then remove empty groups
-        for group in param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
-        param_groups = [g for g in param_groups if g["params"]]
+        param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, self.learning_rate,
+            vlm_lr=self.learning_rate * self.config.vlm_lr_mult,
+            include_vlm=True,
+        )
 
         self.optimizer = torch.optim.AdamW(
             param_groups,
@@ -1682,25 +1694,12 @@ class LoLAV07Trainer:
                 _log("VLM gradient checkpointing enabled (PyTorch default, ZeRO-3 compatible)")
 
         # 6. Rebuild DeepSpeed engine with VLM group included
-        encoder_lr_mult = self.config.encoder_lr_mult
-        vlm_lr_mult = self.config.vlm_lr_mult
         base_lr = self.learning_rate
-
-        trainable_param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            trainable_param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        # VLM group now included since unfrozen
-        trainable_param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
-        # Filter out params that don't require grad, then remove empty groups
-        for group in trainable_param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
-        trainable_param_groups = [g for g in trainable_param_groups if g["params"]]
+        trainable_param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, base_lr,
+            vlm_lr=base_lr * self.config.vlm_lr_mult,
+            include_vlm=True,
+        )
 
         remaining_steps = self.total_steps - self.global_step
         if remaining_steps <= 0:
@@ -1820,25 +1819,11 @@ class LoLAV07Trainer:
             return
 
         # v07: Separate parameter groups
-        encoder_lr_mult = self.config.encoder_lr_mult
-        base_lr = self.learning_rate
-
-        param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        if self.train_vlm and hasattr(self.policy, "vlm") and not self._vlm_delayed_unfreeze:
-            param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": self.vlm_lr})
-
-        # Filter out params that don't require grad, then remove empty groups
-        for group in param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
-        param_groups = [g for g in param_groups if g["params"]]
+        param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, self.learning_rate,
+            vlm_lr=self.vlm_lr,
+            include_vlm=self.train_vlm and not self._vlm_delayed_unfreeze,
+        )
 
         self.optimizer = torch.optim.AdamW(
             param_groups,
@@ -1857,7 +1842,8 @@ class LoLAV07Trainer:
             _log(f"DDP: BF16OptimizerWrapper enabled, optimizer operates on fp32 master params")
 
         # Verify optimizer param group coverage
-        opt_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        # 真覆盖已由 build_lola_v07_param_groups() 的 ID 级断言保证; 这里只报数量
+        opt_params = sum(p.numel() for g in param_groups for p in g["params"])
         all_params = sum(p.numel() for p in self.policy.parameters())
         _log(f"Optimizer: {opt_params:,} / {all_params:,} params in optimizer")
 
@@ -1874,14 +1860,14 @@ class LoLAV07Trainer:
         )
 
     def _extract_special_fields(self, batch):
-        """提取特殊字段"""
+        """提取特殊字段
+
+        按前缀而非逐 key 白名单 —— batch_to_transition() 只保留硬编码白名单,
+        新增的 history 字段漏提不会报错, 只会在 preprocessor 里静默消失。
+        """
         special_data = {}
-        keys_to_extract = ["hist_actions_full", "hist_actions_mask", "hist_actions_length",
-                           "hist_states_full", "hist_states_mask", "hist_states_length",
-                           "n_transition", "n_transition_chunks"]
-        for key in keys_to_extract:
-            if key in batch:
-                special_data[key] = batch.pop(key)
+        for key in [k for k in batch if k.startswith(HISTORY_SPECIAL_PREFIXES)]:
+            special_data[key] = batch.pop(key)
         if "action" in batch:
             special_data["action"] = batch.pop("action")
         return special_data
@@ -1890,6 +1876,97 @@ class LoLAV07Trainer:
         """恢复特殊字段"""
         batch.update(special_data)
         return batch
+
+    def _apply_history_augmentation(self, batch):
+        """chain-position sampling + content dropout (方案 §5.2/§5.3/§11.2)。
+
+        必须在 `_extract_special_fields()` 之前调用: completed_tasks 要留给 preprocessor,
+        而 hist_* 字段在那之后就被 pop 出去了, 在后面改写会静默无效。
+        本方法只产出布尔决策与几何字段, states 的 null 填充一律在模型内完成。
+        """
+        import numpy as np
+
+        cfg = self.config
+        if not cfg.is_segment_summary:
+            return
+
+        lengths = batch["hist_transition_total_length"]
+        b = lengths.shape[0]
+        device = lengths.device
+        epoch = (self.global_step // self._batches_per_epoch) if self._batches_per_epoch else 0
+        index = batch.get("index", None)
+        if index is not None:
+            sample_index = index.reshape(-1)[:b].detach().cpu().numpy()
+        else:
+            sample_index = np.arange(b) + self.global_step * b
+
+        # ── 1. chain position: 同时截断 completed-task 文本与 transition 几何 ──
+        stats = {}
+        if cfg.history_chain_position_mode == "uniform_0_4":
+            max_pos = cfg.history_chain_max_position
+            u = stateless_uniform(self.seed, epoch, sample_index, stream_id=1)
+            drawn = np.minimum((u * (max_pos + 1)).astype(np.int64), max_pos)
+            completed = batch.get("completed_tasks", None)
+            completed_ann = batch.get("completed_tasks_ann", None)
+            effective = []
+            for i in range(b):
+                avail = len(completed[i]) if completed is not None else max_pos
+                pos = int(min(drawn[i], avail))
+                effective.append(pos)
+                # Python `[-0:]` 等于全列表, position=0 必须显式置空
+                if completed is not None:
+                    completed[i] = completed[i][-pos:] if pos > 0 else []
+                if completed_ann is not None:
+                    completed_ann[i] = completed_ann[i][-pos:] if pos > 0 else []
+            effective = torch.tensor(effective, dtype=torch.long, device=device)
+            reset = effective == 0
+            batch["hist_transition_frame_mask"] = (
+                batch["hist_transition_frame_mask"].bool() & ~reset.unsqueeze(1)
+            )
+            batch["hist_transition_total_length"] = torch.where(
+                reset, torch.zeros_like(lengths), lengths
+            )
+            for p in range(max_pos + 1):
+                stats[f"chain_pos_{p}"] = float((effective == p).float().mean())
+        else:
+            reset = lengths <= 0
+
+        # ── 2. content dropout: 与 reset 互斥 ──
+        t_drop = torch.from_numpy(
+            stateless_uniform(self.seed, epoch, sample_index, stream_id=2)
+            < cfg.transition_summary_drop_rate
+        ).to(device) & ~reset
+        k_drop = torch.from_numpy(
+            stateless_uniform(self.seed, epoch, sample_index, stream_id=3)
+            < cfg.task_summary_drop_rate
+        ).to(device)
+        batch["hist_transition_content_drop"] = t_drop
+        batch["hist_task_content_drop"] = k_drop
+
+        # ── 3. 分层统计: reset 样本的 transition 恒为空, 不能与非-reset 混在一起平均 ──
+        n_reset = float(reset.sum())
+        non_reset = ~reset
+        n_non = float(non_reset.sum())
+        stats["context_reset_rate"] = n_reset / b
+        stats["task_content_drop_rate"] = float(k_drop.float().mean())
+        if n_non > 0:
+            stats["nonreset_transition_drop_rate"] = float(t_drop[non_reset].float().mean())
+            t_real = non_reset & ~t_drop
+            k_real = ~k_drop
+            for name, sel in (("TT", t_real & k_real), ("TN", t_real & ~k_real),
+                              ("NT", ~t_real & k_real), ("NN", ~t_real & ~k_real)):
+                stats[f"nonreset_{name}"] = float((sel & non_reset).float().sum() / n_non)
+        stats["transition_real_rate"] = float((non_reset & ~t_drop).float().mean())
+        stats["task_real_rate"] = float((~k_drop).float().mean())
+        stats["transition_retained_mean"] = float(
+            batch["hist_transition_frame_mask"].float().sum(dim=1).mean()
+        )
+        stats["task_retained_mean"] = float(
+            batch["hist_task_frame_mask"].float().sum(dim=1).mean()
+        )
+        stats["transition_raw_length_mean"] = float(batch["hist_transition_total_length"].float().mean())
+        stats["task_raw_length_mean"] = float(batch["hist_task_total_length"].float().mean())
+        self._last_history_aug_stats = stats
 
     def training_step(self, batch, timing_dict: dict | None = None):
         """单步训练 - v07: warmup t-truncation and v-loss alarm"""
@@ -1900,6 +1977,8 @@ class LoLAV07Trainer:
         t_device = time.monotonic() - t0
 
         t1 = time.monotonic()
+        # history augmentation 必须在 _extract_special_fields() 之前 (方案 §5.3)
+        self._apply_history_augmentation(batch)
         # 提取特殊字段
         special_data = self._extract_special_fields(batch)
 
@@ -2027,6 +2106,9 @@ class LoLAV07Trainer:
         except TypeError:
             batches_per_epoch = None
             _log("IterableDataset detected: cannot determine batches per epoch")
+        # history augmentation 的 epoch 用 global_step // batches_per_epoch 语义,
+        # 不能用 self.current_epoch (1-indexed 且表示"进行中"的 epoch)
+        self._batches_per_epoch = batches_per_epoch
 
         # resume 定位: 以 start_step (已完成 batch 数) 为唯一基准推导 epoch 起点。
         # checkpoint 里的 current_epoch 是【进行中】的 epoch (1-indexed; save_every_n_epochs
@@ -2293,6 +2375,8 @@ class LoLAV07Trainer:
                                     log_dict[f"train/{k}"] = v
                             for k, v in interconnect_metrics.items():
                                 log_dict[f"interconnect/{k}"] = v
+                            for k, v in self._last_history_aug_stats.items():
+                                log_dict[f"hist_aug/{k}"] = v
                             for i, (r, a) in enumerate(zip(reserved_gathered, alloc_gathered)):
                                 log_dict[f"memory/gpu{i}_reserved_pct"] = r.item()
                                 log_dict[f"memory/gpu{i}_alloc_pct"] = a.item()
@@ -2434,8 +2518,82 @@ class LoLAV07Trainer:
 
         _log(f"Checkpoint saved: {ckpt_path}")
 
+    def _assert_checkpoint_arch_compatible(self, ckpt_path: str):
+        """load 前的架构 fingerprint 校验 (方案 §15.2)。
+
+        `--resume` 指向具体 run/tag 目录时会绕过 resume_search 的配置比较,
+        而 DeepSpeed 的 load_module_strict=False 不会对缺失参数报错。
+        """
+        base = ckpt_path.rstrip("/")
+        cfg_path = next(
+            (p for p in (os.path.join(base, "training_config.json"),
+                         os.path.join(os.path.dirname(base), "training_config.json"))
+             if os.path.isfile(p)),
+            None,
+        )
+        if cfg_path is None:
+            if self.config.is_segment_summary:
+                raise RuntimeError(
+                    f"[resume-preflight] segment_summary 拒绝加载无 training_config.json 的 "
+                    f"checkpoint: {ckpt_path} —— 无法验证架构一致性"
+                )
+            _log(f"[resume-preflight] ⚠️ {ckpt_path} 无 training_config.json, 跳过架构校验")
+            return
+
+        with open(cfg_path) as f:
+            candidate = json.load(f).get("lola_config") or {}
+
+        mismatches = []
+        for key in ARCH_FINGERPRINT_KEYS:
+            expected = getattr(self.config, key)
+            actual = candidate.get(key, LOLA_CONFIG_LEGACY_DEFAULTS.get(key, expected))
+            if actual != expected:
+                mismatches.append(f"{key}: checkpoint={actual!r} current={expected!r}")
+        if mismatches:
+            raise RuntimeError(
+                "[resume-preflight] checkpoint 架构与当前配置不兼容, 拒绝加载:\n  "
+                + "\n  ".join(mismatches)
+                + f"\n  (来源: {cfg_path})"
+            )
+        _log(f"[resume-preflight] 架构 fingerprint 一致 ({cfg_path})")
+
+    def _assert_ema_state_complete(self):
+        """EMA 缺 key 会被 `_ema_update()` 的 `.get()` 静默跳过 (方案 §15.5)。"""
+        if self._ema_state is None:
+            return
+        missing = [n for n, p in self.policy.named_parameters()
+                   if p.requires_grad and n not in self._ema_state]
+        if missing:
+            raise RuntimeError(
+                f"[resume] EMA state 缺 {len(missing)} 个 trainable 参数 key, "
+                f"这些参数的 EMA 会全程不更新: {missing[:10]}"
+            )
+
+    def _assert_null_buffer_consistent(self):
+        """checkpoint 的 null buffer 必须与当前 dataset stats 一致 (方案 §15.6)。
+
+        容差按 buffer 实际 dtype 推导: DeepSpeed 开 bf16 时 `module.bfloat16()` 会连
+        浮点 buffer 一起 cast (实测相对误差 ~2.6e-3), 用固定 1e-5 会误报。
+        """
+        if not self.config.is_segment_summary or self.history_state_stats is None:
+            return
+        mean, std = self.history_state_stats
+        expected = (0.0 - torch.as_tensor(mean, dtype=torch.float32).reshape(-1)) / (
+            torch.as_tensor(std, dtype=torch.float32).reshape(-1) + 1e-8
+        )
+        buffer = self.policy.model.state_encoder.history_null_state
+        actual = buffer.detach().float().cpu()
+        rtol = max(4.0 * torch.finfo(buffer.dtype).eps, 1e-6)
+        if not torch.allclose(actual, expected, rtol=rtol, atol=rtol * float(expected.abs().max())):
+            raise RuntimeError(
+                "[resume] checkpoint 的 history_null_state 与当前 dataset stats 不一致 —— "
+                f"不允许静默覆盖 (dtype={buffer.dtype}, rtol={rtol:.2e})\n"
+                f"  checkpoint={actual.tolist()}\n  expected  ={expected.tolist()}"
+            )
+
     def load_checkpoint(self, ckpt_path: str):
         """加载 checkpoint"""
+        self._assert_checkpoint_arch_compatible(ckpt_path)
         # 记录实际加载来源 (原地续训时写入 resume_history.jsonl)
         self._resume_loaded_from = ckpt_path
         vlm_unfrozen = False
@@ -2543,6 +2701,8 @@ class LoLAV07Trainer:
         elif vlm_unfrozen and self.train_vlm:
             self._vlm_unfrozen = True
 
+        self._assert_ema_state_complete()
+        self._assert_null_buffer_consistent()
         _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
 
@@ -2648,6 +2808,25 @@ def build_lola_config(args, dataset_metadata):
         image_aug_scale_max=args.image_aug_scale_max,
         visual_token_drop_rate=args.visual_token_drop_rate,
         obs_prev_chunk_frame=args.obs_prev_chunk_frame,
+        # 2026-08-23: 双 Segment Summary
+        history_tokenization_mode=args.history_tokenization_mode,
+        history_architecture_version=(
+            args.history_architecture_version
+            if args.history_architecture_version is not None
+            else (1 if args.history_tokenization_mode == "segment_summary" else 0)
+        ),
+        history_summary_num_heads=args.history_summary_num_heads,
+        max_transition_summary_frames=args.max_transition_summary_frames,
+        max_task_summary_frames=args.max_task_summary_frames,
+        transition_summary_drop_rate=args.transition_summary_drop_rate,
+        task_summary_drop_rate=args.task_summary_drop_rate,
+        history_chain_position_mode=args.history_chain_position_mode,
+        history_chain_max_position=args.history_chain_max_position,
+        history_summary_last_chunk_residual=not args.no_history_summary_last_chunk_residual,
+        history_summary_last_gate_init=args.history_summary_last_gate_init,
+        transition_summary_length_encoding=args.transition_summary_length_encoding,
+        task_summary_length_encoding=not args.no_task_summary_length_encoding,
+        history_summary_total_length_cap=args.history_summary_total_length_cap,
     )
 
     # 归一化模式
@@ -2667,6 +2846,63 @@ def build_lola_config(args, dataset_metadata):
         }
 
     return config, features, action_dim, state_dim
+
+
+def stateless_uniform(base_seed: int, epoch: int, sample_index, stream_id: int):
+    """按样本、跨进程稳定的伪随机 [0, 1) (方案 §16)。
+
+    禁用 Python 内建 hash(): 默认带随机盐, 跨进程/跨启动不稳定。
+    这里用 SplitMix64 混合, 使同一 (seed, epoch, sample_index, stream) 永远得到同一值
+    —— 因此 augmentation 不受 batch 顺序 / rank 分配 / resume 影响。
+    """
+    import numpy as np
+
+    idx = np.asarray(sample_index).astype(np.uint64)
+    c1 = np.uint64(0x9E3779B97F4A7C15)
+    c2 = np.uint64(0xD1B54A32D192ED03)
+    c3 = np.uint64(0xBF58476D1CE4E5B9)
+    c4 = np.uint64(0x94D049BB133111EB)
+    with np.errstate(over="ignore"):
+        z = (np.uint64(base_seed & 0xFFFFFFFFFFFFFFFF) * c1
+             + np.uint64(epoch & 0xFFFFFFFFFFFFFFFF) * c2
+             + idx * c3
+             + np.uint64(stream_id & 0xFFFFFFFFFFFFFFFF) * c4)
+        z = (z ^ (z >> np.uint64(30))) * c3
+        z = (z ^ (z >> np.uint64(27))) * c4
+        z = z ^ (z >> np.uint64(31))
+    return (z >> np.uint64(11)).astype(np.float64) / float(1 << 53)
+
+
+def log_history_config(config: LoLAV07Config):
+    """启动期回显实际生效的 history 配置 (方案 §6.6)。
+
+    CLI / build_lola_config / create_lola_dataset / launcher 共 6 处接线, 漏接任一环
+    都不会报错 (两层都有默认值), 只会静默退回 chunks —— 这是唯一低成本的拦截手段。
+    """
+    _log(f"[history] tokenization_mode      = {config.history_tokenization_mode}")
+    _log(f"[history] architecture_version   = {config.history_architecture_version}")
+    if not config.is_segment_summary:
+        _log(f"[history] max_history_length     = {config.max_history_length}")
+        return
+    _log(f"[history] budgets (transition/task) = "
+         f"{config.max_transition_summary_frames} / {config.max_task_summary_frames}"
+         f"  -> padded P = {config.summary_padded_frames}")
+    _log(f"[history] chunk_size / num_chunks = "
+         f"{config.action_chunk_size} / {config.summary_num_chunks}")
+    _log(f"[history] chain_position_mode     = {config.history_chain_position_mode} "
+         f"(max {config.history_chain_max_position})")
+    _log(f"[history] completed_tasks max     = {config.completed_tasks_history_len}")
+    _log(f"[history] content drop (tr/task)  = "
+         f"{config.transition_summary_drop_rate:.2f} / {config.task_summary_drop_rate:.2f}")
+    _log(f"[history] length encoding (tr/task) = "
+         f"{'on' if config.transition_summary_length_encoding else 'off'} / "
+         f"{'on' if config.task_summary_length_encoding else 'off'}"
+         f"  cap = {config.history_summary_total_length_cap}")
+    _log(f"[history] last_chunk_residual     = "
+         f"{'on' if config.history_summary_last_chunk_residual else 'off'} "
+         f"(gate_init {config.history_summary_last_gate_init})")
+    _log(f"[history] summary_num_heads       = {config.history_summary_num_heads}")
+    _log(f"[history] state_dim               = {config.state_dim}")
 
 
 def build_dataset_metadata_snapshot(dataset_metadata, features):
@@ -2769,6 +3005,45 @@ def build_arg_parser():
                         help="方案B 数据集侧: 合并 transition+task 为连续历史流 (默认跟随 --no_previous_task_end)")
     parser.add_argument("--no_merge_history_stream", action="store_true",
                         help="显式关闭合并历史流 (用于消融: 方案B模型 + 两段式数据)")
+
+    # ── 双 Segment Summary (2026-08-23) ──
+    # 架构字段: mode / version 双向绑定, 决定 checkpoint 能否加载
+    parser.add_argument("--history_tokenization_mode", type=str, default="chunks",
+                        choices=["chunks", "segment_summary"],
+                        help="segment_summary: transition/task 各压缩为 1 个 summary token, "
+                             "history stream 恒为 5 token")
+    parser.add_argument("--history_architecture_version", type=int, default=None,
+                        help="架构版本 (None = 跟随 mode: chunks->0, segment_summary->1)")
+    # 训练语义字段: 不改参数 shape 但改行为, 仍参与 resume 匹配
+    parser.add_argument("--history_summary_num_heads", type=int, default=8,
+                        help="Attention pooling 头数 (须整除 dit_hidden_size)")
+    parser.add_argument("--max_transition_summary_frames", type=int, default=32,
+                        help="transition 段保留的最近帧数 (须整除 action_chunk_size)")
+    parser.add_argument("--max_task_summary_frames", type=int, default=32,
+                        help="当前 task 段保留的最近帧数 (须整除 action_chunk_size)")
+    parser.add_argument("--transition_summary_drop_rate", type=float, default=0.7,
+                        help="transition content dropout 概率 (只替换内容, 不改 mask/length/PTE)")
+    parser.add_argument("--task_summary_drop_rate", type=float, default=0.7,
+                        help="task content dropout 概率")
+    parser.add_argument("--history_chain_position_mode", type=str, default="none",
+                        choices=["none", "uniform_0_4"],
+                        help="uniform_0_4: 联动截断 completed_tasks 文本与 transition 几何, "
+                             "使训练分布接近 CALVIN 五任务链的 0..4 前置任务分布")
+    parser.add_argument("--history_chain_max_position", type=int, default=4,
+                        help="chain position 上界 (uniform_0_4 下须为 4)")
+    parser.add_argument("--no_history_summary_last_chunk_residual", action="store_true",
+                        help="关闭 last-valid chunk residual 旁路 (参数仍恒建, 只门控 forward)")
+    parser.add_argument("--history_summary_last_gate_init", type=float, default=-4.0,
+                        help="residual gate 初值 (sigmoid(-4.0) ≈ 0.018)")
+    parser.add_argument("--transition_summary_length_encoding", action="store_true",
+                        help="开启 transition 段的 total-length 编码 (训练侧近乎常数, 默认关)")
+    parser.add_argument("--no_task_summary_length_encoding", action="store_true",
+                        help="关闭 task 段的 total-length 编码 (评测端 clamp 会长期饱和, 见方案 §10.10)")
+    parser.add_argument("--history_summary_total_length_cap", type=int, default=64,
+                        help="进入模型前 total_length 的 clamp 上界 (训练侧 episode 最长 64)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="统一随机种子 (Python/NumPy/Torch/Sampler 与 history augmentation)")
+
     parser.add_argument("--max_image_pixels", type=int, default=230400,
                         help="每张图片最大像素数（控制 visual token 数）")
     parser.add_argument("--min_image_pixels", type=int, default=65536,
@@ -2924,6 +3199,17 @@ def main():
     # 参数解析
     args = build_arg_parser().parse_args()
 
+    # 统一随机种子 (方案 §16)。history augmentation 不依赖它 —— 那条链路是按样本
+    # stateless 的, resume 后同一样本仍得到同一结果。
+    if getattr(args, "seed", None) is not None:
+        import random as _random
+
+        import numpy as _np
+        _random.seed(args.seed)
+        _np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
     # 检查数据集参数
     if args.dataset_repo_id is None and args.dataset_root is None:
         raise ValueError("Either --dataset_repo_id or --dataset_root must be provided.")
@@ -3008,6 +3294,7 @@ def main():
     # 创建 LoLA 配置 (build_lola_config 与 resume_search CLI 共享, 保证 resume
     # 搜索用的配置快照与实际训练进程严格同源)
     config, features, action_dim, state_dim = build_lola_config(args, dataset_metadata)
+    log_history_config(config)
 
     # Resume 解析: --resume 支持三形态 — 具体 tag 目录 (step_XXXXXX/final) /
     # 含 latest 指针的 run 目录 / run 集合目录。集合目录进入搜索模式: 读取各 run 的
@@ -3160,6 +3447,15 @@ def main():
     trainer.use_wandb = use_wandb
     # 原地续训写回目录 (None = 新建时间戳目录)
     trainer.resume_save_dir = inplace_save_dir
+
+    # null buffer 的 stats 必须与 dataset 实际使用的一致 (跟随 stats_mode)
+    if config.is_segment_summary:
+        if getattr(train_dataset, "_state_mean", None) is None:
+            raise RuntimeError(
+                "segment_summary requires z-score state stats on the dataset "
+                "(--norm_mode zscore + --history_type state)"
+            )
+        trainer.history_state_stats = (train_dataset._state_mean, train_dataset._state_std)
 
     # 设置模型
     trainer.setup_model()

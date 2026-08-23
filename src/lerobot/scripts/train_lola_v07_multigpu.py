@@ -61,9 +61,10 @@ from resume_search import resolve_merge_history_stream  # merge_history_stream �
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.lola_dataset import LoLADataset  # 新增：支持完整历史action的数据集
+from lerobot.datasets.lola_dataset import HISTORY_SPECIAL_PREFIXES, LoLADataset  # 新增：支持完整历史action的数据集
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
+from lerobot.policies.lola_v07.modeling_lola_v07 import build_lola_v07_param_groups
 from lerobot.policies.factory import make_pre_post_processors
 
 
@@ -261,22 +262,18 @@ class LoLAV07LightningModule(pl.LightningModule):
         提取特殊字段，避免被preprocessor处理。
 
         包括：
-        - hist_actions_full, hist_actions_mask, hist_actions_length: LoLADataset的历史action字段
-        - hist_states_full, hist_states_mask, hist_states_length: LoLADataset的历史state字段
+        - 所有 `hist_` / `n_transition` 前缀字段: LoLADataset 的历史字段
+          (chunks 模式的 hist_actions_*/hist_states_*, summary 模式的六字段,
+          以及 trainer 瞬态生成的 hist_*_content_drop)
         - action: 目标action字段（shape可能不匹配stats中的定义）
 
         这些字段不在数据集stats中定义，或者shape可能与stats不匹配。
+        按前缀而非逐 key 白名单 —— batch_to_transition() 只保留硬编码白名单,
+        新增字段漏提不会报错, 只会静默消失。
         """
         special_data = {}
-        # LoLADataset 的历史action和state字段
-        keys_to_extract = [
-            "hist_actions_full", "hist_actions_mask", "hist_actions_length",
-            "hist_states_full", "hist_states_mask", "hist_states_length",
-            "n_transition", "n_transition_chunks",
-        ]
-        for key in keys_to_extract:
-            if key in batch:
-                special_data[key] = batch.pop(key)
+        for key in [k for k in batch if k.startswith(HISTORY_SPECIAL_PREFIXES)]:
+            special_data[key] = batch.pop(key)
 
         # 提取action字段（因为其shape可能与stats不匹配）
         # 当使用delta_timestamps加载多步action时，shape是(B, T, action_dim)
@@ -406,27 +403,12 @@ class LoLAV07LightningModule(pl.LightningModule):
     def configure_optimizers(self):
         """配置优化器 - v07: Separate parameter groups with encoder LR multiplier"""
         # v07: Separate parameter groups
-        encoder_lr_mult = self.config.encoder_lr_mult
         base_lr = self.learning_rate
-
-        param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-
-        # VLM group: only add when train_vlm=True AND VLM is NOT in delayed-unfreeze mode
-        vlm_lr_mult = self.config.vlm_lr_mult
-        if self.train_vlm and not self._vlm_delayed_unfreeze:
-            param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
-
-        # Filter out params that don't require grad
-        for group in param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
+        param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, base_lr,
+            vlm_lr=base_lr * self.config.vlm_lr_mult,
+            include_vlm=self.train_vlm and not self._vlm_delayed_unfreeze,
+        )
 
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -479,25 +461,12 @@ class LoLAV07LightningModule(pl.LightningModule):
             self.policy.vlm.gradient_checkpointing_enable()
 
         # Create a new optimizer + scheduler that includes ALL existing param groups + VLM group
-        encoder_lr_mult = self.config.encoder_lr_mult
-        vlm_lr_mult = self.config.vlm_lr_mult
         base_lr = self.learning_rate
-
-        param_groups = [
-            {"params": list(self.policy.model.dit.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.vlm_bridge.parameters()), "lr": base_lr},
-            {"params": list(self.policy.model.action_encoder.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.arm_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-            {"params": list(self.policy.model.grip_dit_to_latent.parameters()), "lr": base_lr * encoder_lr_mult},
-        ]
-        if self.policy.model.state_encoder is not None:
-            param_groups.append({"params": list(self.policy.model.state_encoder.parameters()), "lr": base_lr * encoder_lr_mult})
-        # Add VLM group
-        param_groups.append({"params": list(self.policy.vlm.parameters()), "lr": base_lr * vlm_lr_mult})
-
-        # Filter out params that don't require grad
-        for group in param_groups:
-            group["params"] = [p for p in group["params"] if p.requires_grad]
+        param_groups = build_lola_v07_param_groups(
+            self.policy, self.config, base_lr,
+            vlm_lr=base_lr * self.config.vlm_lr_mult,
+            include_vlm=True,
+        )
 
         new_optimizer = torch.optim.AdamW(
             param_groups,
@@ -532,7 +501,7 @@ class LoLAV07LightningModule(pl.LightningModule):
         total_params = sum(p.numel() for p in self.policy.parameters())
         print(f"[Rank {self.global_rank}] VLM UNFROZEN at step {self.global_step}! "
               f"Trainable params: {trainable_params:,} / {total_params:,} "
-              f"(remaining_steps={remaining_steps}, vlm_lr={base_lr * vlm_lr_mult})")
+              f"(remaining_steps={remaining_steps}, vlm_lr={base_lr * self.config.vlm_lr_mult})")
 
 
 # ----------------------------------------------------------------------
@@ -649,6 +618,9 @@ def create_lola_dataset(
             hist_action_token_drop_rate=config.hist_action_token_drop_rate,
             max_transition_len=max_transition_len,
             merge_history_stream=merge_history_stream,
+            history_tokenization_mode=config.history_tokenization_mode,
+            max_transition_summary_frames=config.max_transition_summary_frames,
+            max_task_summary_frames=config.max_task_summary_frames,
             stats_mode=stats_mode,
         )
     else:

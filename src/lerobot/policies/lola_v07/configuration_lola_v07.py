@@ -65,6 +65,40 @@ class LoLAV07Config(LoLAConfig):
     # episode 边界 clamp 语义对齐)。开启后 observation_delta_indices = [-chunk, 0]。
     obs_prev_chunk_frame: bool = False
 
+    # ==========================
+    # 双 Segment Summary (2026-08-23)
+    # ==========================
+    # transition / 当前 task 各自独立保留最近 N 帧, 各压缩为 1 个语义 summary token。
+    # 与 chunks 模式的区别: history stream 长度恒为 5
+    # (hist_start | transition_summary | PTE | task_summary | hist_end)。
+    #
+    # 字段分为两类 (见方案 §6.4):
+    #   - 架构 fingerprint: 改变参数拓扑, 决定 checkpoint 能否加载
+    #   - 训练语义: 不改参数 shape 但改行为, 仍参与 resume 匹配
+    # 所有 flag 型字段都是"参数恒建、flag 只门控 forward", 因此开关切换不换架构。
+    history_architecture_version: int = 0   # 0 = chunks, 1 = segment_summary v1
+    history_tokenization_mode: str = "chunks"  # "chunks" | "segment_summary"
+
+    history_summary_num_heads: int = 8
+    max_transition_summary_frames: int = 32
+    max_task_summary_frames: int = 32
+
+    # content dropout: 只把 states 替换为 null, 不动 mask/length/present/PTE
+    transition_summary_drop_rate: float = 0.7
+    task_summary_drop_rate: float = 0.7
+
+    # chain-position sampling: 联动截断 completed_tasks 文本与 transition 几何,
+    # 使训练分布接近 CALVIN 五任务链的 0..4 前置已完成任务分布
+    history_chain_position_mode: str = "none"  # "none" | "uniform_0_4"
+    history_chain_max_position: int = 4
+
+    history_summary_last_chunk_residual: bool = True
+    history_summary_last_gate_init: float = -4.0   # sigmoid ≈ 0.018
+
+    transition_summary_length_encoding: bool = False
+    task_summary_length_encoding: bool = True
+    history_summary_total_length_cap: int = 64
+
     def __post_init__(self):
         super().__post_init__()
         # Validate bottleneck dimensions
@@ -113,6 +147,111 @@ class LoLAV07Config(LoLAConfig):
         for name in ("image_aug_brightness", "image_aug_contrast", "image_aug_saturation", "image_aug_translate"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0")
+        self._validate_history_tokenization()
+
+    def _validate_history_tokenization(self):
+        """双 Segment Summary 的模式校验 (方案 §6.3)。
+
+        整除校验不可省略: LolaV07StateEncoder._pad_and_chunk() 在 seq 不整除
+        chunk_size 时会在【最新帧右侧】补零, 静默污染 last-valid chunk。
+        """
+        valid_modes = ("chunks", "segment_summary")
+        if self.history_tokenization_mode not in valid_modes:
+            raise ValueError(
+                f"history_tokenization_mode must be one of {valid_modes}, "
+                f"got {self.history_tokenization_mode!r}"
+            )
+
+        # 模式 <-> version 双向绑定
+        expected_version = 1 if self.history_tokenization_mode == "segment_summary" else 0
+        if self.history_architecture_version != expected_version:
+            raise ValueError(
+                f"history_architecture_version must be {expected_version} when "
+                f"history_tokenization_mode={self.history_tokenization_mode!r}, "
+                f"got {self.history_architecture_version}"
+            )
+
+        for name in ("transition_summary_drop_rate", "task_summary_drop_rate"):
+            value = getattr(self, name)
+            if not (0.0 <= value <= 1.0):
+                raise ValueError(f"{name} must be in [0.0, 1.0], got {value}")
+
+        valid_chain_modes = ("none", "uniform_0_4")
+        if self.history_chain_position_mode not in valid_chain_modes:
+            raise ValueError(
+                f"history_chain_position_mode must be one of {valid_chain_modes}, "
+                f"got {self.history_chain_position_mode!r}"
+            )
+
+        if self.history_tokenization_mode != "segment_summary":
+            return
+
+        required = {
+            "history_type": "state",
+            "state_encoder_mode": "unified",
+            "load_full_history": True,
+            "use_special_tokens": True,
+            "use_previous_task_end": True,
+            "hist_action_token_drop_rate": 0.0,
+            "transition_mask_rate": 0.0,
+            # CALVIN 五任务链前置已完成任务最多 4 条; 5 条这个 prompt 格式在评测中
+            # 不存在。模式级不变量 — 否则 R1a/R1b 对照会被 5 vs 4 污染 (方案 §6.3)。
+            "completed_tasks_history_len": 4,
+        }
+        for name, expected in required.items():
+            actual = getattr(self, name)
+            if actual != expected:
+                raise ValueError(
+                    f"segment_summary mode requires {name}={expected!r}, got {actual!r}"
+                )
+
+        for name in ("max_transition_summary_frames", "max_task_summary_frames"):
+            value = getattr(self, name)
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0 in segment_summary mode, got {value}")
+            if value % self.action_chunk_size != 0:
+                raise ValueError(
+                    f"{name} ({value}) must be a multiple of action_chunk_size "
+                    f"({self.action_chunk_size}) — otherwise the state encoder pads zeros "
+                    f"to the RIGHT of the newest frame and silently corrupts the last chunk"
+                )
+
+        if self.history_summary_num_heads <= 0:
+            raise ValueError(
+                f"history_summary_num_heads must be > 0, got {self.history_summary_num_heads}"
+            )
+        if self.dit_hidden_size % self.history_summary_num_heads != 0:
+            raise ValueError(
+                f"dit_hidden_size ({self.dit_hidden_size}) must be divisible by "
+                f"history_summary_num_heads ({self.history_summary_num_heads})"
+            )
+        if self.history_summary_total_length_cap <= 0:
+            raise ValueError(
+                f"history_summary_total_length_cap must be > 0, "
+                f"got {self.history_summary_total_length_cap}"
+            )
+        if self.history_chain_position_mode == "uniform_0_4" and self.history_chain_max_position != 4:
+            raise ValueError(
+                f"history_chain_max_position must be 4 when "
+                f"history_chain_position_mode='uniform_0_4', got {self.history_chain_max_position}"
+            )
+
+    @property
+    def is_segment_summary(self) -> bool:
+        return self.history_tokenization_mode == "segment_summary"
+
+    @property
+    def summary_padded_frames(self) -> int:
+        """两段在模型入口对齐到的公共帧预算 P = max(T, K) (方案 §10.3)。
+
+        不等 budget 时较短的一段左 pad 到 P (内容 null / mask False), 再沿 batch
+        合并成一次 state encoder 前向 — 保住 ZeRO-3 的单次模块调用约束。
+        """
+        return max(self.max_transition_summary_frames, self.max_task_summary_frames)
+
+    @property
+    def summary_num_chunks(self) -> int:
+        return self.summary_padded_frames // self.action_chunk_size
 
     @property
     def observation_delta_indices(self) -> list:

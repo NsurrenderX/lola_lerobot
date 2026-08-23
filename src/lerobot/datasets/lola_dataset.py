@@ -38,6 +38,29 @@ from typing import Callable
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.video_utils import decode_video_frames, scan_video_seek_modes
 
+# 历史字段契约 (方案 §7.3 / §8.2)。
+#
+# processor/converters.py:batch_to_transition() 只保留硬编码白名单里的 key,
+# 其余一律静默消失。因此所有 history 字段必须在 preprocessor 前按前缀 pop 出来,
+# 之后再放回 —— 漏一个字段不会报错, 只会静默训练出一个没有历史的模型。
+HISTORY_SPECIAL_PREFIXES = ("hist_", "n_transition")
+
+# dataset 产出, 训练与评测都必须存在
+SEGMENT_SUMMARY_REQUIRED_FIELDS = (
+    "hist_transition_states",
+    "hist_transition_frame_mask",
+    "hist_transition_total_length",
+    "hist_task_states",
+    "hist_task_frame_mask",
+    "hist_task_total_length",
+)
+
+# trainer 瞬态生成, 评测端不存在 —— 不得纳入 fail-fast
+SEGMENT_SUMMARY_OPTIONAL_FIELDS = (
+    "hist_transition_content_drop",
+    "hist_task_content_drop",
+)
+
 
 class LolaImageAugment:
     """LoLA 图像增强 (2026-08-12): brightness/contrast/saturation 小幅 jitter
@@ -150,6 +173,10 @@ class LoLADataset(LeRobotDataset):
         completed_tasks_history_len: int = 5,
         # 方案B: 合并 transition + task 为连续历史流 (不再两段式分别 padding)
         merge_history_stream: bool = False,
+        # 双 Segment Summary: 两段各自独立保留最近 N 帧, 各压缩为 1 个 summary token
+        history_tokenization_mode: str = "chunks",
+        max_transition_summary_frames: int = 32,
+        max_task_summary_frames: int = 32,
         # Stats mode for z-score normalization
         stats_mode: str = "original",  # "original" or "incremental"
     ):
@@ -208,6 +235,11 @@ class LoLADataset(LeRobotDataset):
         # 单次左 pad, 无段间 mask 空洞; n_transition_chunks 恒为 0。
         # drop rate 仍在合并前按来源分段施加, 语义与两段式一致。
         self.merge_history_stream = merge_history_stream
+
+        # 双 Segment Summary 契约 (方案 §7): 两段不竞争预算, 各自左 pad 到固定 budget
+        self.history_tokenization_mode = history_tokenization_mode
+        self.max_transition_summary_frames = max_transition_summary_frames
+        self.max_task_summary_frames = max_task_summary_frames
 
         # Z-score normalization stats (computed from dataset metadata)
         # stats_mode: "original" uses default stats keys, "incremental" uses _incremental keys
@@ -308,6 +340,10 @@ class LoLADataset(LeRobotDataset):
         print(f"[LoLADataset] action_chunk_size: {action_chunk_size}")
         print(f"[LoLADataset] history_padding_side: {history_padding_side}")
         print(f"[LoLADataset] merge_history_stream: {self.merge_history_stream}")
+        print(f"[LoLADataset] history_tokenization_mode: {self.history_tokenization_mode}")
+        if self.history_tokenization_mode == "segment_summary":
+            print(f"[LoLADataset] summary budgets (transition/task): "
+                  f"{self.max_transition_summary_frames} / {self.max_task_summary_frames}")
         print(f"[LoLADataset] action_dim: {self.action_dim}")
         print(f"[LoLADataset] stats_mode: {self.stats_mode}")
 
@@ -412,6 +448,13 @@ class LoLADataset(LeRobotDataset):
             # V1 dataset without metadata — no completed tasks
             item["completed_tasks"] = []
             item["completed_tasks_ann"] = []
+
+        # 双 Segment Summary: 两段各自独立保留最近 budget 帧, 不竞争预算, 不输出
+        # n_transition_chunks; 旧 chunks 路径行为完全不变 (方案 §7.2)。
+        if self.history_tokenization_mode == "segment_summary":
+            self._build_segment_history(item, idx, ep_idx, ep_start)
+            self._normalize_item(item)
+            return item
 
         # ── V2: Build history from two sources, SEPARATE padding/mask ────
         # Source 1: Transition history (pre-annotation) from npz
@@ -610,6 +653,67 @@ class LoLADataset(LeRobotDataset):
         item["n_transition_chunks"] = torch.tensor(n_transition_chunks, dtype=torch.long)
 
         # Normalization
+        self._normalize_item(item)
+
+        return item
+
+    # ------------------------------------------------------------------
+    # segment_summary 六字段契约 (方案 §7)
+    # ------------------------------------------------------------------
+
+    def _left_pad_segment(self, data, budget: int):
+        """左 pad 到固定 budget, 返回 (states[budget, dim], frame_mask[budget])。
+
+        padding 在 raw space 用零; 后续统一 z-score 后恰好等于 normalize(raw_zero),
+        与模型侧 history_null_state buffer 一致 (方案 §9)。
+        """
+        dim = self.state_dim
+        n = 0 if data is None else int(data.shape[0])
+        if n > budget:
+            data = data[-budget:]
+            n = budget
+        states = torch.zeros(budget, dim, dtype=torch.float32)
+        mask = torch.zeros(budget, dtype=torch.bool)
+        if n > 0:
+            states[budget - n:] = data.to(torch.float32)
+            mask[budget - n:] = True
+        return states, mask
+
+    def _build_segment_history(self, item: dict, idx: int, ep_idx: int, ep_start: int) -> None:
+        """产出 6 个字段; retained_length / present 由模型侧从 mask / total_length 派生。"""
+        t_budget = self.max_transition_summary_frames
+        k_budget = self.max_task_summary_frames
+
+        # ── transition: npz 的 pre-annotation 帧 (右对齐存放) ──
+        t_total = 0
+        t_real = None
+        if self._hist_state_all is not None and ep_idx < len(self._hist_state_all):
+            # 注意: pre_len 已被转换阶段 clamp 到 max_transition_len, 无法恢复更早长度
+            t_total = int(self._hist_len_all[ep_idx])
+            if t_total > 0:
+                seq = self._hist_state_all[ep_idx]
+                t_real = seq[seq.shape[0] - min(t_total, t_budget):]
+        t_states, t_mask = self._left_pad_segment(t_real, t_budget)
+
+        # ── task: 当前 episode 内最近 k_budget 帧 (只查该窗口, 不读整个 episode) ──
+        k_total = idx - ep_start + 1
+        k_real = None
+        if k_total > 0:
+            task_from = max(ep_start, idx - k_budget + 1)
+            k_real = self._query_hf_dataset(
+                {"observation.state": list(range(task_from, idx + 1))}
+            )["observation.state"]
+        k_states, k_mask = self._left_pad_segment(k_real, k_budget)
+
+        item["hist_transition_states"] = t_states
+        item["hist_transition_frame_mask"] = t_mask
+        item["hist_transition_total_length"] = torch.tensor(t_total, dtype=torch.long)
+        item["hist_task_states"] = k_states
+        item["hist_task_frame_mask"] = k_mask
+        item["hist_task_total_length"] = torch.tensor(max(k_total, 0), dtype=torch.long)
+
+    def _normalize_item(self, item: dict) -> None:
+        """action / history 归一化 (chunks 与 segment_summary 共用)。"""
         if self.norm_action in (True, "minmax", "robovlm"):
             from lerobot.datasets.robovlm_dataset import normalize_action
             if "action" in item:
@@ -618,6 +722,9 @@ class LoLADataset(LeRobotDataset):
                 item["hist_actions_full"] = normalize_action(item["hist_actions_full"], self.norm_min, self.norm_max)
             if "hist_states_full" in item:
                 item["hist_states_full"] = normalize_action(item["hist_states_full"], self.norm_min, self.norm_max)
+            for key in ("hist_transition_states", "hist_task_states"):
+                if key in item:
+                    item[key] = normalize_action(item[key], self.norm_min, self.norm_max)
         elif self.norm_action == "zscore":
             from lerobot.datasets.robovlm_dataset import normalize_action_zscore
             if "action" in item:
@@ -634,8 +741,17 @@ class LoLADataset(LeRobotDataset):
                 item["hist_states_full"] = (
                     (item["hist_states_full"] - self._state_mean) / (self._state_std + 1e-8)
                 )
+            if self._state_mean is not None:
+                for key in ("hist_transition_states", "hist_task_states"):
+                    if key in item:
+                        item[key] = (item[key] - self._state_mean) / (self._state_std + 1e-8)
 
-        return item
+    @property
+    def history_null_state(self) -> torch.Tensor:
+        """normalize(raw_zero) —— 必须与模型侧 buffer 逐元素相等 (方案 §9.2)。"""
+        if self._state_mean is None:
+            return torch.zeros(self.state_dim, dtype=torch.float32)
+        return (0.0 - self._state_mean) / (self._state_std + 1e-8)
 
 
 class LoLADatasetMetadata(LeRobotDatasetMetadata):

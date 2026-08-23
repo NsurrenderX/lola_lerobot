@@ -68,7 +68,40 @@ LOLA_CONFIG_LEGACY_DEFAULTS = {
     # 2026-08-20 引入: 禁用 transition/task 拆分与 previous_task_end 的方案B 旋钮。
     # 引入前所有 run 均为拆分 + previous_task_end 行为 (=True)。
     "use_previous_task_end": True,
+    # 2026-08-23 引入: 双 Segment Summary。存量 run 的 json 里一个都没有,
+    # 必须【全部】回填, 只补 history_tokenization_mode 会让其余键继续触发 _deep_diff,
+    # 导致所有旧 chunks run 假失配、自动 resume 失效。
+    "history_architecture_version": 0,
+    "history_tokenization_mode": "chunks",
+    "history_summary_num_heads": 8,
+    "max_transition_summary_frames": 32,
+    "max_task_summary_frames": 32,
+    "transition_summary_drop_rate": 0.7,
+    "task_summary_drop_rate": 0.7,
+    "history_chain_position_mode": "none",
+    "history_chain_max_position": 4,
+    "history_summary_last_chunk_residual": True,
+    "history_summary_last_gate_init": -4.0,
+    "transition_summary_length_encoding": False,
+    "task_summary_length_encoding": True,
+    "history_summary_total_length_cap": 64,
 }
+
+# segment_summary 模式下完全不读的旧 history 字段。它们仍在 dataclass 里, 若参与
+# 全量比较, 两次 summary run 只要这些数字写得不一样就无法 resume (方案 §15.4)。
+SUMMARY_IRRELEVANT_LOLA_KEYS = frozenset({
+    "max_history_length",
+    "history_padding_side",
+    "transition_mask_rate",
+    "hist_action_token_drop_rate",
+})
+
+
+def mode_aware_lola_config(cfg: dict) -> dict:
+    """按 history_tokenization_mode 裁剪无关字段 (两侧必须用同一个函数)。"""
+    if cfg.get("history_tokenization_mode", "chunks") == "segment_summary":
+        return {k: v for k, v in cfg.items() if k not in SUMMARY_IRRELEVANT_LOLA_KEYS}
+    return cfg
 
 
 def resolve_merge_history_stream(ta: dict) -> bool:
@@ -146,10 +179,10 @@ def build_current_snapshot(args, lola_config, dataset_metadata_dict, world_size)
     # 不用原始三态键 — 同一语义的多种 CLI 写法 (旋钮联动 vs 显式指定) 不能假失配
     training_args["merge_history_stream"] = resolve_merge_history_stream(ta)
     return {
-        "lola_config": {
+        "lola_config": mode_aware_lola_config({
             k: v for k, v in canon(dataclasses.asdict(lola_config)).items()
             if k not in LOLA_CONFIG_EXCLUDE_KEYS
-        },
+        }),
         "training_args": training_args,
         "distributed": {"world_size": int(world_size)},
         "dataset_metadata": canon(dataset_metadata_dict),
@@ -167,6 +200,7 @@ def _candidate_comparable(candidate_json):
     }
     for k, v in LOLA_CONFIG_LEGACY_DEFAULTS.items():
         cand_cfg.setdefault(k, v)
+    cand_cfg = mode_aware_lola_config(cand_cfg)
     cand_ta = candidate_json.get("training_args") or {}
     training_args = {k: v for k, v in cand_ta.items() if k in TRAINING_ARGS_INCLUDE_KEYS}
     training_args["merge_history_stream"] = resolve_merge_history_stream(cand_ta)

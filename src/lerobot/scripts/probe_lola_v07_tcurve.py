@@ -741,7 +741,9 @@ def main():
     # 顺序遍历 (shuffle=False): CRN 曲线跨运行可复现
     use_static_padding = args.load_full_history
     static_max_len = args.max_history_length if use_static_padding else None
-    collate = make_collate_fn(static_max_len=static_max_len)
+    # chunk_size 必须传 —— 缺失时 collate 退回整体左 pad, 探针测的就不是训练时的分布
+    collate = make_collate_fn(static_max_len=static_max_len,
+                              chunk_size=args.action_chunk_size)
 
     val_loader = DataLoader(
         val_dataset,
