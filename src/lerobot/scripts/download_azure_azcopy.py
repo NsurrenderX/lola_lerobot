@@ -34,6 +34,7 @@ import urllib.request
 import tarfile
 import argparse
 import re
+import fnmatch
 import time
 import threading
 import datetime
@@ -248,12 +249,28 @@ def _wait_with_countdown(seconds):
         time.sleep(1)
     print("\r  " + " " * 30 + "\r", end="", flush=True)
 
+def _wait_minutes(seconds):
+    """长时等待 (分钟级), 每分钟打一行心跳, 避免刷屏。"""
+    remaining = int(seconds)
+    while remaining > 0:
+        mins = (remaining + 59) // 60
+        print(f"  ⏳ 等待中... 剩余 ~{mins} 分钟", flush=True)
+        step = min(60, remaining)
+        time.sleep(step)
+        remaining -= step
+
 # ==========================================
 # 模块 3：调用 AzCopy 执行精准传输（单循环扁平化设计 + 计时统计）
 # 双向通用: source/destination 一侧为 blob URL 一侧为本地路径即可。
 # ==========================================
 MAX_RETRIES = 5
 RETRY_DELAY_SECONDS = 10
+# 第三级容错的等待时长 (秒): blob 直连与 blobfuse 挂载点都失败后, 等这么久让瞬时故障恢复。
+# 优先读环境变量 (可从 amlt yaml 的 env: 段调), 传不过来时硬编码兑底 420s。
+try:
+    FINAL_RETRY_WAIT_SECONDS = int(os.environ.get("LOLA_FINAL_RETRY_WAIT", "420"))
+except (TypeError, ValueError):
+    FINAL_RETRY_WAIT_SECONDS = 420
 
 def run_azcopy_transfer(azcopy_bin, source, destination, max_retries=MAX_RETRIES,
                         overwrite="ifSourceNewer", extra_copy_args=None,
@@ -383,17 +400,22 @@ def run_azcopy_transfer(azcopy_bin, source, destination, max_retries=MAX_RETRIES
 # ==========================================
 # 模块 4：The "Tweezers" (Targeted FUSE Fallback)
 # ==========================================
-def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
+def fallback_fuse_copy(fuse_src_dir, local_dst_dir, include_patterns=None):
     """
     扫描本地目标目录。如果发现文件缺失或大小与 FUSE 挂载点不一致，则使用标准的 Python I/O 安全复制。
     自动跳过所有以 '.' 开头的隐藏文件和隐藏文件夹。
+
+    include_patterns: 文件名 glob 列表 (如 ["latest", "training_config.json"] 或
+        ["*zero_pp_rank_0_mp_rank_00_*"]); 仅拷贝 basename 命中任一模式的文件,
+        语义对齐 azcopy --include-pattern。None = 拷贝全部 (原行为)。
+    返回: 挂载点可读且遍历完成为 True; 挂载点缺失/不可访问为 False (供上层决定是否进下一级)。
     """
     fuse_path = Path(fuse_src_dir).resolve()
     dst_path = Path(local_dst_dir).resolve()
 
     if not fuse_path.exists():
         print(f"⚠️ 找不到 FUSE 挂载路径: {fuse_src_dir}。无法执行后备修复。")
-        return
+        return False
 
     print(f"\n🔍 启动 FUSE 后备扫描: 正在对比本地 NVMe 与 {fuse_path.name} (已开启隐藏文件过滤)...")
     fixed_count = 0
@@ -416,6 +438,11 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
             # 🌟 核心过滤逻辑 2：过滤隐藏文件
             if file.startswith('.'):
                 skipped_hidden += 1
+                continue
+
+            # 按 include_patterns 过滤 (对齐 azcopy --include-pattern, 区分大小写)
+            if include_patterns and not any(
+                    fnmatch.fnmatchcase(file, pat) for pat in include_patterns):
                 continue
 
             fuse_file = current_fuse_dir / file
@@ -442,7 +469,8 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
     if fixed_count > 0:
         print(f"✅ 后备修复完成！成功找回并完美修复了 {fixed_count} 个顽固文件。(同时过滤了 {skipped_hidden} 个隐藏项)")
     else:
-        print(f"✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！(过滤了 {skipped_hidden} 个隐藏项)")
+        print(f"✅ 后备扫描完成：本地已与挂载点一致 (拷贝 0 个, 过滤了 {skipped_hidden} 个隐藏项)")
+    return True
 
 
 # ==========================================
@@ -460,6 +488,67 @@ def resolve_blob_ref(ref, account, container, mount_prefix="/mnt/wangxiaofa"):
     if ref.startswith(prefix):
         ref = ref[len(prefix):]
     return f"https://{account}.blob.core.windows.net/{container}/{ref.lstrip('/')}"
+
+
+def blob_url_to_mount_path(url, account, container, mount_prefix="/mnt/wangxiaofa"):
+    """resolve_blob_ref 的逆: 把 blob URL 反解回 blobfuse 挂载点路径。
+    account/container 对不上 (或 url 不是 http[s]) 返回 None → 上层跳过挂载点回退。"""
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return None
+    for scheme in ("https", "http"):
+        prefix = f"{scheme}://{account}.blob.core.windows.net/{container}/"
+        if url.startswith(prefix):
+            rel = url[len(prefix):]
+            return f"{mount_prefix.rstrip('/')}/{rel.lstrip('/')}"
+    return None
+
+
+def download_with_fallback(azcopy_bin, source, destination, *, account, container,
+                           mount_prefix="/mnt/wangxiaofa", max_retries=MAX_RETRIES,
+                           overwrite="ifSourceNewer", extra_copy_args=None,
+                           dir_transfer=None, include_patterns=None,
+                           final_retry_wait=FINAL_RETRY_WAIT_SECONDS):
+    """三级容错下载 (仅 blob->本地): azcopy 直连 → blobfuse 挂载点直拷 → 等待后两者各再试一次。
+
+    动机: blob 直连 (azcopy REST + MSI) 在网络抖动下偶发失败, 但已挂载的 blobfuse 层
+    此刻常是好的 (反之亦然)——二者是独立工具, 有一个 work 即可。小文件 (latest/
+    training_config.json) 走挂载点极可靠且极快。
+
+    分级:
+      ① azcopy (含其内部 max_retries 次重试) 成功 → 返回 True
+      ② 反解挂载点路径, 直拷 (按 include_patterns 过滤)。挂载点可读即认账
+         (拷到啥算啥; 全新实验拷 0 个 → 交下游"从头训练"逻辑) → 返回 True
+      ③ 仅当挂载点也不可访问 (真 FUSE 故障) 才进此级: 等 final_retry_wait 秒,
+         azcopy 与挂载点各再来一次, 谁先成谁赢; 双失败才返回 False
+    """
+    if run_azcopy_transfer(azcopy_bin, source, destination, max_retries=max_retries,
+                           overwrite=overwrite, extra_copy_args=extra_copy_args,
+                           dir_transfer=dir_transfer):
+        return True
+
+    mount_src = blob_url_to_mount_path(source, account, container, mount_prefix)
+    if mount_src is None:
+        print(f"\n⚠️ 无法从 {source} 反解挂载点路径 (account/container 不匹配), 跳过挂载点回退")
+    else:
+        print(f"\n🩹 azcopy 直连失败, 回退到 blobfuse 挂载点直拷: {mount_src} -> {destination}")
+        if fallback_fuse_copy(mount_src, destination, include_patterns=include_patterns):
+            print("✅ 挂载点回退成功 (以挂载点内容为准)")
+            return True
+
+    if final_retry_wait and final_retry_wait > 0:
+        print(f"\n⏳ azcopy 与挂载点均不可用, 等待 ~{(final_retry_wait + 59) // 60} 分钟后做最后一次尝试...")
+        _wait_minutes(final_retry_wait)
+        print("\n🔁 最后一次尝试 (1/2): azcopy 直连")
+        if run_azcopy_transfer(azcopy_bin, source, destination, max_retries=2,
+                               overwrite=overwrite, extra_copy_args=extra_copy_args,
+                               dir_transfer=dir_transfer):
+            return True
+        if mount_src is not None:
+            print("\n🔁 最后一次尝试 (2/2): blobfuse 挂载点直拷")
+            if fallback_fuse_copy(mount_src, destination, include_patterns=include_patterns):
+                return True
+
+    return False
 
 
 if __name__ == "__main__":
@@ -483,6 +572,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help=f"最大重试次数 (默认: {MAX_RETRIES})")
     parser.add_argument("--azcopy-path", type=str, default="./azcopy", help="azcopy 二进制存放路径")
     parser.add_argument("--mount-prefix", type=str, default="/mnt/wangxiaofa", help="blobfuse 挂载点前缀")
+    parser.add_argument("--fuse-fallback", action="store_true",
+                        help="下载失败时回退到 blobfuse 挂载点直拷 (三级容错; 仅对 --download 生效)")
+    parser.add_argument("--final-retry-wait", type=int, default=FINAL_RETRY_WAIT_SECONDS,
+                        help=f"三级容错最后一次尝试前的等待秒数 (默认读环境变量 LOLA_FINAL_RETRY_WAIT, "
+                             f"缺省 {FINAL_RETRY_WAIT_SECONDS})")
     args = parser.parse_args()
 
     if not args.download and not args.upload:
@@ -500,6 +594,7 @@ if __name__ == "__main__":
     extra_args = []
     if args.include_pattern:
         extra_args.append(f"--include-pattern={args.include_pattern}")
+    include_patterns = args.include_pattern.split(";") if args.include_pattern else None
 
     tasks = []
     for blob_ref, local in args.download:
@@ -513,9 +608,18 @@ if __name__ == "__main__":
 
     failed_tasks = []
     for src, dst, is_dir in tasks:
-        success = run_azcopy_transfer(azcopy_bin, src, dst, max_retries=args.max_retries,
-                                      overwrite=args.overwrite, extra_copy_args=extra_args,
-                                      dir_transfer=is_dir)
+        is_download = src.startswith("https://") or src.startswith("http://")
+        if args.fuse_fallback and is_download:
+            success = download_with_fallback(
+                azcopy_bin, src, dst, account=args.account, container=args.container,
+                mount_prefix=args.mount_prefix, max_retries=args.max_retries,
+                overwrite=args.overwrite, extra_copy_args=extra_args,
+                dir_transfer=is_dir, include_patterns=include_patterns,
+                final_retry_wait=args.final_retry_wait)
+        else:
+            success = run_azcopy_transfer(azcopy_bin, src, dst, max_retries=args.max_retries,
+                                          overwrite=args.overwrite, extra_copy_args=extra_args,
+                                          dir_transfer=is_dir)
         if not success:
             failed_tasks.append((src, dst))
 

@@ -954,7 +954,7 @@ if [ "$LOCALIZE_IO" = true ]; then
             # run 目录或 run 集合目录: 统一下载元数据 (latest + training_config.json,
             # 均为小文件, 一次拉完; 集合目录下每个 run 各一份)
             echo "[localize] resume: fetch metadata (latest + training_config.json) from $RESUME_BLOB"
-            _azcopy_transfer --download "$RESUME_BLOB" "$RESUME_LOCAL" --include-pattern "latest;training_config.json" --overwrite true --dir
+            _azcopy_transfer --download "$RESUME_BLOB" "$RESUME_LOCAL" --include-pattern "latest;training_config.json" --overwrite true --dir --fuse-fallback
             _show_layout "resume metadata" "$RESUME_LOCAL"
             if [ -f "${RESUME_LOCAL}/latest" ]; then
                 : # run 目录: latest 指针已在元数据下载中就位
@@ -988,7 +988,7 @@ if [ "$LOCALIZE_IO" = true ]; then
         fi
         if [ -n "$RESUME" ]; then
             echo "[localize] resume ckpt: $RESUME_TAG_DIR_BLOB -> $RESUME_TAG_DIR_LOCAL (shard filter: ranks ${START_RANK}-${END_RANK})"
-            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS" --dir
+            _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --include-pattern "$SHARD_PATTERNS" --dir --fuse-fallback
             _show_layout "resume tag" "$RESUME_TAG_DIR_LOCAL"
             # 校验本节点分片齐全, 缺失则全量重下兜底
             SHARDS_OK=true
@@ -1000,7 +1000,7 @@ if [ "$LOCALIZE_IO" = true ]; then
             done
             if [ "$SHARDS_OK" != true ]; then
                 echo "[localize] WARN: 分片过滤下载不完整, 全量重下 tag 目录兜底"
-                _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --dir
+                _azcopy_transfer --download "$RESUME_TAG_DIR_BLOB" "$RESUME_TAG_DIR_LOCAL" --dir --fuse-fallback
                 _show_layout "resume tag (全量兜底)" "$RESUME_TAG_DIR_LOCAL"
             fi
             RESUME="$RESUME_LOCAL"
