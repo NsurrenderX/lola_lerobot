@@ -38,6 +38,16 @@ LoLA Azure 分布式训练脚本 - 使用原生 PyTorch DDP
     python src/lerobot/scripts/train_lola_azure.py \
         --dataset_root /path/to/dataset \
         --disable_wandb
+
+Resume runtime options (also accepted by test_azure_v07c.sh):
+    --resume_fast_skip skips batch indices before reading samples. Sample order
+    is retained for an unchanged DistributedSampler; augmentation RNG may differ.
+    --resume_gpu_keepalive runs one random small BERT per GPU after checkpoint
+    restore, stopping all helpers before the first training forward. Both options
+    default off. The helper batch size defaults to 8; its maximum lifetime defaults
+    to 3600 seconds, after which resume fails. It does not cover earlier downloads
+    or checkpoint loading. Confirm cluster policy, utilization and VRAM headroom
+    before enabling it; synthetic activity is not a guarantee against suspension.
 """
 
 import argparse
@@ -47,13 +57,14 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 # 调试开关: LOLA_DETECT_ANOMALY=1 时开启 autograd anomaly detection (定位 backward 错误来源)
@@ -88,10 +99,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.lola_dataset import HISTORY_SPECIAL_PREFIXES, LoLADataset
+from lerobot.datasets.sampler import SkipBatchSampler
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola_v07 import LoLAV07Config, LoLAV07Policy
 from lerobot.policies.lola_v07.modeling_lola_v07 import build_lola_v07_param_groups
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.scripts.resume_gpu_keepalive import ResumeGPUKeepalive
 
 # resume 搜索 (同目录模块; run 集合目录 → 按训练配置匹配并选步数最多者)
 from resume_search import (
@@ -2039,6 +2052,21 @@ class LoLAV07Trainer:
         return loss, loss_dict
 
     def train(self, train_loader, start_step: int = 0, start_epoch: int = 0):
+        runtime_args = self.training_args or {}
+        keepalive_enabled = (
+            runtime_args.get("resume_gpu_keepalive", False)
+            and getattr(self, "resume_checkpoint_loaded", False)
+        )
+        context = ResumeGPUKeepalive(
+            local_rank=self.dist_info["local_rank"], global_rank=self.world_rank,
+            batch_size=runtime_args.get("resume_gpu_keepalive_batch_size", 8),
+            max_seconds=runtime_args.get("resume_gpu_keepalive_max_seconds", 3600),
+            log=_log,
+        ) if keepalive_enabled else nullcontext(None)
+        with context as keepalive:
+            self._train(train_loader, start_step, start_epoch, keepalive)
+
+    def _train(self, train_loader, start_step: int, start_epoch: int, resume_keepalive=None):
         """训练循环，增强 wandb 日志（throughput / timing / GPU metrics）"""
         self.global_step = start_step
         self.model.train()
@@ -2062,6 +2090,10 @@ class LoLAV07Trainer:
                             "resumed_from": getattr(self, "_resume_loaded_from", None),
                             "from_step": start_step,
                             "from_epoch": start_epoch,
+                            "resume_runtime": {
+                                key: value for key, value in (self.training_args or {}).items()
+                                if key.startswith("resume_fast_") or key.startswith("resume_gpu_")
+                            },
                         }) + "\n")
                 except OSError as e:
                     _log(f"WARNING: resume_history.jsonl 写入失败 ({e}), 不影响训练")
@@ -2100,12 +2132,19 @@ class LoLAV07Trainer:
             self._ema_register()
 
         # 计算 resume 时需要跳过的 batch 数
+        fast_sampler = getattr(train_loader, "batch_sampler", None)
+        if not isinstance(fast_sampler, SkipBatchSampler):
+            fast_sampler = None
         try:
-            batches_per_epoch = len(train_loader)
+            batches_per_epoch = fast_sampler.full_length if fast_sampler is not None else len(train_loader)
             _log(f"Total batches per epoch: {batches_per_epoch}")
         except TypeError:
             batches_per_epoch = None
             _log("IterableDataset detected: cannot determine batches per epoch")
+        if batches_per_epoch == 0:
+            raise ValueError("Training DataLoader has no complete batches")
+        _log(f"Resume runtime: fast_skip={fast_sampler is not None}, "
+             f"gpu_keepalive={resume_keepalive is not None}")
         # history augmentation 的 epoch 用 global_step // batches_per_epoch 语义,
         # 不能用 self.current_epoch (1-indexed 且表示"进行中"的 epoch)
         self._batches_per_epoch = batches_per_epoch
@@ -2140,17 +2179,42 @@ class LoLAV07Trainer:
                 break
             epoch += 1
             self.current_epoch = epoch
-            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            first_batch_index = 0
+            if fast_sampler is not None:
+                fast_sampler.set_epoch(epoch, start_batch=skip_batches)
+                first_batch_index = skip_batches
+                skip_batches = 0
+            elif hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
 
-            for batch_idx, batch in enumerate(train_loader):
+            if resume_keepalive is not None:
+                resume_keepalive.start()
+            resume_wait_started = time.monotonic()
+            skip_log_time = resume_wait_started
+
+            for batch_idx, batch in enumerate(train_loader, start=first_batch_index):
                 if self.max_steps is not None and self.global_step >= self.total_steps:
                     break
 
                 # Map-style 数据集：跳过 resume 前当前 epoch 已训的 batch
                 if skip_batches > 0:
                     skip_batches -= 1
+                    if time.monotonic() - skip_log_time >= 30:
+                        _log(f"Resume data skip: {skip_batches} batches remaining, "
+                             f"elapsed_s={time.monotonic() - resume_wait_started:.1f}")
+                        skip_log_time = time.monotonic()
                     continue
+
+                if resume_keepalive is not None:
+                    _log(f"First resumed batch ready: batch_idx={batch_idx}; waiting for all ranks")
+                    if self.is_distributed:
+                        dist.barrier()
+                    resume_keepalive.stop()
+                    if self.is_distributed:
+                        dist.barrier()
+                    resume_keepalive = None
+                    _log(f"Resume BERT released on all ranks; data_wait_s="
+                         f"{time.monotonic() - resume_wait_started:.2f}")
 
                 step_start = time.monotonic()
 
@@ -2407,6 +2471,9 @@ class LoLAV07Trainer:
                         _log(f"Checkpoint completed at step {self.global_step}: "
                              f"duration={checkpoint_completed - checkpoint_start:.1f}s, "
                              f"timer reset")
+
+            if resume_keepalive is not None:
+                raise RuntimeError("Resumed DataLoader ended before a productive batch was ready")
 
         # 保存最终 checkpoint
         if self.strategy == "deepspeed":
@@ -2703,6 +2770,7 @@ class LoLAV07Trainer:
 
         self._assert_ema_state_complete()
         self._assert_null_buffer_consistent()
+        self.resume_checkpoint_loaded = True
         _log(f"Checkpoint loaded from: {ckpt_path}, starting from step {self.global_step}")
 
 
@@ -2949,6 +3017,14 @@ def build_arg_parser():
     parser.add_argument("--train_vlm", action="store_true")
     parser.add_argument("--ckpt_dir", type=str, default="/data_16T/deepseek/checkpoints/lola")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume_fast_skip", action="store_true",
+                        help="Skip restored batch indices without reading samples; augmentation RNG may differ")
+    parser.add_argument("--resume_gpu_keepalive", action="store_true",
+                        help="Run a temporary random BERT on each GPU until all first resumed batches are ready")
+    parser.add_argument("--resume_gpu_keepalive_batch_size", type=int, default=8,
+                        help="Synthetic BERT batch size, independent of the training batch size")
+    parser.add_argument("--resume_gpu_keepalive_max_seconds", type=int, default=3600,
+                        help="Maximum keepalive lifetime; expiry aborts resume rather than leaving orphan work")
 
     # LoLA 参数
     parser.add_argument("--action_dim", type=int, default=14)
@@ -3199,6 +3275,9 @@ def main():
     # 参数解析
     args = build_arg_parser().parse_args()
 
+    if args.resume_gpu_keepalive_batch_size <= 0 or args.resume_gpu_keepalive_max_seconds <= 0:
+        raise ValueError("Resume keepalive batch size and maximum seconds must be positive")
+
     # 统一随机种子 (方案 §16)。history augmentation 不依赖它 —— 那条链路是按样本
     # stateless 的, resume 后同一样本仍得到同一结果。
     if getattr(args, "seed", None) is not None:
@@ -3395,16 +3474,28 @@ def main():
         _log(f"Using static collate padding to max_history_length={static_max_len}")
     collate = make_collate_fn(static_max_len=static_max_len, chunk_size=args.action_chunk_size)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=shuffle if sampler is None else False,
-        num_workers=args.num_workers,
-        collate_fn=collate,
-        pin_memory=True,
-        drop_last=True,  # 分布式训练建议 drop_last
-    )
+    if args.resume_fast_skip and args.resume and not isinstance(train_dataset, IterableDataset):
+        batch_sampler = SkipBatchSampler(BatchSampler(
+            sampler if sampler is not None else RandomSampler(train_dataset),
+            args.batch_size, drop_last=True,
+        ))
+        train_loader = DataLoader(
+            train_dataset, batch_sampler=batch_sampler, num_workers=args.num_workers,
+            collate_fn=collate, pin_memory=True,
+        )
+    else:
+        if args.resume_fast_skip and args.resume:
+            _log("Fast resume skip is unavailable for IterableDataset; retaining legacy iteration")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            shuffle=shuffle if sampler is None else False,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=True,
+            drop_last=True,  # 分布式训练建议 drop_last
+        )
 
     # 创建训练器
     trainer = LoLAV07Trainer(

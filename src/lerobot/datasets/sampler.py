@@ -14,8 +14,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Iterator
+from itertools import islice
 
 import torch
+from torch.utils.data import BatchSampler
+
+
+class SkipBatchSampler:
+    """Skip batch indices before dataset reads, retaining the full epoch length."""
+
+    def __init__(self, batch_sampler: BatchSampler):
+        self.batch_sampler = batch_sampler
+        self.start_batch = 0
+
+    @property
+    def full_length(self) -> int:
+        return len(self.batch_sampler)
+
+    def set_epoch(self, epoch: int, start_batch: int = 0):
+        if not 0 <= start_batch <= self.full_length:
+            raise ValueError(f"Invalid batch offset {start_batch} for {self.full_length} batches")
+        self.start_batch = start_batch
+        if hasattr(self.batch_sampler.sampler, "set_epoch"):
+            self.batch_sampler.sampler.set_epoch(epoch)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        return islice(self.batch_sampler, self.start_batch, None)
+
+    def __len__(self) -> int:
+        return self.full_length - self.start_batch
 
 
 class EpisodeAwareSampler:

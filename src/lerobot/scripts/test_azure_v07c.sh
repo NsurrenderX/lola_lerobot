@@ -202,6 +202,10 @@ VLM_MAX_LENGTH=""
 
 # Resume 参数
 RESUME=""
+RESUME_FAST_SKIP=false
+RESUME_GPU_KEEPALIVE=false
+RESUME_GPU_KEEPALIVE_BATCH_SIZE=8
+RESUME_GPU_KEEPALIVE_MAX_SECONDS=3600
 
 # ----------------------------------------------------------------------
 # 本地化 IO: 数据集/ckpt 走节点本地 NVMe, blob 只做异步持久化
@@ -654,6 +658,30 @@ while [[ $# -gt 0 ]]; do
                 shift
             fi
             ;;
+        --resume_fast_skip)
+            RESUME_FAST_SKIP=true
+            shift
+            ;;
+        --resume_gpu_keepalive)
+            RESUME_GPU_KEEPALIVE=true
+            shift
+            ;;
+        --resume_gpu_keepalive_batch_size)
+            RESUME_GPU_KEEPALIVE_BATCH_SIZE="${2:-}"
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --resume_gpu_keepalive_batch_size requires a positive integer"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --resume_gpu_keepalive_max_seconds)
+            RESUME_GPU_KEEPALIVE_MAX_SECONDS="${2:-}"
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --resume_gpu_keepalive_max_seconds requires a positive integer"
+                exit 1
+            fi
+            shift 2
+            ;;
         --deepspeed_config)
             DEEPSPEED_CONFIG="$2"
             shift 2
@@ -728,6 +756,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ ! "$RESUME_GPU_KEEPALIVE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ||
+            ! "$RESUME_GPU_KEEPALIVE_MAX_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: resume GPU keepalive batch size and maximum seconds must be positive integers"
+        exit 1
+fi
+
 # ----------------------------------------------------------------------
 # resume_search CLI 快照参数对齐 (2026-08-09 修复, 勿回退)
 # resume_search.py 用 LAUNCH_ARGS (原始 $@) 重建当前训练配置快照; 但 launcher
@@ -742,6 +776,8 @@ done
 # 注意: 新增"bash 默认值 + 拼 cmd"的参数时, 必须同步到此列表。
 # ----------------------------------------------------------------------
 LAUNCH_ARGS+=(
+    --resume_gpu_keepalive_batch_size "${RESUME_GPU_KEEPALIVE_BATCH_SIZE}"
+    --resume_gpu_keepalive_max_seconds "${RESUME_GPU_KEEPALIVE_MAX_SECONDS}"
     --strategy "${STRATEGY}"
     --batch_size "${BATCH_SIZE}"
     --learning_rate "${LEARNING_RATE}"
@@ -796,6 +832,12 @@ LAUNCH_ARGS+=(
     --completed_tasks_history_len "${COMPLETED_TASKS_HISTORY_LEN}"
 )
 # 布尔/条件参数 (追加条件与 cmd 拼装保持一致)
+if [[ "$RESUME_FAST_SKIP" = true ]]; then
+    LAUNCH_ARGS+=(--resume_fast_skip)
+fi
+if [[ "$RESUME_GPU_KEEPALIVE" = true ]]; then
+    LAUNCH_ARGS+=(--resume_gpu_keepalive)
+fi
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     LAUNCH_ARGS+=(--load_full_history --max_history_length "${MAX_HISTORY_LENGTH}" --history_padding_side "${HISTORY_PADDING_SIDE}")
 fi
@@ -1064,6 +1106,8 @@ echo "  - VLM bridge: ${VLM_BRIDGE_MODE} (width=${VLM_BRIDGE_WIDTH}, layers=${VL
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - DeepSpeed config: ${DEEPSPEED_CONFIG:-default}"
 echo "  - DeepSpeed ZeRO stage: ${DEEPSPEED_ZERO_STAGE}"
+echo "  - Resume fast skip: ${RESUME_FAST_SKIP}"
+echo "  - Resume GPU keepalive: ${RESUME_GPU_KEEPALIVE} (batch=${RESUME_GPU_KEEPALIVE_BATCH_SIZE}, limit=${RESUME_GPU_KEEPALIVE_MAX_SECONDS}s)"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -1266,6 +1310,14 @@ fi
 if [ -n "$RESUME" ]; then
     cmd="${cmd} --resume ${RESUME}"
 fi
+if [[ "$RESUME_FAST_SKIP" = true ]]; then
+    cmd="${cmd} --resume_fast_skip"
+fi
+if [[ "$RESUME_GPU_KEEPALIVE" = true ]]; then
+    cmd="${cmd} --resume_gpu_keepalive"
+fi
+cmd="${cmd} --resume_gpu_keepalive_batch_size ${RESUME_GPU_KEEPALIVE_BATCH_SIZE}"
+cmd="${cmd} --resume_gpu_keepalive_max_seconds ${RESUME_GPU_KEEPALIVE_MAX_SECONDS}"
 
 # DeepSpeed 参数
 if [ -n "$DEEPSPEED_CONFIG" ]; then
