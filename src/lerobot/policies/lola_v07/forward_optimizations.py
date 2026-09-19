@@ -20,7 +20,7 @@ def enable_batched_vision_sdpa(vlm):
                 or (attention.training and attention.attention_dropout != 0)):
             return original(hidden_states, cu_seqlens, position_embeddings, **kwargs)
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        if not lengths or min(lengths) <= 0 or len(set(lengths)) != 1:
+        if not lengths or min(lengths) <= 0:
             return original(hidden_states, cu_seqlens, position_embeddings)
         sequence_length = hidden_states.shape[0]
         query, key, value = (
@@ -29,14 +29,32 @@ def enable_batched_vision_sdpa(vlm):
             .permute(1, 0, 2, 3).unbind(0)
         )
         query, key = apply_rotary_pos_emb_vision(query, key, *position_embeddings)
-        query, key, value = [
-            tensor.reshape(len(lengths), lengths[0], attention.num_heads, -1).transpose(1, 2)
-            for tensor in (query, key, value)
-        ]
-        output = functional.scaled_dot_product_attention(
-            query, key, value, dropout_p=0.0, is_causal=False, scale=attention.scaling,
-        )
-        output = output.transpose(1, 2).reshape(sequence_length, -1).contiguous()
+        if len(set(lengths)) == 1:
+            query, key, value = [
+                tensor.reshape(len(lengths), lengths[0], attention.num_heads, -1).transpose(1, 2)
+                for tensor in (query, key, value)
+            ]
+            output = functional.scaled_dot_product_attention(
+                query, key, value, dropout_p=0.0, is_causal=False, scale=attention.scaling,
+            ).transpose(1, 2).reshape(sequence_length, -1).contiguous()
+        else:
+            groups = {}
+            for index, length in enumerate(lengths):
+                groups.setdefault(length, []).append(index)
+            parts = [tensor.split(lengths, dim=0) for tensor in (query, key, value)]
+            outputs = [None] * len(lengths)
+            for indices in groups.values():
+                grouped_query, grouped_key, grouped_value = [
+                    torch.stack([chunks[index] for index in indices]).transpose(1, 2)
+                    for chunks in parts
+                ]
+                grouped_output = functional.scaled_dot_product_attention(
+                    grouped_query, grouped_key, grouped_value,
+                    dropout_p=0.0, is_causal=False, scale=attention.scaling,
+                ).transpose(1, 2)
+                for index, output in zip(indices, grouped_output.unbind(0)):
+                    outputs[index] = output
+            output = torch.cat(outputs, dim=0).reshape(sequence_length, -1).contiguous()
         return attention.proj(output)
 
     count = 0

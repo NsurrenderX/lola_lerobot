@@ -1328,7 +1328,7 @@ class LoLAV07Policy(PreTrainedPolicy):
             if getattr(config, "dit_gradient_checkpointing", False):
                 self.model.gradient_checkpointing_enable()
             if config.train_vlm:
-                self.vlm.gradient_checkpointing_enable()
+                self.enable_vlm_gradient_checkpointing()
 
         # Action queue
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
@@ -1356,6 +1356,26 @@ class LoLAV07Policy(PreTrainedPolicy):
         self._in_vlm_forward: bool = False
         if self._vlm_forward_mode == "hook":
             self._register_vlm_hooks()
+
+    def enable_vlm_gradient_checkpointing(self):
+        self.vlm.gradient_checkpointing_enable()
+        if not self.config.vision_gradient_checkpointing:
+            modules = [module for module in self.vlm.visual.modules()
+                       if hasattr(module, "gradient_checkpointing")]
+            if not modules:
+                raise ValueError("Vision tower does not expose selective gradient checkpointing")
+            for module in modules:
+                module.gradient_checkpointing = False
+        else:
+            retained_layers = getattr(self.config, "vision_no_checkpoint_layers", 0)
+            if retained_layers:
+                blocks = getattr(self.vlm.visual, "blocks", ())
+                if not 0 < retained_layers <= len(blocks):
+                    raise ValueError(f"vision_no_checkpoint_layers must be between 0 and {len(blocks)}")
+                for block in blocks[-retained_layers:]:
+                    if not hasattr(block, "gradient_checkpointing"):
+                        raise ValueError("Vision blocks do not support selective checkpointing")
+                    block.gradient_checkpointing = False
 
     # ---- VLM hook infrastructure (same as LoLAPolicy) ----
 

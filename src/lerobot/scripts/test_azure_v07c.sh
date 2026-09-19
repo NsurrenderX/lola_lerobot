@@ -89,6 +89,9 @@ USE_STATE_CONDITION=false
 
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
+VISION_GRADIENT_CHECKPOINTING=true
+VISION_NO_CHECKPOINT_LAYERS=0
+VISION_BATCHED_SDPA=false
 # DiT 梯度检查点 (默认关: DiT 激活仅 ~1GB, GC 重算不划算; VLM GC 不受影响)
 DIT_GRADIENT_CHECKPOINTING=false
 COMPILE_MODEL=false
@@ -379,6 +382,18 @@ while [[ $# -gt 0 ]]; do
         # LoLA 模型配置参数
         --no_gradient_checkpointing)
             GRADIENT_CHECKPOINTING=false
+            shift
+            ;;
+        --no_vision_gradient_checkpointing)
+            VISION_GRADIENT_CHECKPOINTING=false
+            shift
+            ;;
+        --vision_no_checkpoint_layers)
+            VISION_NO_CHECKPOINT_LAYERS="$2"
+            shift 2
+            ;;
+        --vision_batched_sdpa)
+            VISION_BATCHED_SDPA=true
             shift
             ;;
         --dit_gradient_checkpointing)
@@ -1281,6 +1296,15 @@ fi
 # 梯度检查点 & compile
 if [ "$GRADIENT_CHECKPOINTING" = false ]; then
     cmd="${cmd} --no_gradient_checkpointing"
+fi
+if [[ "$VISION_GRADIENT_CHECKPOINTING" = false ]]; then
+    cmd="${cmd} --no_vision_gradient_checkpointing"
+fi
+if [[ "$VISION_NO_CHECKPOINT_LAYERS" != 0 ]]; then
+    cmd="${cmd} --vision_no_checkpoint_layers ${VISION_NO_CHECKPOINT_LAYERS}"
+fi
+if [[ "$VISION_BATCHED_SDPA" = true ]]; then
+    cmd="${cmd} --vision_batched_sdpa"
 fi
 if [ "$DIT_GRADIENT_CHECKPOINTING" = true ]; then
     cmd="${cmd} --dit_gradient_checkpointing"

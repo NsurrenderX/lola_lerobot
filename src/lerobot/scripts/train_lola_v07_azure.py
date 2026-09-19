@@ -1414,7 +1414,7 @@ class LoLAV07Trainer:
 
         # 3. Enable VLM gradient checkpointing if configured
         if self.config.gradient_checkpointing:
-            self.policy.vlm.gradient_checkpointing_enable()
+            self.policy.enable_vlm_gradient_checkpointing()
             _log("VLM gradient checkpointing enabled")
 
         # 4. Rebuild optimizer + scheduler with VLM group included
@@ -1691,7 +1691,7 @@ class LoLAV07Trainer:
 
         # 5. Enable VLM gradient checkpointing
         if self.config.gradient_checkpointing:
-            self.policy.vlm.gradient_checkpointing_enable()
+            self.policy.enable_vlm_gradient_checkpointing()
             if self.deepspeed_zero_stage < 3:
                 # ZeRO-2 下可用 DeepSpeed checkpoint func; ZeRO-3 必须保留 PyTorch 默认
                 # (ds non_reentrant_checkpoint + ZeRO-3 分片 → backward param.grad 视图失配)
@@ -2834,6 +2834,9 @@ def build_lola_config(args, dataset_metadata):
         use_state_condition=args.use_state_condition,
         gradient_checkpointing=gradient_checkpointing,
         dit_gradient_checkpointing=args.dit_gradient_checkpointing,
+        vision_gradient_checkpointing=not getattr(args, "no_vision_gradient_checkpointing", False),
+        vision_no_checkpoint_layers=getattr(args, "vision_no_checkpoint_layers", 0),
+        vision_batched_sdpa=getattr(args, "vision_batched_sdpa", False),
         compile_model=args.compile_model,
         compile_mode=args.compile_mode,
         vlm_lr=args.vlm_lr,
@@ -3050,6 +3053,12 @@ def build_arg_parser():
                         help="启用梯度检查点（默认开启）")
     parser.add_argument("--no_gradient_checkpointing", action="store_true",
                         help="关闭梯度检查点")
+    parser.add_argument("--no_vision_gradient_checkpointing", action="store_true",
+                        help="Disable vision checkpointing only; retain language checkpointing")
+    parser.add_argument("--vision_no_checkpoint_layers", type=int, default=0,
+                        help="Retain activations for the last N vision blocks instead of recomputing them")
+    parser.add_argument("--vision_batched_sdpa", action="store_true",
+                        help="Group equal-length images into batched vision SDPA calls")
     parser.add_argument("--dit_gradient_checkpointing", action="store_true",
                         help="对 DiT 也启用梯度检查点 (默认关闭: DiT 激活仅 ~1GB, GC 重算不划算; "
                              "VLM 的 GC 不受此开关影响, 显存 OOM 时再打开)")

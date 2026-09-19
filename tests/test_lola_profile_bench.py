@@ -14,11 +14,28 @@ import torch
 
 from lerobot.scripts.profile_lola_v07 import (
     BenchComplete, BenchRecorder, ProfileLoader, counter_deltas, parse_options, summarize,
-    localize_main, run_profile_child, stage_checkpoint_config, validate_checkpoint_tag,
+    assess_memory_budget, localize_main, run_profile_child, stage_checkpoint_config, validate_checkpoint_tag,
 )
 
 
 class ProfileBenchTests(unittest.TestCase):
+    def test_production_launcher_vision_options(self):
+        launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/test_azure_v07c.sh"
+        source = launcher.read_text()
+        parser_source = source.split('\nif [[ ! "$RESUME_GPU_KEEPALIVE_BATCH_SIZE"', 1)[0]
+        beginning = source.index('if [ "$GRADIENT_CHECKPOINTING" = false ]; then')
+        ending = source.index('\n# V2:', beginning)
+        script = parser_source + '\ncmd=""\n' + source[beginning:ending] + '\nprintf "%s\\n" "$cmd"\n'
+        for arguments in ([], ["--vision_batched_sdpa"],
+                          ["--vision_batched_sdpa", "--no_vision_gradient_checkpointing"]):
+            result = subprocess.run(["bash", "-s", "--", *arguments], input=script,
+                                    capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.split(), list(reversed(arguments)))
+        result = subprocess.run(["bash", "-s", "--", "--vision_batched_sdpa",
+                                 "--vision_no_checkpoint_layers", "12"], input=script,
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.split(), ["--vision_no_checkpoint_layers", "12", "--vision_batched_sdpa"])
+
     def test_launcher_cli_and_environment(self):
         launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/profile_azure_v07c.sh"
         environment = {key: value for key, value in os.environ.items() if key not in {
@@ -136,6 +153,7 @@ class ProfileBenchTests(unittest.TestCase):
             for name in ("dataset_root", "vlm_path", "resume", "strategy"):
                 parser.add_argument(f"--{name}")
             parser.add_argument("--deepspeed_zero_stage", type=int)
+            parser.add_argument("--no_vision_gradient_checkpointing", action="store_true")
             parser.set_defaults(**snapshot["training_args"])
             return None, parser, parser.parse_args(arguments)
 
@@ -197,6 +215,9 @@ class ProfileBenchTests(unittest.TestCase):
                 def child(command, console):
                     launched.append(command)
                     options, arguments = parse_options(command[command.index("--training-config"):])
+                    self.assertEqual(options.memory_budget_fraction, 0.9)
+                    self.assertTrue(options.vision_batched_sdpa)
+                    self.assertIn("--no_vision_gradient_checkpointing", arguments)
                     _, _, training = resolve(json.loads(options.training_config.read_text()), arguments)
                     self.assertFalse(Path(training.dataset_root).is_relative_to(mount))
                     self.assertTrue((Path(training.dataset_root) / "meta/info.json").is_file())
@@ -229,7 +250,9 @@ class ProfileBenchTests(unittest.TestCase):
                             "--master_addr", "host", "--master_port", "9901", "--storage_account", "account",
                             "--storage_container", "container", "--mount_prefix", str(mount),
                             "--local_mirror", str(root / f"node{node}"), "--training-config", str(config),
-                            "--output", str(mount / "profiles/run01"), "--", "--dataset_root", str(dataset)])
+                            "--output", str(mount / "profiles/run01"), "--memory-budget-fraction", "0.9",
+                            "--vision-batched-sdpa", "--", "--no_vision_gradient_checkpointing",
+                            "--dataset_root", str(dataset)])
                     expected = child_exit or (1 if missing_metadata or node == 1 and (fail_upload or missing_shard) else 0)
                     self.assertEqual(result, expected)
                     receipt_path = blob / f"profiles/run01/io_node{node:03d}/upload_status.json"
@@ -295,9 +318,52 @@ class ProfileBenchTests(unittest.TestCase):
     def test_trainer_passthrough(self):
         options, arguments = parse_options([
             "--training-config", "config.json", "--output", "results",
-            "--steps", "3", "--trace-steps", "0", "--", "--batch_size", "64"])
+            "--steps", "3", "--trace-steps", "0", "--memory-budget-fraction", "0.9",
+            "--", "--batch_size", "64"])
         self.assertEqual(arguments, ["--batch_size", "64"])
         self.assertEqual(options.steps, 3)
+        self.assertEqual(options.memory_budget_fraction, 0.9)
+
+    def test_memory_budget_estimate_and_invalid_limits(self):
+        before = dict(total_bytes=100, used_bytes=70, non_torch_bytes=10)
+        after = dict(total_bytes=100, used_bytes=75, non_torch_bytes=15)
+        stats = {"reserved_bytes.all.peak": 80}
+        budget = assess_memory_budget(before, after, stats, 0.9)
+        self.assertEqual(budget["estimated_peak_fraction"], 0.95)
+        self.assertTrue(budget["exceeded"])
+        stats["reserved_bytes.all.peak"] = 75
+        self.assertFalse(assess_memory_budget(before, after, stats, 0.9)["exceeded"])
+        for value in ("0", "1", "-0.1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(SystemExit), patch("sys.stderr"):
+                parse_options(["--training-config", "config.json", "--output", "results",
+                               "--memory-budget-fraction", value])
+
+    def test_memory_budget_collective_exit(self):
+        for local_exceeds in (True, False):
+            with self.subTest(local_exceeds=local_exceeds), tempfile.TemporaryDirectory() as folder:
+                options = SimpleNamespace(output=Path(folder), warmup=0, steps=2, trace_steps=0,
+                                          trace_ranks=(), memory_history=False, sync_phases=False,
+                                          memory_budget_fraction=0.9)
+                trainer = SimpleNamespace(world_rank=0, device="cpu", global_step=10)
+                recorder = BenchRecorder(trainer, options)
+                stats = {"num_alloc_retries": 0, "reserved_bytes.all.current": 60,
+                         "reserved_bytes.all.peak": 90 if local_exceeds else 70}
+                with patch("torch.cuda.synchronize"), patch("torch.cuda.reset_peak_memory_stats"), \
+                        patch("lerobot.scripts.profile_lola_v07.memory_stats", return_value=stats), \
+                        patch("torch.cuda.mem_get_info", return_value=(30, 100)), \
+                        patch("torch.distributed.is_initialized", return_value=True), \
+                        patch("torch.distributed.all_reduce", side_effect=lambda tensor, op: tensor.fill_(1)) as reduce:
+                    iterator = iter(ProfileLoader([1, 2], recorder))
+                    next(iterator)
+                    trainer.global_step += 1
+                    with self.assertRaisesRegex(RuntimeError, "Memory budget exceeded"):
+                        next(iterator)
+                    reduce.assert_called_once()
+                recorder.journal.close()
+                row = json.loads((recorder.output / "steps.jsonl").read_text())
+                self.assertEqual(row["memory_budget"]["exceeded"], local_exceeds)
+                self.assertTrue(row["memory_budget"]["any_rank_exceeded"])
+                self.assertEqual(recorder.count, 1)
 
     def test_bounded_steps_and_skip(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -357,14 +423,46 @@ class ProfileBenchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 summarize(directory)
 
+    def test_summary_memory_budget(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            records = []
+            for rank in range(2):
+                root = directory / f"rank{rank:03d}"
+                root.mkdir()
+                (root / "manifest.json").write_text(json.dumps(dict(
+                    rank=rank, world_size=2, training_args=dict(batch_size=32))))
+                (root / "status.json").write_text(json.dumps(dict(status="complete")))
+                row = dict(global_step=1, warmup=False, traced=False, snapshot_saved=False,
+                           step_s=2.0, data_wait_s=0.0, counter_delta=dict(num_alloc_retries=0),
+                           memory_budget=dict(limit_fraction=0.9, estimated_peak_fraction=0.8,
+                                              exceeded=False, any_rank_exceeded=False))
+                records.append(row)
+                (root / "steps.jsonl").write_text(json.dumps(row) + "\n")
+            with patch("builtins.print"):
+                result = summarize(directory)
+            self.assertEqual(result["memory_budget"], dict(limit_fraction=0.9, passed=True,
+                                                           max_estimated_peak_fraction=0.8))
+            target = directory / "rank001/steps.jsonl"
+            records[1]["memory_budget"]["any_rank_exceeded"] = True
+            target.write_text(json.dumps(records[1]) + "\n")
+            with self.assertRaisesRegex(ValueError, "memory budget"):
+                summarize(directory)
+            del records[1]["memory_budget"]
+            target.write_text(json.dumps(records[1]) + "\n")
+            with self.assertRaisesRegex(ValueError, "memory budget"):
+                summarize(directory)
 
-def distributed_smoke(output):
+
+def distributed_smoke(output, real_vision=False):
     import os
     from types import MethodType
     import deepspeed
     from lerobot.scripts import train_lola_v07_azure as training
     from lerobot.scripts.profile_lola_v07 import run_bench
     from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
+    from lerobot.policies.lola_v07.modeling_lola_v07 import LoLAV07Policy
+    from lerobot.policies.lola_v07.forward_optimizations import enable_batched_vision_sdpa
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -376,14 +474,32 @@ def distributed_smoke(output):
         def __init__(self):
             super().__init__()
             self.vlm = torch.nn.Module()
-            self.vlm.visual = torch.nn.Linear(16, 16)
-            self.vlm.language_model = torch.nn.Linear(16, 16)
+            width = 64 if real_vision else 16
+            if real_vision:
+                from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+                from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+                vision_config = Qwen3VLVisionConfig(
+                    hidden_size=width, intermediate_size=128, num_heads=4, depth=2,
+                    out_hidden_size=width, deepstack_visual_indexes=[], num_position_embeddings=16,
+                    patch_size=2, temporal_patch_size=1, spatial_merge_size=2,
+                )
+                vision_config._attn_implementation = "sdpa"
+                self.vlm.visual = Qwen3VLVisionModel(vision_config)
+                self.config = SimpleNamespace(vision_gradient_checkpointing=True, vision_no_checkpoint_layers=1)
+                self.vlm.gradient_checkpointing_enable = self.vlm.visual.gradient_checkpointing_enable
+                LoLAV07Policy.enable_vlm_gradient_checkpointing(self)
+                enable_batched_vision_sdpa(self.vlm)
+            else:
+                self.vlm.visual = torch.nn.Linear(width, width)
+            self.vlm.language_model = torch.nn.Linear(width, width)
             self.model = torch.nn.Module()
-            self.model.vlm_bridge = torch.nn.Linear(16, 16)
-            self.model.dit = torch.nn.Linear(16, 16)
+            self.model.vlm_bridge = torch.nn.Linear(width, width)
+            self.model.dit = torch.nn.Linear(width, width)
 
         def forward(self, batch):
-            hidden = self.vlm.language_model(self.vlm.visual(batch["input"]))
+            visual = self.vlm.visual(batch["input"], batch["grid"]).pooler_output if real_vision else self.vlm.visual(batch["input"])
+            hidden = self.vlm.language_model(visual)
             loss = self.model.dit(self.model.vlm_bridge(hidden)).square().mean()
             return loss, {"loss": loss.item()}
 
@@ -394,7 +510,7 @@ def distributed_smoke(output):
         model=policy, optimizer=optimizer, config=dict(
             train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1,
             zero_optimization=dict(stage=3, stage3_param_persistence_threshold=0),
-            zero_allow_untested_optimizer=True, bf16=dict(enabled=False),
+            zero_allow_untested_optimizer=True, bf16=dict(enabled=real_vision),
             steps_per_print=1000,
         ),
     )
@@ -417,8 +533,10 @@ def distributed_smoke(output):
     options = SimpleNamespace(output=output, training_config=Path(__file__),
                               warmup=1, steps=4, trace_steps=1, trace_ranks=(0,),
                               memory_history=True, snapshot_threshold=100.0,
-                              sync_phases=False, trace_memory=False, vision_batched_sdpa=False)
-    loader = [{"input": torch.randn(2, 16)} for batch_index in range(16)]
+                              sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
+                              memory_budget_fraction=0.9)
+    loader = [dict(input=torch.randn(20, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2]]))
+              if real_vision else {"input": torch.randn(2, 16)} for batch_index in range(16)]
     run_bench(trainer, options, loader, 0, 0, training.LoLAV07Trainer.train)
     assert trainer.global_step == 5
     torch.distributed.barrier()
@@ -426,15 +544,16 @@ def distributed_smoke(output):
     if rank == 0:
         result = summarize(output)
         assert all(row["count"] == 3 for row in result["per_rank"].values())
+        assert result["memory_budget"]["passed"]
         assert (output / "rank000/trace.json").is_file()
         assert (output / "rank000/memory_final.pickle").is_file()
-        print("PASS: real two-rank ZeRO-3 updates, trace, allocator snapshot, bounded exit, no checkpoint")
+        print(f"PASS: real two-rank ZeRO-3 updates, vision={real_vision}, 90% budget, trace, allocator snapshot, bounded exit, no checkpoint")
     torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
     import sys
-    if sys.argv[1:2] == ["--distributed-smoke"]:
-        distributed_smoke(Path(sys.argv[2]))
+    if sys.argv[1:2] in (["--distributed-smoke"], ["--distributed-vision-smoke"]):
+        distributed_smoke(Path(sys.argv[2]), real_vision=sys.argv[1] == "--distributed-vision-smoke")
     else:
         unittest.main()

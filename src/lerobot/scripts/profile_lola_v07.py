@@ -34,6 +34,7 @@ def parse_options(arguments=None):
     parser.add_argument("--trace-memory", action="store_true")
     parser.add_argument("--memory-history", action="store_true")
     parser.add_argument("--snapshot-threshold", type=float, default=20.0)
+    parser.add_argument("--memory-budget-fraction", type=float, default=None)
     parser.add_argument("--vision-batched-sdpa", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     options, trainer_arguments = parser.parse_known_args(arguments)
@@ -41,6 +42,8 @@ def parse_options(arguments=None):
         trainer_arguments = trainer_arguments[1:]
     if options.steps <= 0 or options.warmup < 0 or not 0 <= options.trace_steps <= options.steps:
         parser.error("Require steps > 0, warmup >= 0, and 0 <= trace-steps <= steps")
+    if options.memory_budget_fraction is not None and not 0 < options.memory_budget_fraction < 1:
+        parser.error("memory-budget-fraction must be between 0 and 1")
     options.trace_ranks = tuple(int(rank) for rank in options.trace_ranks.split(",") if rank)
     return options, trainer_arguments
 
@@ -161,6 +164,8 @@ def localize_main(arguments=None):
                f"--node_rank={settings.node_rank}", f"--master_addr={settings.master_addr}",
                f"--master_port={settings.master_port}", "--max_restarts=0", str(Path(__file__).resolve())]
     for name, value in vars(options).items():
+        if value is None:
+            continue
         flag = "--" + name.replace("_", "-")
         if isinstance(value, bool):
             if value:
@@ -276,6 +281,24 @@ def counter_deltas(before, after):
             and before.get(key) is not None and after[key] is not None}
 
 
+def device_memory_sample(device, stats):
+    free, total = torch.cuda.mem_get_info(device)
+    used = total - free
+    return dict(total_bytes=total, used_bytes=used,
+                non_torch_bytes=max(0, used - stats["reserved_bytes.all.current"]))
+
+
+def assess_memory_budget(before, after, stats, limit):
+    if before["total_bytes"] != after["total_bytes"]:
+        raise ValueError("Device memory capacity changed during a step")
+    estimated_peak = max(before["used_bytes"], after["used_bytes"],
+                         stats["reserved_bytes.all.peak"] + max(before["non_torch_bytes"], after["non_torch_bytes"]))
+    fraction = estimated_peak / after["total_bytes"]
+    return dict(limit_fraction=limit, estimated_peak_fraction=fraction,
+                estimated_peak_bytes=estimated_peak, exceeded=fraction > limit,
+                device_before=before, device_after=after)
+
+
 class BenchRecorder:
     def __init__(self, trainer, options):
         self.trainer = trainer
@@ -294,6 +317,7 @@ class BenchRecorder:
         self.host_times = {}
         self.shapes = {}
         self.active = False
+        self.memory_budget_fraction = getattr(options, "memory_budget_fraction", None)
 
     @contextmanager
     def stage(self, name):
@@ -359,6 +383,7 @@ class BenchRecorder:
             torch.cuda.synchronize(self.device)
             torch.cuda.reset_peak_memory_stats(self.device)
             before_memory = memory_stats(self.device)
+            device_before = device_memory_sample(self.device, before_memory) if self.memory_budget_fraction else None
             self.host_times = {}
             self.shapes = {}
             self.active = True
@@ -372,6 +397,14 @@ class BenchRecorder:
                 continue
             after_memory = memory_stats(self.device)
             deltas = counter_deltas(before_memory, after_memory)
+            budget = None
+            if self.memory_budget_fraction:
+                budget = assess_memory_budget(device_before, device_memory_sample(self.device, after_memory),
+                                              after_memory, self.memory_budget_fraction)
+                exceeded = torch.tensor(int(budget["exceeded"]), device=self.device)
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(exceeded, op=torch.distributed.ReduceOp.MAX)
+                budget["any_rank_exceeded"] = bool(exceeded.item())
             snapshot_needed = (self.options.memory_history and self.rank in self.options.trace_ranks
                                and self.snapshot_count < 2
                                and (elapsed >= self.options.snapshot_threshold or deltas.get("num_alloc_retries", 0)))
@@ -384,11 +417,16 @@ class BenchRecorder:
                        host_stage_s=self.host_times, shapes=self.shapes,
                        memory_before=before_memory, memory_after=after_memory, counter_delta=deltas,
                        snapshot_saved=bool(snapshot_needed))
+            if budget is not None:
+                row["memory_budget"] = budget
             self.journal.write(json.dumps(row) + "\n")
             if snapshot_needed:
                 torch.cuda.memory._dump_snapshot(str(self.output / f"memory_step{self.count}.pickle"))
                 self.snapshot_count += 1
             self.count += 1
+            if budget is not None and budget["any_rank_exceeded"]:
+                raise RuntimeError(f"Memory budget exceeded on at least one rank; limit={self.memory_budget_fraction:.1%}, "
+                                   f"rank {self.rank} estimated peak={budget['estimated_peak_fraction']:.1%}")
             if self.profiler is not None:
                 self.profiler.step()
             if self.options.trace_steps and self.count == self.options.warmup + self.options.trace_steps:
@@ -518,6 +556,15 @@ def summarize(directory):
     result = dict(per_rank=per_rank, mean_rank_max_step_plus_data_s=rank_max_mean,
                   estimated_samples_per_second=world_size * manifests[0]["training_args"]["batch_size"] / rank_max_mean,
                   caveat="Rank-max step+data estimate; boundary synchronization and instrumentation perturb training. Host stages overlap and are not additive.")
+    budgets = [row["memory_budget"] for rows in rows_by_rank.values() for row in rows if "memory_budget" in row]
+    if budgets:
+        if len(budgets) != sum(map(len, rows_by_rank.values())) or any(
+                budget["exceeded"] or budget["any_rank_exceeded"] for budget in budgets):
+            raise ValueError("Missing or exceeded memory budget records")
+        if len({budget["limit_fraction"] for budget in budgets}) != 1:
+            raise ValueError("Memory budget limits differ")
+        result["memory_budget"] = dict(limit_fraction=budgets[0]["limit_fraction"], passed=True,
+                                       max_estimated_peak_fraction=max(budget["estimated_peak_fraction"] for budget in budgets))
     (directory / "summary.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
     return result
@@ -557,7 +604,7 @@ def main():
 
     def build_config(*args, **kwargs):
         result = original_build_config(*args, **kwargs)
-        result[0].vision_batched_sdpa = options.vision_batched_sdpa
+        result[0].vision_batched_sdpa = options.vision_batched_sdpa or result[0].vision_batched_sdpa
         return result
 
     def train(trainer, loader, start_step=0, start_epoch=0):

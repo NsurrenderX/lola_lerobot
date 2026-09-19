@@ -212,7 +212,8 @@ measurements and retain a production wall-time baseline.
 
 All ranks mark the trace window as perturbed, including ranks without a
 profiler. After trace export, one all-rank barrier keeps export delay out of
-the next timed step. There is no added per-step distributed barrier.
+the next timed step. Without the optional memory budget there is no added
+per-step collective; the budget adds an all-reduce outside the step timer.
 Cross-node wall timestamps require synchronized clocks; compare durations
 and global step IDs when that cannot be guaranteed.
 
@@ -262,12 +263,115 @@ precision-isolated encoders/projections and the number of denoising steps
 are unchanged.
 
 `LoLAV07Config.vision_batched_sdpa` defaults to false. It batches equal-length
-image segments into one SDPA call per vision layer, retaining the original
-image boundaries. Unequal lengths, nonzero training dropout, other attention
-backends and unsupported call options fall back to the original implementation.
+image segments into one SDPA call per distinct length per vision layer, retaining
+the original image boundaries and token order. Mixed lengths are grouped without
+padding, resampling, or cross-image attention. Nonpositive lengths, nonzero
+training dropout, other attention backends and unsupported call options fall
+back to the original implementation.
 It requires the Qwen3-VL vision tower and does not install Flash Attention.
 For a distributed A/B, add `--vision-batched-sdpa` before `--` and use a new
-output directory, the same checkpoint, seed and data configuration.
+output directory, the same checkpoint, seed and data configuration. The production
+trainer also accepts `--vision_batched_sdpa` (after `--` when using this bench).
+
+`LoLAV07Config.vision_gradient_checkpointing` defaults to true. The production
+argument `--no_vision_gradient_checkpointing` disables recomputation only in the
+vision tower, including its individual blocks. Language checkpointing remains
+enabled when the existing global setting enables it; DiT behavior is unchanged.
+The choice is reapplied when the trainer unfreezes the VLM. Neither optimization
+changes parameter names or shapes, and both are off by default for old jobs.
+
+For finer control, `--vision_no_checkpoint_layers N` retains activations only
+for the last N vision blocks (default 0). Other vision blocks and the language
+model keep checkpointing. Negative counts, counts beyond the visual depth and
+combining a positive count with full vision checkpointing disablement are rejected.
+
+### A100 40 GB Memory Budget
+
+The target is at most 90% device memory on EVERY rank, including startup/warmup,
+not just mean allocated memory. Do not disable all VLM checkpointing or change
+ZeRO persistence settings merely because the baseline has spare memory.
+
+Use three fresh, otherwise matched profile runs:
+
+| Run | Additional options before `--` | Additional trainer options after `--` |
+| --- | --- | --- |
+| Baseline | `--memory-budget-fraction 0.90` | None |
+| Grouped SDPA | `--memory-budget-fraction 0.90 --vision-batched-sdpa` | None |
+| Grouped SDPA, last 12 vision blocks retained | `--memory-budget-fraction 0.90 --vision-batched-sdpa` | `--vision_no_checkpoint_layers 12` |
+
+For a throughput comparison use `--trace-steps 0` on all three. Keep batch size,
+seed, input data, checkpoint and environment unchanged. Retain all startup rows
+and assess the full latency distribution as well as any explicitly identified
+stable tail; the previous baseline's first 10 steps did not remove all long tails.
+Use new output names such as `lola_budget90_baseline_01`,
+`lola_budget90_grouped_01` and `lola_budget90_vision_retain12_01`.
+
+The optional budget samples device free/total memory at step boundaries and
+records PyTorch peak reserved bytes. Its estimate is the maximum of boundary
+device usage and peak reserved bytes plus the larger observed non-PyTorch usage.
+Each row records the estimate and its limit. An all-reduce makes every rank fail
+together if any rank exceeds the limit; journals/failed status are retained and
+the localizing launcher uploads the diagnostics. A completed summary includes
+`memory_budget.passed` and `max_estimated_peak_fraction`.
+
+This is a conservative diagnostic estimate, NOT a hard allocation cap or a
+continuous measurement of device usage. It can overestimate noncoincident peaks;
+short-lived non-PyTorch allocations and model setup before the bench can escape
+it. An OOM can occur before the next budget check. Use external GPU-memory
+telemetry as well for final A100 acceptance. The budget itself adds a collective,
+so enable it in both sides of an A/B and use production wall timing before
+claiming throughput. Production training does not inherit this bench-only gate.
+
+If the retained-activation run exceeds 90%, keep vision checkpointing enabled
+and evaluate grouped SDPA alone; do not silently increase the budget, shrink the
+batch, change data, or turn off language checkpointing. A6000 split-model tests
+cannot certify the memory usage of a full A100 ZeRO-3 rank.
+
+After A100 validation, the production `test_azure_v07c.sh` launcher accepts
+`--vision_batched_sdpa` and optionally `--vision_no_checkpoint_layers 12`.
+Append those trainer flags to the existing production command; do not pass the
+bench-only `--memory-budget-fraction` to it. Retain external GPU memory telemetry
+for the full training job, including checkpoint saves which the bench disables.
+
+The first local B32 full-checkpoint probe (`training_ab_01`, two A6000 GPUs,
+VLM on GPU0 and the remaining model on GPU1) rejected fully disabled vision
+checkpointing at an estimated 91.0% peak. GPU0 allocated/reserved peaks rose
+from 30.462/34.914 GiB to 37.266/42.801 GiB. The run stopped before its planned
+alternating timing phase; these probes do not establish a speedup. The failed
+status, step journal and original runner are retained. Partial retention uses
+a new run identity, without raising the 90% limit or reducing batch size.
+
+The completed `training_ab_02` (2026-09-19) kept the last 12 of 27 vision
+blocks' activations. It used the same B32 checkpoint and three real batches,
+with fixed seeds, two warmup iterations and six measured iterations per variant
+in rotating order. All 33 steps and bound source hashes were verified.
+
+| Variant | Mean forward + backward (s) | Median (s) | Isolated GPU0 allocated / reserved peak (GiB) |
+| --- | --- | --- | --- |
+| Baseline | 4.474788 | 4.321858 | 30.462 / 34.914 |
+| Grouped SDPA | 4.475336 | 4.474509 | 30.462 / 34.914 |
+| Grouped SDPA, retain last 12 | 4.422355 | 4.336371 | 33.086 / 38.418 |
+
+The last variant's mean time decreased 1.17%, but its median did not improve
+and paired time reductions ranged from -14.33% to +17.48%. Grouping alone
+showed no mean gain. This short, noisy local run does NOT establish a stable
+training speedup; keep the options experimental until matched A100 runs show
+a useful improvement within budget. Actual image lengths were 32 segments of
+144 tokens and 32 of 64 tokens.
+
+The maximum budget estimate across all local steps was 81.76%. Alternating
+variants share the allocator cache, so use the isolated peaks for memory
+comparisons. All six candidate/batch comparisons had identical losses and
+identical gradient samples for all 1,479 parameter tensors (up to 1,024 elements
+per tensor); full gradients were checked for finiteness, not full equality.
+The run included preprocessing, transfer, forward and backward but no ZeRO,
+optimizer, clipping or weight updates. It neither certifies A100 memory nor
+training quality. The original failed run remains separate.
+
+Local validation also passed five GPU optimization tests, 15 profiler tests,
+and both two-rank ZeRO-3 smoke modes (five updates per rank, budget checks,
+trace and allocator snapshot, no model checkpoint writes). The real-vision
+smoke used BF16 and mixed checkpointed/non-checkpointed visual blocks.
 
 `DiTCUDAGraph` is an explicit inference-only helper. It captures one shape,
 copies all new inputs before replay, recaptures on shape changes and falls
@@ -292,7 +396,8 @@ share a graph instance between concurrent callers.
 
 The focused tests require the project environment and `PYTHONPATH=src`.
 Run `tests/test_lola_forward_optimizations.py` for vision output/gradient and
-real BF16 DiT graph tests, and `tests/test_lola_profile_bench.py` for recorder,
+real BF16 DiT graph tests, mixed-length SDPA call counts, and actual selective
+recomputation/full-gradient checks. Run `tests/test_lola_profile_bench.py` for recorder,
 summary, launcher and mocked two-node IO tests (CLI/config precedence, node-local
 shards, output isolation, training/upload failures, dry-run and path protection).
 The IO tests use temporary files and simulated transfers, not Azure or GPUs.
@@ -305,9 +410,12 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 \
 ```
 
 The smoke runs five tiny-model updates per rank, exports a rank-zero trace
-and allocator snapshot, checks bounded exit and verifies no model checkpoint
+and allocator snapshot, checks the memory budget, bounded exit and verifies no model checkpoint
 was written. It tests the real training loop and recorder, not full LoLA
 checkpoint restore, A100 performance or cross-node networking.
+Replace `--distributed-smoke` with `--distributed-vision-smoke` to exercise
+an actual small BF16 Qwen3-VL vision tower with mixed image lengths, grouped
+SDPA and one of two vision blocks retaining activations under ZeRO-3.
 
 Numeric comparisons are required on the deployed hardware/software. Local
 action agreement is not a robot task-success evaluation. Do not infer an

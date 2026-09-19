@@ -26,6 +26,8 @@ class LoLAV07Config(LoLAConfig):
     dit_gradient_checkpointing: bool = False
 
     vision_batched_sdpa: bool = False
+    vision_gradient_checkpointing: bool = True
+    vision_no_checkpoint_layers: int = 0
 
     # Override defaults from LoLAConfig
     action_loss_weight: float = 10.0       # v06 was 1.0
@@ -103,6 +105,10 @@ class LoLAV07Config(LoLAConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.vision_no_checkpoint_layers < 0:
+            raise ValueError("vision_no_checkpoint_layers must be nonnegative")
+        if self.vision_no_checkpoint_layers and not self.vision_gradient_checkpointing:
+            raise ValueError("Choose partial or fully disabled vision checkpointing, not both")
         # Validate bottleneck dimensions
         if self.action_bottleneck_dim >= self.dit_hidden_size:
             raise ValueError(
