@@ -25,6 +25,8 @@ class LoLAV07Config(LoLAConfig):
     # 显存吃紧时可用 --dit_gradient_checkpointing 重新打开。
     dit_gradient_checkpointing: bool = False
 
+    vision_batched_sdpa: bool = False
+
     # Override defaults from LoLAConfig
     action_loss_weight: float = 10.0       # v06 was 1.0
 

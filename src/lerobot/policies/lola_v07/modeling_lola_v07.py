@@ -1180,7 +1180,13 @@ class LoLAV07Pytorch(nn.Module):
         dt = -1.0 / self.config.num_inference_steps
         time = torch.tensor(1.0, device=device, dtype=torch.float32)
 
-        while time >= -dt / 2:
+        if use_st:
+            grip_target_mask = torch.ones(b, predict_chunks_len, dtype=torch.bool, device=device)
+            arm_target_mask = torch.ones(b, predict_chunks_len, dtype=torch.bool, device=device)
+            full_mask = torch.cat([vlm_stream_mask, grip_stream_mask, arm_stream_mask,
+                                   grip_target_mask, arm_target_mask], dim=1)
+
+        for denoising_step in range(self.config.num_inference_steps):
             expanded_time = time.expand(b)
 
             # 2. Latent -> DiT (FP32 for decoder precision, output to BF16)
@@ -1191,11 +1197,6 @@ class LoLAV07Pytorch(nn.Module):
 
             # 3. DiT forward
             if use_st:
-                # Build full mask for special token mode
-                grip_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
-                arm_target_mask = torch.ones(b, z_t_dit.shape[1] // 2, dtype=torch.bool, device=device)
-                full_mask = torch.cat([vlm_stream_mask, grip_stream_mask, arm_stream_mask,
-                                       grip_target_mask, arm_target_mask], dim=1)
                 pred_z0_dit = self.dit(
                     target_actions=z_t_dit,
                     hist_actions=hist_actions_for_dit,
@@ -1303,6 +1304,10 @@ class LoLAV07Policy(PreTrainedPolicy):
             )
 
         # Remove unused VLM layers
+        if config.vision_batched_sdpa:
+            from .forward_optimizations import enable_batched_vision_sdpa
+            enable_batched_vision_sdpa(self.vlm)
+
         last_extract_layer = max(self.config.vlm_extract_layers)
         lang_model = self.vlm.language_model
         for i in range(len(lang_model.layers) - 1, last_extract_layer - 1, -1):
