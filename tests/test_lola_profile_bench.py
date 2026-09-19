@@ -14,7 +14,7 @@ import torch
 
 from lerobot.scripts.profile_lola_v07 import (
     BenchComplete, BenchRecorder, ProfileLoader, counter_deltas, parse_options, summarize,
-    localize_main, run_profile_child, validate_checkpoint_tag,
+    localize_main, run_profile_child, stage_checkpoint_config, validate_checkpoint_tag,
 )
 
 
@@ -85,6 +85,49 @@ class ProfileBenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "zero_pp_rank_16_"):
                 validate_checkpoint_tag(folder, [16])
 
+    def test_checkpoint_metadata_with_production_preflight(self):
+        from lerobot.scripts import train_lola_v07_azure as training
+
+        fingerprint = {key: "expected" for key in training.ARCH_FINGERPRINT_KEYS}
+        trainer = SimpleNamespace(config=SimpleNamespace(is_segment_summary=True, **fingerprint))
+        preflight = training.LoLAV07Trainer._assert_checkpoint_arch_compatible
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "blob/run/step_000010"
+            local = Path(folder) / "mirror/run/step_000010"
+            source.mkdir(parents=True)
+            local.mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "training_config.json"):
+                preflight(trainer, str(local))
+            with self.assertRaises(FileNotFoundError):
+                stage_checkpoint_config(source, local)
+            content = json.dumps(dict(lola_config=fingerprint)).encode() + b"\n"
+            (source.parent / "training_config.json").write_bytes(content)
+            stale = dict(fingerprint)
+            changed_key = next(iter(stale))
+            stale[changed_key] = "stale"
+            (local.parent / "training_config.json").write_text(json.dumps(dict(lola_config=stale)))
+            with patch.object(training, "_log"):
+                receipt = stage_checkpoint_config(source, local)
+                self.assertEqual(receipt["source"], str(source.parent / "training_config.json"))
+                self.assertEqual((local / "training_config.json").read_bytes(), content)
+                preflight(trainer, str(local))
+                (source / "training_config.json").write_text(json.dumps(dict(lola_config=stale)))
+                receipt = stage_checkpoint_config(source, local)
+                self.assertEqual(receipt["source"], str(source / "training_config.json"))
+                with self.assertRaisesRegex(RuntimeError, changed_key):
+                    preflight(trainer, str(local))
+            (source / "training_config.json").write_text('{"training_args": {}}')
+            with self.assertRaisesRegex(ValueError, "lola_config"):
+                stage_checkpoint_config(source, local)
+            (source / "training_config.json").write_text("{malformed")
+            with self.assertRaises(json.JSONDecodeError):
+                stage_checkpoint_config(source, local)
+            (source / "training_config.json").unlink()
+            receipt = stage_checkpoint_config(source, source)
+            self.assertEqual(receipt["source"], receipt["local"])
+            self.assertFalse((source / "training_config.json").exists())
+            self.assertEqual((source.parent / "training_config.json").read_bytes(), content)
+
     def test_localized_io_two_nodes_and_failures(self):
         from lerobot.scripts import download_azure_azcopy as transfers
 
@@ -96,10 +139,12 @@ class ProfileBenchTests(unittest.TestCase):
             parser.set_defaults(**snapshot["training_args"])
             return None, parser, parser.parse_args(arguments)
 
-        for child_exit, fail_upload, missing_shard in ((0, None, False), (7, None, False),
-                                  (0, "rank008", False), (0, "upload_status.json", False),
-                                  (0, None, True)):
-            with self.subTest(child_exit=child_exit, fail_upload=fail_upload, missing_shard=missing_shard), \
+        for child_exit, fail_upload, missing_shard, missing_metadata in (
+            (0, None, False, False), (7, None, False, False),
+            (0, "rank008", False, False), (0, "upload_status.json", False, False),
+            (0, None, True, False), (0, None, False, True)):
+            with self.subTest(child_exit=child_exit, fail_upload=fail_upload, missing_shard=missing_shard,
+                      missing_metadata=missing_metadata), \
                     tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 mount = root / "mount"
@@ -111,6 +156,9 @@ class ProfileBenchTests(unittest.TestCase):
                     path.mkdir(parents=True)
                 (dataset / "meta/info.json").write_text("{}")
                 (vlm / "config.json").write_text("{}")
+                checkpoint_config = json.dumps(dict(lola_config=dict(history_tokenization_mode="segment_summary")))
+                if not missing_metadata:
+                    (checkpoint.parent / "training_config.json").write_text(checkpoint_config)
                 for rank in range(16):
                     (checkpoint / f"zero_pp_rank_{rank}_mp_rank_00_model_states.pt").touch()
                     if not missing_shard or rank != 9:
@@ -152,6 +200,8 @@ class ProfileBenchTests(unittest.TestCase):
                     _, _, training = resolve(json.loads(options.training_config.read_text()), arguments)
                     self.assertFalse(Path(training.dataset_root).is_relative_to(mount))
                     self.assertTrue((Path(training.dataset_root) / "meta/info.json").is_file())
+                    self.assertEqual((Path(training.resume) / "training_config.json").read_text(), checkpoint_config)
+                    self.assertNotEqual(options.training_config.read_text(), checkpoint_config)
                     node = int(next(value.split("=", 1)[1] for value in command if value.startswith("--node_rank=")))
                     foreign = options.output / f"rank{8 if node == 0 else 0:03d}"
                     foreign.mkdir()
@@ -164,6 +214,10 @@ class ProfileBenchTests(unittest.TestCase):
                     return child_exit
 
                 for node in (0, 1):
+                    local_tag = root / f"node{node}/checkpoints/run/step_000010"
+                    if missing_metadata:
+                        local_tag.mkdir(parents=True)
+                        (local_tag / "training_config.json").write_text(checkpoint_config)
                     with patch("lerobot.scripts.profile_lola_v07.resolve_training_arguments", side_effect=resolve), \
                             patch.object(transfers, "install_azcopy", return_value="fake-azcopy"), \
                             patch.object(transfers, "download_with_fallback", side_effect=download), \
@@ -176,22 +230,26 @@ class ProfileBenchTests(unittest.TestCase):
                             "--storage_container", "container", "--mount_prefix", str(mount),
                             "--local_mirror", str(root / f"node{node}"), "--training-config", str(config),
                             "--output", str(mount / "profiles/run01"), "--", "--dataset_root", str(dataset)])
-                    expected = child_exit or (1 if node == 1 and (fail_upload or missing_shard) else 0)
+                    expected = child_exit or (1 if missing_metadata or node == 1 and (fail_upload or missing_shard) else 0)
                     self.assertEqual(result, expected)
                     receipt_path = blob / f"profiles/run01/io_node{node:03d}/upload_status.json"
                     if node == 1 and fail_upload == "upload_status.json":
                         self.assertFalse(receipt_path.exists())
                         receipt_path = root / f"node{node}/profiles/run01/io_node{node:03d}/upload_status.json"
                     receipt = json.loads(receipt_path.read_text())
-                    self.assertEqual(receipt["child_exit_code"], child_exit if not (missing_shard and node == 1) else 1)
+                    self.assertEqual(receipt["child_exit_code"], 1 if missing_metadata or missing_shard and node == 1 else child_exit)
                     self.assertEqual(receipt["upload_complete"], not (fail_upload == "rank008" and node == 1))
-                    local_tag = root / f"node{node}/checkpoints/run/step_000010"
-                    self.assertEqual(len(list(local_tag.glob("*model_states.pt"))), 8)
-                self.assertEqual(len(launched), 1 if missing_shard else 2)
-                self.assertEqual(len(downloaded), 6)
+                    self.assertEqual(len(list(local_tag.glob("*model_states.pt"))), 0 if missing_metadata else 8)
+                    if missing_metadata:
+                        error_path = blob / f"profiles/run01/io_node{node:03d}/error.log"
+                        self.assertIn("Missing checkpoint training_config.json", error_path.read_text())
+                self.assertEqual(len(launched), 0 if missing_metadata else (1 if missing_shard else 2))
+                self.assertEqual(len(downloaded), 0 if missing_metadata else 6)
                 self.assertTrue((blob / "profiles/run01/source_training_config.json").is_file())
                 self.assertFalse(list(blob.rglob("foreign.txt")))
                 self.assertTrue((checkpoint / "zero_pp_rank_0_mp_rank_00_model_states.pt").is_file())
+                if not missing_metadata:
+                    self.assertEqual((checkpoint.parent / "training_config.json").read_text(), checkpoint_config)
 
     def test_localization_dry_run_and_path_safety(self):
         from lerobot.scripts import download_azure_azcopy as transfers

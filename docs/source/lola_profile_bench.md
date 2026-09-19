@@ -154,6 +154,14 @@ AzCopy executable; otherwise the helper installs it under the local mirror.
 - An explicit resume tag is required when resuming. Each node downloads only
   its own model, optimizer and optional EMA shards. Missing model or optimizer
   shards abort before torchrun; a failed resume never falls back to fresh training.
+- Checkpoint architecture metadata is staged separately from the profile's CLI
+  configuration. The launcher reads `training_config.json` from the SOURCE tag,
+  or its parent run directory if absent in the tag, and copies its unchanged
+  bytes into the localized tag before downloading shards. The source must contain
+  a nonempty `lola_config`; missing/malformed metadata aborts before torchrun,
+  even if a stale local copy exists. The trainer's architecture check remains
+  enabled. `io_nodeNNN/checkpoint_config.json` records source, local path and SHA256.
+  Already-local checkpoints are validated without modifying their files.
 - `--output` is the final blob-mounted destination, and must be a new run
   directory below `--mount_prefix`, outside the input directories. For example,
   `/mnt/wangxiaofa/profiles/run01` maps to

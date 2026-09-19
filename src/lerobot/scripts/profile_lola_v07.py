@@ -52,6 +52,24 @@ def validate_checkpoint_tag(directory, ranks):
             raise ValueError(f"Use an explicit checkpoint tag directory; missing {shard.name} in {directory}")
 
 
+def stage_checkpoint_config(source_tag, local_tag):
+    source_tag, local_tag = Path(source_tag).resolve(), Path(local_tag).resolve()
+    source = next((path for path in (source_tag / "training_config.json",
+                                     source_tag.parent / "training_config.json") if path.is_file()), None)
+    if source is None:
+        raise FileNotFoundError(f"Missing checkpoint training_config.json in {source_tag} or its parent")
+    content = source.read_bytes()
+    snapshot = json.loads(content)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("lola_config"), dict) or not snapshot["lola_config"]:
+        raise ValueError(f"Checkpoint configuration has no nonempty lola_config: {source}")
+    destination = source
+    if source_tag != local_tag:
+        local_tag.mkdir(parents=True, exist_ok=True)
+        destination = local_tag / "training_config.json"
+        destination.write_bytes(content)
+    return dict(source=str(source), local=str(destination), sha256=hashlib.sha256(content).hexdigest())
+
+
 def resolve_training_arguments(snapshot, trainer_arguments):
     sys.path.insert(0, str(Path(__file__).parent))
     from lerobot.scripts import train_lola_v07_azure as training
@@ -172,6 +190,10 @@ def localize_main(arguments=None):
     status_path.write_text(json.dumps(status, indent=2))
     try:
         azcopy = transfers.install_azcopy(str(settings.azcopy_path or mirror / "bin/azcopy"))
+        if "resume" in inputs:
+            checkpoint_config = stage_checkpoint_config(sources["resume"], inputs["resume"])
+            (node_output / "checkpoint_config.json").write_text(json.dumps(checkpoint_config, indent=2))
+            print(f"[localize] checkpoint config: {checkpoint_config['source']} -> {checkpoint_config['local']}", flush=True)
         for name, path in inputs.items():
             source = Path(sources[name]).resolve()
             if source.is_relative_to(mount):
