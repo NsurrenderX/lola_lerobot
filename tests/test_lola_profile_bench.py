@@ -16,11 +16,143 @@ import torch
 from lerobot.scripts.profile_lola_v07 import (
     BenchComplete, BenchRecorder, ProfileLoader, counter_deltas, parse_options, summarize,
     assess_memory_budget, localize_main, resolve_training_arguments, run_profile_child,
-    stage_checkpoint_config, validate_checkpoint_tag,
+    stage_checkpoint_config, validate_checkpoint_tag, configure_profile_deepspeed,
+    profile_deepspeed_initialization, profile_hpz_topology,
 )
 
 
 class ProfileBenchTests(unittest.TestCase):
+    def test_hpz_profile_config_isolated(self):
+        from lerobot.scripts import train_lola_v07_azure as training
+
+        original = training.get_deepspeed_config(batch_size=32, world_size=16, zero_stage=3,
+                                                 allgather_bucket_size=5e8)
+        original["zero_optimization"]["zero_hpz_partition_size"] = 4
+        before = json.dumps(original, sort_keys=True)
+        configs = []
+        for size in (1, 8):
+            options, arguments = parse_options([
+                "--training-config", "config.json", "--output", "/tmp/hpz-profile",
+                "--validated-optimizations", "--zero-hpz-partition-size", str(size),
+            ])
+            self.assertEqual(options.zero_hpz_partition_size, size)
+            self.assertNotIn("--zero-hpz-partition-size", arguments)
+            self.assertEqual(options.memory_budget_fraction, 0.9)
+            config = configure_profile_deepspeed(original, size, 16, 8)
+            self.assertEqual(config["zero_optimization"]["zero_hpz_partition_size"], size)
+            self.assertEqual(config["train_batch_size"], 512)
+            configs.append(config)
+        self.assertEqual(json.dumps(original, sort_keys=True), before)
+        self.assertEqual(configure_profile_deepspeed(original, None, 1, 1), original)
+        configs[0]["zero_optimization"]["zero_hpz_partition_size"] = 8
+        self.assertEqual(configs[0], configs[1])
+
+    def test_hpz_profile_rejects_confounders(self):
+        from lerobot.scripts import train_lola_v07_azure as training
+
+        for overrides, message in (
+                ({"stage": 2}, "BF16 ZeRO-3"),
+                ({"mics_shard_size": 8}, "MiCS"),
+                ({"offload_optimizer": {"device": "cpu"}}, "offload"),
+                ({"offload_param": {"device": "nvme"}}, "offload"),
+                *[({name: True}, "quantization") for name in (
+                    "zero_quantized_weights", "zero_quantized_nontrainable_weights", "zero_quantized_gradients")]):
+            config = training.get_deepspeed_config(zero_stage=3)
+            config["zero_optimization"].update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
+                configure_profile_deepspeed(config, 8, 16, 8)
+        config = training.get_deepspeed_config(zero_stage=3)
+        for world_size, local_world_size in ((8, 8), (16, 4), (12, 8)):
+            with self.subTest(world_size=world_size, local_world_size=local_world_size), \
+                    self.assertRaisesRegex(ValueError, "multiple nodes with 8 ranks"):
+                configure_profile_deepspeed(config, 8, world_size, local_world_size)
+
+    def test_hpz_profile_actual_trainer_initialization(self):
+        import deepspeed
+        from lerobot.scripts import train_lola_v07_azure as training
+
+        with tempfile.TemporaryDirectory() as folder:
+            custom = Path(folder) / "custom.json"
+            config = training.get_deepspeed_config(zero_stage=3)["zero_optimization"]
+            config.update(zero_hpz_partition_size=4, stage3_max_live_parameters=12345)
+            custom.write_text(json.dumps({"zero_optimization": config}))
+            for size in (None, 1, 8):
+                engine = SimpleNamespace()
+                trainer = SimpleNamespace(
+                    learning_rate=2.5e-5, weight_decay=0.01, gradient_clip_val=1.0, train_vlm=True,
+                    batch_size=32, world_size=16, deepspeed_reduce_bucket_size=5e8,
+                    deepspeed_allgather_bucket_size=5e8, deepspeed_zero_stage=3,
+                    deepspeed_config_path=str(custom), policy=torch.nn.Linear(2, 2),
+                    config=SimpleNamespace(), vlm_lr=1e-5, _vlm_delayed_unfreeze=False,
+                    _configure_deepspeed_checkpointing=lambda: None,
+                )
+                with patch.object(deepspeed, "initialize", return_value=(engine, None, None, None)) as initialize, \
+                        patch.object(training, "build_lola_v07_param_groups", return_value=[]), \
+                        patch.dict(os.environ, WORLD_SIZE="16", LOCAL_WORLD_SIZE="8"), \
+                        profile_deepspeed_initialization(SimpleNamespace(zero_hpz_partition_size=size)):
+                    training.LoLAV07Trainer._setup_deepspeed(trainer)
+                actual = initialize.call_args.kwargs["config"]
+                self.assertEqual(actual["zero_optimization"]["zero_hpz_partition_size"], 4 if size is None else size)
+                self.assertEqual(actual["zero_optimization"]["stage3_max_live_parameters"], 12345)
+                self.assertEqual(actual["train_batch_size"], 512)
+                self.assertEqual(engine._lola_profile_deepspeed_config, actual)
+                self.assertIsNot(engine._lola_profile_deepspeed_config, actual)
+                self.assertEqual(json.loads(custom.read_text())["zero_optimization"]["zero_hpz_partition_size"], 4)
+
+    def test_hpz_profile_runtime_topology(self):
+        for size in (1, 8):
+            for invalid in (None, "size", "group", "host", "same-node", "local-rank"):
+                if size == 1 and invalid in ("host", "same-node", "local-rank"):
+                    continue
+                records = [dict(rank=rank, hostname=f"node{rank // 8}", local_rank=rank % 8,
+                                hpz_partition_size=size,
+                                hpz_group_ranks=list(range(rank // 8 * 8, rank // 8 * 8 + 8)) if size == 8 else [])
+                           for rank in range(16)]
+                if invalid == "size":
+                    records[0]["hpz_partition_size"] = 4
+                elif invalid == "group":
+                    records[0]["hpz_group_ranks"] = [0, 8]
+                elif invalid == "host":
+                    records[0]["hostname"] = "foreign"
+                elif invalid == "local-rank":
+                    records[0]["local_rank"] = 7
+                elif invalid == "same-node":
+                    for record in records:
+                        record["hostname"] = "node0"
+                policy = torch.nn.Linear(2, 2)
+                next(policy.parameters()).ds_zero_param_process_group = object() if size == 8 else None
+                trainer = SimpleNamespace(policy=policy, world_rank=0, local_rank=0, world_size=16,
+                                          model=SimpleNamespace(optimizer=SimpleNamespace(zero_hpz_partition_size=size)))
+                with self.subTest(size=size, invalid=invalid), \
+                        patch("torch.distributed.get_process_group_ranks", return_value=list(range(8))), \
+                        patch("torch.distributed.all_gather_object", side_effect=lambda output, value: output.__setitem__(slice(None), records)):
+                    if invalid:
+                        with self.assertRaises(ValueError):
+                            profile_hpz_topology(trainer, size)
+                    else:
+                        self.assertEqual(profile_hpz_topology(trainer, size), records)
+        self.assertIsNone(profile_hpz_topology(None, None))
+
+    def test_hpz_profile_main_initialization(self):
+        import deepspeed
+        from lerobot.scripts import profile_lola_v07 as profile
+        from lerobot.scripts import train_lola_v07_azure as training
+
+        config = training.get_deepspeed_config(batch_size=32, world_size=16, zero_stage=3)
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "training_config.json"
+            source.write_text(json.dumps({"training_args": {"strategy": "deepspeed", "deepspeed_zero_stage": 3}}))
+            for size in (1, 8):
+                command = ["profile_lola_v07.py", "--training-config", str(source), "--output", str(Path(folder) / "output"),
+                           "--validated-optimizations", "--zero-hpz-partition-size", str(size)]
+                with patch("sys.argv", command), patch.dict(os.environ, WORLD_SIZE="16", LOCAL_WORLD_SIZE="8"), \
+                        patch.object(deepspeed, "initialize", return_value=(SimpleNamespace(), None, None, None)) as initialize, \
+                        patch.object(training, "main", side_effect=lambda: deepspeed.initialize(config=config)):
+                    profile.main()
+                    self.assertIs(deepspeed.initialize, initialize)
+                self.assertEqual(initialize.call_args.kwargs["config"]["zero_optimization"]["zero_hpz_partition_size"], size)
+                self.assertNotIn("zero_hpz_partition_size", config["zero_optimization"])
+
     def test_abc_grouping_and_zero_retention_options(self):
         override = Path(__file__).resolve().parents[1] / "deepspeed_lola_zero3_c.json"
         snapshot = dict(training_args=dict(
@@ -151,6 +283,7 @@ class ProfileBenchTests(unittest.TestCase):
                            "--node_rank", str(rank), "--master_addr=10.0.0.1", "--master_port", "9901",
                            "--training-config", "/tmp/training config.json", "--output=/tmp/profile output",
                            "--python", str(executable), "--warmup", "10", "--steps", "50", "--validated-optimizations",
+                           "--zero-hpz-partition-size", "8",
                            "--", "--resume", "/tmp/checkpoint tag", "--batch_size", "32"]
                 for defaults in ({}, {"NODE_RANK": "99", "NNODES": "99", "MASTER_PORT": "1",
                                       "TRAINING_CONFIG": "/wrong", "PROFILE_OUTPUT": "/wrong"}):
@@ -162,6 +295,7 @@ class ProfileBenchTests(unittest.TestCase):
                                      "--master_addr=10.0.0.1", "--master_port=9901", "--max_restarts=0"])
                     self.assertEqual(actual[9:], ["--training-config", "/tmp/training config.json",
                                      "--output", "/tmp/profile output", "--warmup", "10", "--steps", "50", "--validated-optimizations",
+                                     "--zero-hpz-partition-size", "8",
                                      "--", "--resume", "/tmp/checkpoint tag", "--batch_size", "32"])
             result = subprocess.run(["bash", str(launcher), "--batch_size", "32"],
                                     env=dict(environment, PYTHON_BIN=str(executable), NNODES="2", NPROC_PER_NODE="8",
@@ -360,6 +494,7 @@ class ProfileBenchTests(unittest.TestCase):
                     options, arguments = parse_options(command[command.index("--training-config"):])
                     self.assertEqual(options.memory_budget_fraction, 0.9)
                     self.assertTrue(options.vision_batched_sdpa)
+                    self.assertEqual(options.zero_hpz_partition_size, 8)
                     self.assertIn("--no_vision_gradient_checkpointing", arguments)
                     _, _, training = resolve(json.loads(options.training_config.read_text()), arguments)
                     self.assertFalse(Path(training.dataset_root).is_relative_to(mount))
@@ -394,7 +529,7 @@ class ProfileBenchTests(unittest.TestCase):
                             "--storage_container", "container", "--mount_prefix", str(mount),
                             "--local_mirror", str(root / f"node{node}"), "--training-config", str(config),
                             "--output", str(mount / "profiles/run01"), "--memory-budget-fraction", "0.9",
-                            "--vision-batched-sdpa", "--", "--no_vision_gradient_checkpointing",
+                            "--vision-batched-sdpa", "--zero-hpz-partition-size", "8", "--", "--no_vision_gradient_checkpointing",
                             "--dataset_root", str(dataset)])
                     expected = child_exit or (1 if missing_metadata or node == 1 and (fail_upload or missing_shard) else 0)
                     self.assertEqual(result, expected)
@@ -561,6 +696,13 @@ class ProfileBenchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "training_args"):
                 summarize(directory)
             manifest["training_args"]["batch_size"] = 32
+            for key in ("deepspeed_config", "hpz_topology"):
+                manifest[key] = {"different": True}
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, key):
+                    summarize(directory)
+                del manifest[key]
+            manifest["training_args"]["batch_size"] = 32
             manifest_path.write_text(json.dumps(manifest))
             (directory / "rank001/status.json").write_text(json.dumps(dict(status="failed")))
             with self.assertRaises(ValueError):
@@ -652,14 +794,20 @@ def distributed_smoke(output, real_vision=False):
     torch.manual_seed(42)
     policy = TinyPolicy().to(device)
     optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
-    engine, optimizer, _, _ = deepspeed.initialize(
-        model=policy, optimizer=optimizer, config=dict(
-            train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1,
-            zero_optimization=dict(stage=3, stage3_param_persistence_threshold=0),
-            zero_allow_untested_optimizer=True, bf16=dict(enabled=real_vision),
-            steps_per_print=1000,
-        ),
-    )
+    options = SimpleNamespace(output=output, training_config=Path(__file__),
+                              warmup=1, steps=4, trace_steps=1, trace_ranks=(0,),
+                              memory_history=True, snapshot_threshold=100.0,
+                              sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
+                              memory_budget_fraction=0.9, zero_hpz_partition_size=None)
+    with profile_deepspeed_initialization(options):
+        engine, optimizer, _, _ = deepspeed.initialize(
+            model=policy, optimizer=optimizer, config=dict(
+                train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1,
+                zero_optimization=dict(stage=3, stage3_param_persistence_threshold=0),
+                zero_allow_untested_optimizer=True, bf16=dict(enabled=real_vision),
+                steps_per_print=1000,
+            ),
+        )
     trainer = training.LoLAV07Trainer(
         LoLAV07Config(), {}, dict(device=device, local_rank=local_rank, world_rank=rank,
                                  world_size=torch.distributed.get_world_size(), is_distributed=True),
@@ -676,11 +824,6 @@ def distributed_smoke(output, real_vision=False):
         return owner.model(owner.preprocessor(batch))
 
     trainer.training_step = MethodType(training_step, trainer)
-    options = SimpleNamespace(output=output, training_config=Path(__file__),
-                              warmup=1, steps=4, trace_steps=1, trace_ranks=(0,),
-                              memory_history=True, snapshot_threshold=100.0,
-                              sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
-                              memory_budget_fraction=0.9)
     loader = [dict(input=torch.randn(40, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]]))
               if real_vision else {"input": torch.randn(2, 16)} for batch_index in range(16)]
     with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",

@@ -65,6 +65,7 @@ while (( $# )); do
                 '  [--mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror]' \
                 '  [--azcopy_path EXECUTABLE] (--output is the blob destination in localized mode)' \
                 '  [--validated-optimizations] (grouped SDPA, retain 12 vision blocks, 90% budget)' \
+                '  [--zero-hpz-partition-size 1|8] (A: baseline=1; B: hpZ=8; profile only)' \
                 '  [profile options] [-- trainer options]' \
                 'CLI values override environment defaults. Options accept VALUE or =VALUE.'
             exit 0

@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -38,6 +39,8 @@ def parse_options(arguments=None):
     parser.add_argument("--vision-batched-sdpa", action="store_true")
     parser.add_argument("--validated-optimizations", action="store_true",
                         help="Use grouped vision SDPA, retain 12 vision blocks, and check a 90%% memory budget")
+    parser.add_argument("--zero-hpz-partition-size", type=int, choices=(1, 8), default=None,
+                        help="Profile-only hpZ control: 1 for baseline, 8 for node-local parameter caching")
     parser.add_argument("--dry-run", action="store_true")
     options, trainer_arguments = parser.parse_known_args(arguments)
     if trainer_arguments[:1] == ["--"]:
@@ -54,6 +57,77 @@ def parse_options(arguments=None):
         parser.error("memory-budget-fraction must be between 0 and 1")
     options.trace_ranks = tuple(int(rank) for rank in options.trace_ranks.split(",") if rank)
     return options, trainer_arguments
+
+
+def configure_profile_deepspeed(config, partition_size, world_size, local_world_size):
+    result = deepcopy(config)
+    if partition_size is None:
+        return result
+    if partition_size not in (1, 8):
+        raise ValueError("hpZ profile partition size must be 1 or 8")
+    zero = result["zero_optimization"]
+    if zero["stage"] != 3 or not result.get("bf16", {}).get("enabled"):
+        raise ValueError("hpZ comparison requires BF16 ZeRO-3")
+    if any(zero.get(name, False) for name in (
+            "zero_quantized_weights", "zero_quantized_nontrainable_weights", "zero_quantized_gradients")):
+        raise ValueError("hpZ comparison requires all ZeRO quantization options disabled")
+    if zero.get("mics_shard_size", -1) > 0:
+        raise ValueError("hpZ comparison must not enable MiCS")
+    if any(zero.get(name, {}).get("device", "none") != "none"
+           for name in ("offload_param", "offload_optimizer") if zero.get(name)):
+        raise ValueError("hpZ comparison requires no parameter or optimizer offload")
+    if partition_size > 1 and (local_world_size != partition_size or world_size <= local_world_size
+                                or world_size % local_world_size):
+        raise ValueError("hpZ8 comparison requires multiple nodes with 8 ranks per node")
+    zero["zero_hpz_partition_size"] = partition_size
+    return result
+
+
+@contextmanager
+def profile_deepspeed_initialization(options):
+    import deepspeed
+
+    original_initialize = deepspeed.initialize
+
+    def initialize(*args, **kwargs):
+        config = configure_profile_deepspeed(
+            kwargs["config"], options.zero_hpz_partition_size,
+            int(os.environ.get("WORLD_SIZE", "1")), int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        kwargs["config"] = config
+        receipt = deepcopy(config)
+        result = original_initialize(*args, **kwargs)
+        result[0]._lola_profile_deepspeed_config = receipt
+        return result
+
+    with patch.object(deepspeed, "initialize", initialize):
+        yield
+
+
+def profile_hpz_topology(trainer, partition_size):
+    if partition_size is None:
+        return None
+    parameter = next(trainer.policy.parameters())
+    group = getattr(parameter, "ds_zero_param_process_group", None)
+    ranks = torch.distributed.get_process_group_ranks(group) if group is not None else []
+    local = dict(rank=trainer.world_rank, hostname=socket.gethostname(), local_rank=trainer.local_rank,
+                 hpz_group_ranks=ranks, hpz_partition_size=trainer.model.optimizer.zero_hpz_partition_size)
+    topology = [None] * trainer.world_size
+    torch.distributed.all_gather_object(topology, local)
+    for entry in topology:
+        if entry["hpz_partition_size"] != partition_size:
+            raise ValueError("DeepSpeed did not apply the requested hpZ partition size")
+        start = entry["rank"] // partition_size * partition_size
+        expected = list(range(start, start + partition_size)) if partition_size > 1 else []
+        if entry["hpz_group_ranks"] != expected:
+            raise ValueError("Unexpected hpZ rank group")
+        if partition_size > 1:
+            members = [topology[rank] for rank in expected]
+            if len({member["hostname"] for member in members}) != 1 or \
+                    sorted(member["local_rank"] for member in members) != list(range(partition_size)):
+                raise ValueError("hpZ group must contain all 8 ranks on one node")
+    if partition_size > 1 and len({entry["hostname"] for entry in topology}) != trainer.world_size // partition_size:
+        raise ValueError("hpZ comparison requires distinct physical nodes")
+    return topology
 
 
 def validate_checkpoint_tag(directory, ranks):
@@ -462,6 +536,7 @@ class ProfileLoader:
 def run_bench(trainer, options, loader, start_step, start_epoch, original_train):
     if trainer.strategy != "deepspeed":
         raise ValueError("This bench requires the production DeepSpeed training path")
+    hpz_topology = profile_hpz_topology(trainer, options.zero_hpz_partition_size)
     recorder = BenchRecorder(trainer, options)
     trainer.resume_save_dir = None
     trainer.ckpt_dir = str(options.output / "runtime_config")
@@ -477,6 +552,8 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
                     allocator_backend=torch.cuda.memory.get_allocator_backend(),
                     allocator_config=os.environ.get("PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF")),
                     bench=vars(options), training_args=trainer.training_args,
+                    deepspeed_config=trainer.model._lola_profile_deepspeed_config,
+                    hpz_topology=hpz_topology,
                     source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                     trainer_sha256=hashlib.sha256(Path(training.__file__).read_bytes()).hexdigest(),
                     optimizations_sha256=hashlib.sha256(Path(forward_optimizations.__file__).read_bytes()).hexdigest(),
@@ -528,7 +605,8 @@ def summarize(directory):
     if {entry["rank"] for entry in manifests} != set(range(world_size)):
         raise ValueError("Missing ranks; copy both nodes' rank directories before summarizing")
     for key in ("world_size", "source_sha256", "trainer_sha256", "policy_sha256",
-                "optimizations_sha256", "training_config_sha256", "start_step", "training_args", "bench"):
+                "optimizations_sha256", "training_config_sha256", "start_step", "training_args", "bench",
+                "deepspeed_config", "hpz_topology"):
         if any(entry.get(key) != manifests[0].get(key) for entry in manifests):
             raise ValueError(f"Rank manifests disagree on {key}")
     per_rank = {}
@@ -622,7 +700,8 @@ def main():
             patch.object(training, "build_arg_parser", return_value=parser), \
             patch.object(training, "build_lola_config", build_config), \
             patch.object(training, "_resolve_inplace_save_dir", return_value=None), \
-            patch.object(training.LoLAV07Trainer, "train", train):
+            patch.object(training.LoLAV07Trainer, "train", train), \
+            profile_deepspeed_initialization(options):
         training.main()
 
 

@@ -169,6 +169,70 @@ is checked for all three launchers. The CALVIN CLI/contract tests isolate those
 functions without loading the simulator. Full CALVIN rollouts and a new full
 sixteen-GPU training run were not executed for this integration.
 
+## hpZ A/B Profile, 2026-09-21
+
+This experiment retains global 16-rank ZeRO-3 optimizer/gradient sharding.
+The candidate adds node-local secondary parameter partitions with
+`zero_hpz_partition_size=8`; it is NOT MiCS or an outer DDP wrapper.
+Official DeepSpeed 0.19.7 removed MiCS; no downgrade or quantization is needed
+for hpZ. No hpZ throughput or full-model memory result is established yet.
+
+Use `--zero-hpz-partition-size 1` for A and `8` for B, BEFORE `--`.
+Omitting this option preserves the original configuration. The override is
+applied immediately before DeepSpeed initialization, AFTER custom JSON merging.
+It does not modify the source JSON or production training defaults. Explicit
+hpZ profiles reject non-BF16/non-ZeRO3, quantization, offload and MiCS settings.
+hpZ8 also requires multiple nodes with eight ranks each. Before measurement,
+the bench verifies the actual secondary groups and their physical hostnames.
+Each rank manifest records the final submitted `deepspeed_config` and the
+gathered `hpz_topology`; summarization rejects cross-rank disagreements.
+
+Both nodes should execute this SAME loop in one cluster allocation. Set
+`NODE_RANK` to 0/1 and `MASTER_ADDR` to node 0's address. In AMLT templates,
+map them from `$$AZUREML_CR_NODE_RANK` and `$$AZ_BATCHAI_JOB_MASTER_NODE_IP`
+using the existing template escaping. The paths below match the previous
+cluster experiments. Use a NEW output root for every attempt.
+
+```bash
+set -euo pipefail
+PROFILE_ROOT=/mnt/wangxiaofa/profiles/lola_hpz_ab_01
+for HPZ_SIZE in 1 8; do
+  bash src/lerobot/scripts/profile_azure_v07c.sh \
+    --nnodes 2 --nproc_per_node 8 --node_rank "$NODE_RANK" \
+    --master_addr "$MASTER_ADDR" --master_port "$((9900 + HPZ_SIZE))" \
+    --python /home/aiscuser/.conda/envs/lerobot/bin/python \
+    --localize_io --storage_account azsussc --storage_container v-wangxiaofa \
+    --mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror \
+    --training-config /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/training_config.json \
+    --output "$PROFILE_ROOT/hpz${HPZ_SIZE}" \
+    --validated-optimizations --zero-hpz-partition-size "$HPZ_SIZE" \
+    --warmup 40 --steps 200 --trace-steps 0 --memory-budget-fraction 0.90 \
+    -- --strategy deepspeed --deepspeed_zero_stage 3 --batch_size 32 --seed 0 \
+    --ema_decay 0 \
+    --dataset_root /mnt/wangxiaofa/robot_dataset/lerobot-format-v30/calvin_task_ABC_D_training_v4 \
+    --vlm_path /mnt/wangxiaofa/utils/Cosmos3-Nano \
+    --resume /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/step_032929
+done
+```
+
+Check that the ORIGINAL saved training configuration has `deepspeed_config`
+null/absent, global/vision checkpointing enabled and DiT checkpointing disabled.
+Do not use the historical C override or a profile's runtime configuration.
+Both runs use grouped SDPA, retain 12 vision blocks, 5e8 buckets, live/reuse
+2e9, global batch 512, the same seed/checkpoint and zero checkpoint writes.
+Each run starts a fresh process and restores the same optimizer state; B does
+not continue A's in-memory training. No checkpoint-saving compatibility is
+claimed by this read-only profile.
+
+Collect all 16 rank directories for each run, then invoke the existing
+`profile_lola_v07.py summarize DIRECTORY` separately for `hpz1` and `hpz8`.
+Compare the mean rank-max step-plus-data time, estimated samples/s, maximum
+memory-budget fraction and allocator retries over all 200 measured steps.
+Keep slow steps; do not relax the 90% budget or change batch size after a
+failure. The budget check is at step boundaries, not a hard allocator cap.
+A single A-then-B pair is diagnostic, not repeated-job proof. Local tests
+check configuration and wiring; two local GPUs cannot measure this 2x8 topology.
+
 ## Local Results, 2026-09-19
 
 Historical caveat added 2026-09-20: the old attention patch fell back whenever
