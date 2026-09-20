@@ -17,6 +17,12 @@ that is reported as a failure, not a complete measurement.
 
 ## Local Results, 2026-09-19
 
+Historical caveat added 2026-09-20: the old attention patch fell back whenever
+`output_hidden_states` was forwarded, even when false. The labels below record
+requested options, not proof that grouping executed. Keep these historical
+measurements, but do not attribute their timing differences to grouped SDPA.
+The corrected wrapper-level tests and new ABC protocol are described below.
+
 Same-checkpoint alternating A/B on two RTX A6000 GPUs (VLM on GPU0, remaining
 model on GPU1), PyTorch 2.11.0+cu126 and Transformers 5.14.1. Checkpoint
 `step_032929`, its saved configuration and CALVIN v4 data were used. Each
@@ -268,6 +274,10 @@ the original image boundaries and token order. Mixed lengths are grouped without
 padding, resampling, or cross-image attention. Nonpositive lengths, nonzero
 training dropout, other attention backends and unsupported call options fall
 back to the original implementation.
+The corrected patch allows only the forwarded `output_hidden_states` metadata;
+unknown options, including `attention_mask` and `output_attentions`, still go
+through the original attention with their arguments unchanged. Do not replace
+this with unconditional removal of arbitrary keyword arguments.
 It requires the Qwen3-VL vision tower and does not install Flash Attention.
 For a distributed A/B, add `--vision-batched-sdpa` before `--` and use a new
 output directory, the same checkpoint, seed and data configuration. The production
@@ -284,6 +294,142 @@ For finer control, `--vision_no_checkpoint_layers N` retains activations only
 for the last N vision blocks (default 0). Other vision blocks and the language
 model keep checkpointing. Negative counts, counts beyond the visual depth and
 combining a positive count with full vision checkpointing disablement are rejected.
+
+### Corrected Grouped-SDPA ABC Protocol, 2026-09-20
+
+This ABC protocol differs from the earlier memory-budget probe below: ALL three
+groups retain the last 12 vision blocks. A/B isolate the grouped-SDPA switch;
+B/C isolate the two ZeRO retention thresholds. Use the same corrected repository
+revision and dependencies for all six nodes, with two nodes/eight GPUs per node
+in each separate AMLT job. Do not combine ranks from different groups.
+
+| Group | Grouped SDPA | Last vision blocks retained | Max live / reuse parameters | Output |
+| --- | --- | --- | --- | --- |
+| A | Off | 12 | 2e9 / 2e9 | `lola_groupfix_A_01` |
+| B | On | 12 | 2e9 / 2e9 | `lola_groupfix_B_01` |
+| C | On | 12 | 3e9 / 3e9 | `lola_groupfix_C_01` |
+
+Run from the repository root. C uses the checked-in
+`deepspeed_lola_zero3_c.json`, which must exist in that same checkout on both
+nodes. It provides the WHOLE `zero_optimization` dictionary because the trainer
+does a shallow merge. Persistence stays 0 and all three bucket sizes stay 5e8;
+only live/reuse increase from 2e9 to 3e9. The localizer does not copy or hash
+custom DS JSON. Retain the exact JSON and its SHA256 with the run's configuration
+evidence, as well as the repository revision; a manifest path alone is insufficient.
+
+Use the ORIGINAL checkpoint's training configuration shown below, not an old
+profile's runtime configuration. Confirm that its `training_args` has
+`vision_batched_sdpa` false/absent and `deepspeed_config` null/absent. Omission of
+the grouping flag does NOT override an inherited true value. Keep global and
+vision checkpointing enabled and DiT checkpointing disabled. The listed paths
+match the 04/05/06 source paths; adjust only if the mounted inputs actually move.
+Every output must be unused, including the short preflight output.
+
+Before the long jobs, run B's command once with output
+`/mnt/wangxiaofa/profiles/lola_groupfix_B_trace_01` and replace its measurement
+options with `--warmup 3 --steps 5 --trace-steps 3 --trace-ranks 0,8`.
+This is an execution-path check, not a throughput benchmark. With 64 images,
+two distinct lengths and 27 visual blocks, the expected VISION SDPA calls per
+step are 54 in forward, 30 in backward recomputation and 54 backward attention
+operations; over three traced steps this is 252 forward/recompute and 162
+backward operations. The old per-image path would be 8064 and 5184, respectively.
+Count within the vision ranges or distinguish the vision backend from language
+attention; total model SDPA counts also include language/DiT. Inspect actual
+shapes/backend and both traced ranks before accepting these expectations.
+
+After that check, use the following long-run commands. Each retains 40 warmup
+plus 200 measured steps, without a profiler, and the same 90% per-rank budget.
+Do not change the budget or batch size to rescue a failed C run.
+
+**A: grouped off, default ZeRO retention**
+
+```yaml
+- >-
+  bash src/lerobot/scripts/profile_azure_v07c.sh
+  --nnodes 2 --nproc_per_node 8
+  --node_rank $$AZUREML_CR_NODE_RANK
+  --master_addr $$AZ_BATCHAI_JOB_MASTER_NODE_IP --master_port 9901
+  --python /home/aiscuser/.conda/envs/lerobot/bin/python
+  --localize_io --storage_account azsussc --storage_container v-wangxiaofa
+  --mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror
+  --training-config /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/training_config.json
+  --output /mnt/wangxiaofa/profiles/lola_groupfix_A_01
+  --warmup 40 --steps 200 --trace-steps 0 --trace-ranks 0,8
+  --memory-budget-fraction 0.90
+  --
+  --strategy deepspeed --deepspeed_zero_stage 3 --batch_size 32 --seed 0
+  --vision_no_checkpoint_layers 12
+  --deepspeed_reduce_bucket_size 500000000 --deepspeed_allgather_bucket_size 500000000
+  --dataset_root /mnt/wangxiaofa/robot_dataset/lerobot-format-v30/calvin_task_ABC_D_training_v4
+  --vlm_path /mnt/wangxiaofa/utils/Cosmos3-Nano
+  --resume /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/step_032929
+```
+
+**B: grouped on, default ZeRO retention**
+
+```yaml
+- >-
+  bash src/lerobot/scripts/profile_azure_v07c.sh
+  --nnodes 2 --nproc_per_node 8
+  --node_rank $$AZUREML_CR_NODE_RANK
+  --master_addr $$AZ_BATCHAI_JOB_MASTER_NODE_IP --master_port 9901
+  --python /home/aiscuser/.conda/envs/lerobot/bin/python
+  --localize_io --storage_account azsussc --storage_container v-wangxiaofa
+  --mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror
+  --training-config /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/training_config.json
+  --output /mnt/wangxiaofa/profiles/lola_groupfix_B_01
+  --warmup 40 --steps 200 --trace-steps 0 --trace-ranks 0,8
+  --memory-budget-fraction 0.90 --vision-batched-sdpa
+  --
+  --strategy deepspeed --deepspeed_zero_stage 3 --batch_size 32 --seed 0
+  --vision_no_checkpoint_layers 12
+  --deepspeed_reduce_bucket_size 500000000 --deepspeed_allgather_bucket_size 500000000
+  --dataset_root /mnt/wangxiaofa/robot_dataset/lerobot-format-v30/calvin_task_ABC_D_training_v4
+  --vlm_path /mnt/wangxiaofa/utils/Cosmos3-Nano
+  --resume /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/step_032929
+```
+
+**C: grouped on, larger ZeRO retention**
+
+```yaml
+- >-
+  bash src/lerobot/scripts/profile_azure_v07c.sh
+  --nnodes 2 --nproc_per_node 8
+  --node_rank $$AZUREML_CR_NODE_RANK
+  --master_addr $$AZ_BATCHAI_JOB_MASTER_NODE_IP --master_port 9901
+  --python /home/aiscuser/.conda/envs/lerobot/bin/python
+  --localize_io --storage_account azsussc --storage_container v-wangxiaofa
+  --mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror
+  --training-config /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/training_config.json
+  --output /mnt/wangxiaofa/profiles/lola_groupfix_C_01
+  --warmup 40 --steps 200 --trace-steps 0 --trace-ranks 0,8
+  --memory-budget-fraction 0.90 --vision-batched-sdpa
+  --
+  --strategy deepspeed --deepspeed_zero_stage 3 --batch_size 32 --seed 0
+  --vision_no_checkpoint_layers 12
+  --deepspeed_reduce_bucket_size 500000000 --deepspeed_allgather_bucket_size 500000000
+  --deepspeed_config ./deepspeed_lola_zero3_c.json
+  --dataset_root /mnt/wangxiaofa/robot_dataset/lerobot-format-v30/calvin_task_ABC_D_training_v4
+  --vlm_path /mnt/wangxiaofa/utils/Cosmos3-Nano
+  --resume /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260829_221224/step_032929
+```
+
+The doubled dollar syntax is for AMLT substitution only. In a normal shell
+replace node rank/master with actual values or single-dollar environment variables.
+The grouping flag is before `--`; the underscore-form checkpointing and DS
+options are after it. Do not reuse profile04/05/06 output names.
+
+Local fix validation: the new metadata regression failed on the original code
+with 8 versus 4 SDPA calls for BOTH true and false. After the fix, all eight
+forward tests passed, including actual LoLA `prepare_vlm_inputs` calling a tiny
+Cosmos model in hidden-state and hook modes, full output/input/parameter-gradient
+comparisons, selective recomputation counts, and unknown-option fallback.
+All 16 profiler tests passed, including ABC argument resolution and exact DS
+override differences. The real two-GPU BF16 ZeRO-3 vision smoke passed five
+updates per rank with four images/two lengths and forwarded metadata: 30 SDPA
+calls per rank across forward/recomputation, versus 60 without grouping.
+This establishes local execution correctness, not full-checkpoint BF16 gradient
+equivalence, A100 speedup or cross-node memory acceptance.
 
 ### A100 40 GB Memory Budget
 
@@ -414,8 +560,10 @@ and allocator snapshot, checks the memory budget, bounded exit and verifies no m
 was written. It tests the real training loop and recorder, not full LoLA
 checkpoint restore, A100 performance or cross-node networking.
 Replace `--distributed-smoke` with `--distributed-vision-smoke` to exercise
-an actual small BF16 Qwen3-VL vision tower with mixed image lengths, grouped
-SDPA and one of two vision blocks retaining activations under ZeRO-3.
+an actual small BF16 Qwen3-VL vision tower with four images/two lengths, forwarded
+hidden-state metadata, grouped SDPA and one of two vision blocks retaining
+activations under ZeRO-3. The smoke asserts exactly six SDPA calls per update
+including checkpoint recomputation, so a silent per-image fallback fails.
 
 Numeric comparisons are required on the deployed hardware/software. Local
 action agreement is not a robot task-success evaluation. Do not infer an

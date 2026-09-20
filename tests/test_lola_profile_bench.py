@@ -14,11 +14,58 @@ import torch
 
 from lerobot.scripts.profile_lola_v07 import (
     BenchComplete, BenchRecorder, ProfileLoader, counter_deltas, parse_options, summarize,
-    assess_memory_budget, localize_main, run_profile_child, stage_checkpoint_config, validate_checkpoint_tag,
+    assess_memory_budget, localize_main, resolve_training_arguments, run_profile_child,
+    stage_checkpoint_config, validate_checkpoint_tag,
 )
 
 
 class ProfileBenchTests(unittest.TestCase):
+    def test_abc_grouping_and_zero_retention_options(self):
+        override = Path(__file__).resolve().parents[1] / "deepspeed_lola_zero3_c.json"
+        snapshot = dict(training_args=dict(
+            vision_batched_sdpa=False, deepspeed_config=None,
+            gradient_checkpointing=True, train_vlm=True,
+        ))
+        common = ["--strategy", "deepspeed", "--deepspeed_zero_stage", "3", "--batch_size", "32", "--seed", "0",
+                  "--vision_no_checkpoint_layers", "12", "--deepspeed_reduce_bucket_size", "500000000",
+                  "--deepspeed_allgather_bucket_size", "500000000"]
+        configs = []
+        for group in ("A", "B", "C"):
+            before = [] if group == "A" else ["--vision-batched-sdpa"]
+            after = ["--deepspeed_config", str(override)] if group == "C" else []
+            options, trainer_arguments = parse_options([
+                "--training-config", "original_training_config.json", "--output", f"/tmp/lola_fixed_{group}",
+                "--warmup", "40", "--steps", "200", "--trace-steps", "0", "--memory-budget-fraction", "0.90",
+                *before, "--", *common, *after,
+            ])
+            training, _, args = resolve_training_arguments(snapshot, trainer_arguments)
+            self.assertEqual((options.warmup, options.steps, options.trace_steps), (40, 200, 0))
+            self.assertEqual(options.memory_budget_fraction, 0.9)
+            self.assertEqual(options.vision_batched_sdpa or args.vision_batched_sdpa, group != "A")
+            self.assertEqual((args.batch_size, args.seed, args.vision_no_checkpoint_layers), (32, 0, 12))
+            self.assertTrue(args.gradient_checkpointing)
+            self.assertFalse(args.no_gradient_checkpointing or args.no_vision_gradient_checkpointing)
+            config = training.get_deepspeed_config(
+                batch_size=args.batch_size, world_size=16, zero_stage=args.deepspeed_zero_stage,
+                reduce_bucket_size=args.deepspeed_reduce_bucket_size,
+                allgather_bucket_size=args.deepspeed_allgather_bucket_size,
+            )
+            if args.deepspeed_config:
+                config.update(json.loads(Path(args.deepspeed_config).read_text()))
+            self.assertEqual(config["train_batch_size"], 512)
+            self.assertEqual(config["zero_optimization"]["param_persistence_threshold"], 0)
+            configs.append(config)
+        self.assertEqual(configs[0], configs[1])
+        for key in configs[1]:
+            if key != "zero_optimization":
+                self.assertEqual(configs[1][key], configs[2][key])
+        previous, candidate = [config["zero_optimization"] for config in configs[1:]]
+        self.assertEqual(previous.keys(), candidate.keys())
+        changed = {key for key in previous if previous[key] != candidate[key]}
+        self.assertEqual(changed, {"stage3_max_live_parameters", "stage3_max_reuse_distance"})
+        for key in changed:
+            self.assertEqual((previous[key], candidate[key]), (2000000000, 3000000000))
+
     def test_production_launcher_vision_options(self):
         launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/test_azure_v07c.sh"
         source = launcher.read_text()
@@ -498,7 +545,10 @@ def distributed_smoke(output, real_vision=False):
             self.model.dit = torch.nn.Linear(width, width)
 
         def forward(self, batch):
-            visual = self.vlm.visual(batch["input"], batch["grid"]).pooler_output if real_vision else self.vlm.visual(batch["input"])
+            if real_vision:
+                visual = self.vlm.visual(batch["input"], batch["grid"], output_hidden_states=True).pooler_output
+            else:
+                visual = self.vlm.visual(batch["input"])
             hidden = self.vlm.language_model(visual)
             loss = self.model.dit(self.model.vlm_bridge(hidden)).square().mean()
             return loss, {"loss": loss.item()}
@@ -535,9 +585,13 @@ def distributed_smoke(output, real_vision=False):
                               memory_history=True, snapshot_threshold=100.0,
                               sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
                               memory_budget_fraction=0.9)
-    loader = [dict(input=torch.randn(20, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2]]))
+    loader = [dict(input=torch.randn(40, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]]))
               if real_vision else {"input": torch.randn(2, 16)} for batch_index in range(16)]
-    run_bench(trainer, options, loader, 0, 0, training.LoLAV07Trainer.train)
+    with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",
+               wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa:
+        run_bench(trainer, options, loader, 0, 0, training.LoLAV07Trainer.train)
+    if real_vision:
+        assert sdpa.call_count == 5 * 6, sdpa.call_count
     assert trainer.global_step == 5
     torch.distributed.barrier()
     assert not list(output.rglob("*model_states.pt"))

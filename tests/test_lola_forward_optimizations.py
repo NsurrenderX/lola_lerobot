@@ -41,6 +41,133 @@ class ForwardOptimizationTests(unittest.TestCase):
             original.zero_grad()
             candidate.zero_grad()
 
+    def test_vision_forwarded_metadata(self):
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+        config = Qwen3VLVisionConfig(
+            hidden_size=64, intermediate_size=128, num_heads=4, depth=2,
+            out_hidden_size=64, deepstack_visual_indexes=[], num_position_embeddings=16,
+            patch_size=2, temporal_patch_size=1, spatial_merge_size=2,
+        )
+        config._attn_implementation = "sdpa"
+        original = Qwen3VLVisionModel(config).train()
+        candidate = copy.deepcopy(original)
+        enable_batched_vision_sdpa(SimpleNamespace(visual=candidate))
+        grid = torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]])
+        for output_hidden_states in (True, False):
+            with self.subTest(output_hidden_states=output_hidden_states):
+                inputs = torch.randn(40, 12, requires_grad=True)
+                other = inputs.detach().clone().requires_grad_()
+                expected = original(inputs, grid, output_hidden_states=output_hidden_states)
+                with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",
+                           wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa:
+                    actual = candidate(other, grid, output_hidden_states=output_hidden_states)
+                self.assertEqual(sdpa.call_count, 4)
+                torch.testing.assert_close(actual.pooler_output, expected.pooler_output, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(actual.last_hidden_state, expected.last_hidden_state, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(actual.hidden_states, expected.hidden_states, rtol=1e-5, atol=1e-6)
+                expected.pooler_output.square().sum().backward()
+                actual.pooler_output.square().sum().backward()
+                torch.testing.assert_close(other.grad, inputs.grad, rtol=1e-4, atol=1e-5)
+                for baseline_parameter, parameter in zip(original.parameters(), candidate.parameters()):
+                    torch.testing.assert_close(parameter.grad, baseline_parameter.grad, rtol=1e-4, atol=1e-5)
+                original.zero_grad(set_to_none=True)
+                candidate.zero_grad(set_to_none=True)
+
+    def test_cosmos_policy_wrapper_outputs_gradients_and_calls(self):
+        from transformers.models.cosmos3_omni.configuration_cosmos3_omni import Cosmos3OmniConfig
+        from transformers.models.cosmos3_omni.modeling_cosmos3_omni import Cosmos3OmniModel
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig, Qwen3VLVisionConfig
+        from lerobot.policies.lola_v07.modeling_lola_v07 import LoLAV07Policy
+
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        config = Cosmos3OmniConfig(
+            vision_config=Qwen3VLVisionConfig(
+                hidden_size=64, intermediate_size=128, num_heads=4, depth=2,
+                out_hidden_size=64, deepstack_visual_indexes=[], num_position_embeddings=16,
+                patch_size=2, temporal_patch_size=1, spatial_merge_size=2,
+            ),
+            text_config=Qwen3VLTextConfig(
+                vocab_size=32, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                num_attention_heads=4, num_key_value_heads=2, head_dim=16, use_cache=False,
+                rope_parameters={"rope_type": "default", "mrope_section": [2, 3, 3]},
+            ),
+            image_token_id=4, video_token_id=5, vision_start_token_id=9, vision_end_token_id=10,
+        )
+        config._attn_implementation = "sdpa"
+        input_ids = torch.tensor([[1, 4, 4, 4, 4, 2, 4, 2, 4, 4, 4, 4, 2, 4, 3]], device=device)
+        batch = dict(input_ids=input_ids, mm_token_type_ids=(input_ids == 4).long(),
+                     image_grid_thw=torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]], device=device))
+        for mode, retained in (("output_hidden_states", 0), ("output_hidden_states", 1), ("hook", None)):
+            with self.subTest(mode=mode, retained=retained):
+                torch.manual_seed(0)
+                original = Cosmos3OmniModel(copy.deepcopy(config)).to(device).train()
+                candidate = copy.deepcopy(original)
+                keys = set(candidate.state_dict())
+                self.assertEqual(enable_batched_vision_sdpa(candidate), 2)
+                self.assertEqual(enable_batched_vision_sdpa(candidate), 2)
+                self.assertEqual(set(candidate.state_dict()), keys)
+                policies = []
+                for model in (original, candidate):
+                    policy = SimpleNamespace(
+                        config=SimpleNamespace(train_vlm=True, vlm_extract_layers=[2],
+                                               vision_gradient_checkpointing=True, vision_no_checkpoint_layers=retained),
+                        vlm=model, _vlm_forward_mode=mode, _captured_hidden_states={},
+                        _hook_handles=[], _in_vlm_forward=False,
+                    )
+                    if retained is not None:
+                        LoLAV07Policy.enable_vlm_gradient_checkpointing(policy)
+                    if mode == "hook":
+                        LoLAV07Policy._register_vlm_hooks(policy)
+                    policies.append(policy)
+                inputs = torch.randn(40, 12, device=device, requires_grad=True)
+                other = inputs.detach().clone().requires_grad_()
+                weights = torch.randn(1, input_ids.shape[1], 64, device=device)
+                outputs = []
+                for policy, pixels, grouped in zip(policies, (inputs, other), (False, True)):
+                    with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",
+                               wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa:
+                        features, actual_ids = LoLAV07Policy.prepare_vlm_inputs(policy, dict(batch, pixel_values=pixels))
+                        torch.testing.assert_close(actual_ids, input_ids, rtol=0, atol=0)
+                        visual_calls = 4 if grouped else 8
+                        self.assertEqual(sdpa.call_count, visual_calls + 2)
+                        outputs.append(features[2])
+                        (features[2] * weights).sum().backward()
+                        recompute = 0 if retained is None else (2 - retained) * (2 if grouped else 4) + 2
+                        self.assertEqual(sdpa.call_count, visual_calls + 2 + recompute)
+                torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(other.grad, inputs.grad, rtol=1e-4, atol=1e-5)
+                for (name, baseline_parameter), (other_name, parameter) in zip(
+                        original.named_parameters(), candidate.named_parameters()):
+                    self.assertEqual(name, other_name)
+                    self.assertEqual(parameter.grad is None, baseline_parameter.grad is None, name)
+                    if parameter.grad is not None:
+                        self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                        torch.testing.assert_close(parameter.grad, baseline_parameter.grad, rtol=1e-4, atol=1e-5)
+                for policy in policies:
+                    LoLAV07Policy._remove_vlm_hooks(policy)
+
+    def test_vision_unknown_kwargs_preserve_original_fallback(self):
+        from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionAttention
+
+        config = Qwen3VLVisionConfig(hidden_size=64, num_heads=4)
+        config._attn_implementation = "sdpa"
+        attention = Qwen3VLVisionAttention(config)
+        enable_batched_vision_sdpa(SimpleNamespace(visual=attention))
+        inputs = torch.randn(8, 64)
+        boundaries = torch.tensor([0, 4, 8], dtype=torch.int32)
+        angle = torch.randn(8, 16)
+        embeddings = (angle.cos(), angle.sin())
+        expected = torch.randn_like(inputs)
+        for kwargs in (dict(attention_mask=torch.ones(4, 4)), dict(output_attentions=True), dict(custom_option=7)):
+            with self.subTest(keys=tuple(kwargs)), \
+                    patch.object(attention, "_lola_original_forward", return_value=expected) as original:
+                actual = attention(inputs, boundaries, embeddings, output_hidden_states=False, **kwargs)
+                self.assertIs(actual, expected)
+                original.assert_called_once_with(inputs, boundaries, embeddings, output_hidden_states=False, **kwargs)
+
     def test_selective_vision_checkpointing(self):
         from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel

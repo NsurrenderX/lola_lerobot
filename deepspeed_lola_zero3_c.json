@@ -1,0 +1,11 @@
+{
+    "zero_optimization": {
+        "stage": 3,
+        "allgather_bucket_size": 500000000,
+        "reduce_bucket_size": 500000000,
+        "param_persistence_threshold": 0,
+        "stage3_prefetch_bucket_size": 500000000,
+        "stage3_max_live_parameters": 3000000000,
+        "stage3_max_reuse_distance": 3000000000
+    }
+}

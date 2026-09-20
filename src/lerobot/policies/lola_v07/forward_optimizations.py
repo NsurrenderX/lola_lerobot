@@ -16,7 +16,8 @@ def enable_batched_vision_sdpa(vlm):
     def forward(attention, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
         original = attention._lola_original_forward
         if (attention.config._attn_implementation != "sdpa"
-                or position_embeddings is None or kwargs
+            or position_embeddings is None
+            or any(name != "output_hidden_states" for name in kwargs)
                 or (attention.training and attention.attention_dropout != 0)):
             return original(hidden_states, cu_seqlens, position_embeddings, **kwargs)
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
