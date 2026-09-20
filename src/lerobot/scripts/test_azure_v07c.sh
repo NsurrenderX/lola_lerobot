@@ -90,8 +90,8 @@ USE_STATE_CONDITION=false
 # LoLA 模型配置
 GRADIENT_CHECKPOINTING=true
 VISION_GRADIENT_CHECKPOINTING=true
-VISION_NO_CHECKPOINT_LAYERS=0
-VISION_BATCHED_SDPA=false
+VISION_NO_CHECKPOINT_LAYERS=12
+VISION_BATCHED_SDPA=true
 # DiT 梯度检查点 (默认关: DiT 激活仅 ~1GB, GC 重算不划算; VLM GC 不受影响)
 DIT_GRADIENT_CHECKPOINTING=false
 COMPILE_MODEL=false
@@ -196,7 +196,7 @@ DEEPSPEED_ZERO_STAGE=3
 # reduce bucket 默认 5e8 (2026-08-07 ZeRO-3 通信调优; ZeRO-3 用它做梯度
 # reduce-scatter 分桶, 旧值 5e7 是给 ZeRO-2/NVLink 调的)。生产 yaml 本就显式传 5e8。
 DEEPSPEED_REDUCE_BUCKET_SIZE=5e8
-DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e7
+DEEPSPEED_ALLGATHER_BUCKET_SIZE=5e8
 
 # Static padding 参数
 STATIC_COLLATE_PADDING=true
@@ -394,6 +394,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --vision_batched_sdpa)
             VISION_BATCHED_SDPA=true
+            shift
+            ;;
+        --no_vision_batched_sdpa)
+            VISION_BATCHED_SDPA=false
             shift
             ;;
         --dit_gradient_checkpointing)
@@ -790,6 +794,18 @@ fi
 # 因此追加总是无害的 (值参数与布尔 flag 的追加条件需与下方 cmd 拼装逻辑一致)。
 # 注意: 新增"bash 默认值 + 拼 cmd"的参数时, 必须同步到此列表。
 # ----------------------------------------------------------------------
+VISION_ARGS=()
+if [[ "$VISION_GRADIENT_CHECKPOINTING" = false ]]; then
+    VISION_NO_CHECKPOINT_LAYERS=0
+    VISION_ARGS+=(--no_vision_gradient_checkpointing)
+fi
+VISION_ARGS+=(--vision_no_checkpoint_layers "$VISION_NO_CHECKPOINT_LAYERS")
+if [[ "$VISION_BATCHED_SDPA" = true ]]; then
+    VISION_ARGS+=(--vision_batched_sdpa)
+else
+    VISION_ARGS+=(--no_vision_batched_sdpa)
+fi
+LAUNCH_ARGS+=("${VISION_ARGS[@]}")
 LAUNCH_ARGS+=(
     --resume_gpu_keepalive_batch_size "${RESUME_GPU_KEEPALIVE_BATCH_SIZE}"
     --resume_gpu_keepalive_max_seconds "${RESUME_GPU_KEEPALIVE_MAX_SECONDS}"
@@ -1297,15 +1313,9 @@ fi
 if [ "$GRADIENT_CHECKPOINTING" = false ]; then
     cmd="${cmd} --no_gradient_checkpointing"
 fi
-if [[ "$VISION_GRADIENT_CHECKPOINTING" = false ]]; then
-    cmd="${cmd} --no_vision_gradient_checkpointing"
-fi
-if [[ "$VISION_NO_CHECKPOINT_LAYERS" != 0 ]]; then
-    cmd="${cmd} --vision_no_checkpoint_layers ${VISION_NO_CHECKPOINT_LAYERS}"
-fi
-if [[ "$VISION_BATCHED_SDPA" = true ]]; then
-    cmd="${cmd} --vision_batched_sdpa"
-fi
+for vision_arg in "${VISION_ARGS[@]}"; do
+    cmd="${cmd} ${vision_arg}"
+done
 if [ "$DIT_GRADIENT_CHECKPOINTING" = true ]; then
     cmd="${cmd} --dit_gradient_checkpointing"
 fi

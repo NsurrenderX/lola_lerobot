@@ -36,10 +36,18 @@ def parse_options(arguments=None):
     parser.add_argument("--snapshot-threshold", type=float, default=20.0)
     parser.add_argument("--memory-budget-fraction", type=float, default=None)
     parser.add_argument("--vision-batched-sdpa", action="store_true")
+    parser.add_argument("--validated-optimizations", action="store_true",
+                        help="Use grouped vision SDPA, retain 12 vision blocks, and check a 90%% memory budget")
     parser.add_argument("--dry-run", action="store_true")
     options, trainer_arguments = parser.parse_known_args(arguments)
     if trainer_arguments[:1] == ["--"]:
         trainer_arguments = trainer_arguments[1:]
+    if options.validated_optimizations:
+        trainer_arguments = ["--vision_batched_sdpa", "--vision_no_checkpoint_layers", "12",
+                             "--deepspeed_reduce_bucket_size", "500000000",
+                             "--deepspeed_allgather_bucket_size", "500000000", *trainer_arguments]
+        if options.memory_budget_fraction is None:
+            options.memory_budget_fraction = 0.90
     if options.steps <= 0 or options.warmup < 0 or not 0 <= options.trace_steps <= options.steps:
         parser.error("Require steps > 0, warmup >= 0, and 0 <= trace-steps <= steps")
     if options.memory_budget_fraction is not None and not 0 < options.memory_budget_fraction < 1:

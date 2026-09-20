@@ -3059,6 +3059,8 @@ def build_arg_parser():
                         help="Retain activations for the last N vision blocks instead of recomputing them")
     parser.add_argument("--vision_batched_sdpa", action="store_true",
                         help="Group equal-length images into batched vision SDPA calls")
+    parser.add_argument("--no_vision_batched_sdpa", dest="vision_batched_sdpa", action="store_false",
+                        help="Disable grouped vision SDPA (also overrides saved configuration)")
     parser.add_argument("--dit_gradient_checkpointing", action="store_true",
                         help="对 DiT 也启用梯度检查点 (默认关闭: DiT 激活仅 ~1GB, GC 重算不划算; "
                              "VLM 的 GC 不受此开关影响, 显存 OOM 时再打开)")

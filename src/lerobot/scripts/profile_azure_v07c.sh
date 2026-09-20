@@ -64,6 +64,7 @@ while (( $# )); do
                 '  [--localize_io --storage_account NAME --storage_container NAME]' \
                 '  [--mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror]' \
                 '  [--azcopy_path EXECUTABLE] (--output is the blob destination in localized mode)' \
+                '  [--validated-optimizations] (grouped SDPA, retain 12 vision blocks, 90% budget)' \
                 '  [profile options] [-- trainer options]' \
                 'CLI values override environment defaults. Options accept VALUE or =VALUE.'
             exit 0

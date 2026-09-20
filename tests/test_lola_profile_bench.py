@@ -1,4 +1,5 @@
 import argparse
+import ast
 import fnmatch
 import json
 import os
@@ -66,22 +67,73 @@ class ProfileBenchTests(unittest.TestCase):
         for key in changed:
             self.assertEqual((previous[key], candidate[key]), (2000000000, 3000000000))
 
+    def test_validated_profile_options(self):
+        snapshot = {"training_args": {"vision_batched_sdpa": False, "vision_no_checkpoint_layers": 0}}
+        common = ["--training-config", "config.json", "--output", "/tmp/new-profile", "--validated-optimizations"]
+        options, arguments = parse_options(common)
+        _, _, effective = resolve_training_arguments(snapshot, arguments)
+        self.assertTrue(effective.vision_batched_sdpa)
+        self.assertEqual(effective.vision_no_checkpoint_layers, 12)
+        self.assertEqual(effective.deepspeed_reduce_bucket_size, 5e8)
+        self.assertEqual(effective.deepspeed_allgather_bucket_size, 5e8)
+        self.assertEqual(options.memory_budget_fraction, 0.9)
+        options, arguments = parse_options([
+            *common, "--memory-budget-fraction", "0.85", "--", "--no_vision_batched_sdpa",
+            "--vision_no_checkpoint_layers", "0", "--no_vision_gradient_checkpointing",
+        ])
+        _, _, effective = resolve_training_arguments(snapshot, arguments)
+        self.assertFalse(effective.vision_batched_sdpa)
+        self.assertEqual(effective.vision_no_checkpoint_layers, 0)
+        self.assertTrue(effective.no_vision_gradient_checkpointing)
+        self.assertEqual(options.memory_budget_fraction, 0.85)
+
     def test_production_launcher_vision_options(self):
         launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/test_azure_v07c.sh"
         source = launcher.read_text()
         parser_source = source.split('\nif [[ ! "$RESUME_GPU_KEEPALIVE_BATCH_SIZE"', 1)[0]
+        options_source = source[source.index('VISION_ARGS=()'):source.index('\nLAUNCH_ARGS+=(\n')]
         beginning = source.index('if [ "$GRADIENT_CHECKPOINTING" = false ]; then')
         ending = source.index('\n# V2:', beginning)
-        script = parser_source + '\ncmd=""\n' + source[beginning:ending] + '\nprintf "%s\\n" "$cmd"\n'
-        for arguments in ([], ["--vision_batched_sdpa"],
-                          ["--vision_batched_sdpa", "--no_vision_gradient_checkpointing"]):
+        script = parser_source + '\n' + options_source + '\ncmd=""\n' + source[beginning:ending]
+        script += '\nprintf "%s\\n" "$cmd"\nprintf "%s\\n" "${LAUNCH_ARGS[*]}"\n'
+        cases = [
+            ([], ["--vision_no_checkpoint_layers", "12", "--vision_batched_sdpa"]),
+            (["--no_vision_batched_sdpa", "--vision_no_checkpoint_layers", "0"],
+             ["--vision_no_checkpoint_layers", "0", "--no_vision_batched_sdpa"]),
+            (["--no_vision_gradient_checkpointing"],
+             ["--no_vision_gradient_checkpointing", "--vision_no_checkpoint_layers", "0", "--vision_batched_sdpa"]),
+            (["--no_vision_batched_sdpa", "--vision_batched_sdpa", "--vision_no_checkpoint_layers", "18"],
+             ["--vision_no_checkpoint_layers", "18", "--vision_batched_sdpa"]),
+        ]
+        for arguments, expected in cases:
             result = subprocess.run(["bash", "-s", "--", *arguments], input=script,
                                     capture_output=True, text=True, check=True)
-            self.assertEqual(result.stdout.split(), list(reversed(arguments)))
-        result = subprocess.run(["bash", "-s", "--", "--vision_batched_sdpa",
-                                 "--vision_no_checkpoint_layers", "12"], input=script,
+            command, snapshot = [line.split() for line in result.stdout.splitlines()]
+            self.assertEqual(command, expected)
+            self.assertEqual(snapshot[-len(expected):], expected)
+            _, _, command_args = resolve_training_arguments({"training_args": {}}, command)
+            _, _, snapshot_args = resolve_training_arguments({"training_args": {}}, snapshot)
+            self.assertEqual(command_args.vision_batched_sdpa, snapshot_args.vision_batched_sdpa)
+            self.assertEqual(command_args.vision_no_checkpoint_layers, snapshot_args.vision_no_checkpoint_layers)
+            self.assertEqual(command_args.vision_batched_sdpa, expected[-1] == "--vision_batched_sdpa")
+            from lerobot.scripts import train_lola_v07_azure as training
+            from lerobot.configs.types import FeatureType, PolicyFeature
+
+            features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+            metadata = SimpleNamespace(features={}, total_episodes=1, total_frames=1)
+            with patch.object(training, "dataset_to_policy_features", return_value=features):
+                config = training.build_lola_config(command_args, metadata)[0]
+            self.assertEqual(config.vision_batched_sdpa, command_args.vision_batched_sdpa)
+            self.assertEqual(config.vision_no_checkpoint_layers, command_args.vision_no_checkpoint_layers)
+            self.assertEqual(config.vision_gradient_checkpointing, not command_args.no_vision_gradient_checkpointing)
+        _, _, disabled = resolve_training_arguments(
+            {"training_args": {"vision_batched_sdpa": True}}, ["--no_vision_batched_sdpa"])
+        self.assertFalse(disabled.vision_batched_sdpa)
+        result = subprocess.run(["bash", "-s"], input=parser_source +
+                                '\nprintf "%s %s %s\\n" "$DEEPSPEED_REDUCE_BUCKET_SIZE" '
+                                '"$DEEPSPEED_ALLGATHER_BUCKET_SIZE" "$DEEPSPEED_ZERO_STAGE"\n',
                                 capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout.split(), ["--vision_no_checkpoint_layers", "12", "--vision_batched_sdpa"])
+        self.assertEqual([float(value) for value in result.stdout.split()], [5e8, 5e8, 3])
 
     def test_launcher_cli_and_environment(self):
         launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/profile_azure_v07c.sh"
@@ -98,7 +150,7 @@ class ProfileBenchTests(unittest.TestCase):
                 command = ["bash", str(launcher), "--nnodes", "2", "--nproc_per_node=8",
                            "--node_rank", str(rank), "--master_addr=10.0.0.1", "--master_port", "9901",
                            "--training-config", "/tmp/training config.json", "--output=/tmp/profile output",
-                           "--python", str(executable), "--warmup", "10", "--steps", "50",
+                           "--python", str(executable), "--warmup", "10", "--steps", "50", "--validated-optimizations",
                            "--", "--resume", "/tmp/checkpoint tag", "--batch_size", "32"]
                 for defaults in ({}, {"NODE_RANK": "99", "NNODES": "99", "MASTER_PORT": "1",
                                       "TRAINING_CONFIG": "/wrong", "PROFILE_OUTPUT": "/wrong"}):
@@ -109,7 +161,7 @@ class ProfileBenchTests(unittest.TestCase):
                                      "--nproc_per_node=8", f"--node_rank={rank}",
                                      "--master_addr=10.0.0.1", "--master_port=9901", "--max_restarts=0"])
                     self.assertEqual(actual[9:], ["--training-config", "/tmp/training config.json",
-                                     "--output", "/tmp/profile output", "--warmup", "10", "--steps", "50",
+                                     "--output", "/tmp/profile output", "--warmup", "10", "--steps", "50", "--validated-optimizations",
                                      "--", "--resume", "/tmp/checkpoint tag", "--batch_size", "32"])
             result = subprocess.run(["bash", str(launcher), "--batch_size", "32"],
                                     env=dict(environment, PYTHON_BIN=str(executable), NNODES="2", NPROC_PER_NODE="8",
@@ -131,6 +183,50 @@ class ProfileBenchTests(unittest.TestCase):
             self.assertEqual(actual[1], "localize")
             self.assertEqual(actual[actual.index("--azcopy_path") + 1], "/tmp/azcopy binary")
             self.assertEqual(actual[-3:], ["--", "--dataset_root", "/mnt/dataset"])
+
+    def test_summary_eval_launcher_options(self):
+        root = Path(__file__).resolve().parents[1]
+        evaluator = root.parent / "eval_on_lola_07_summary_torchrun.py"
+        if not evaluator.is_file():
+            self.skipTest("Adjacent CALVIN summary evaluator is not installed")
+        tree = ast.parse(evaluator.read_text())
+        parser_node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_build_parser")
+        namespace = {"argparse": argparse}
+        exec(compile(ast.Module(body=[parser_node], type_ignores=[]), str(evaluator), "exec"), namespace)
+        parser = namespace["_build_parser"]()
+        required = ["--training_config", "/tmp/training config.json", "--checkpoint_path", "/tmp/checkpoint"]
+        original = parser.parse_args(required)
+        self.assertIsNone(original.vision_batched_sdpa)
+        self.assertFalse(original.dit_cuda_graph)
+        launcher = root / "src/lerobot/scripts/eval_lola_v07_summary.sh"
+        with tempfile.TemporaryDirectory() as folder:
+            executable = Path(folder) / "fake python"
+            executable.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@"\n')
+            executable.chmod(0o700)
+            for switches, enabled in (([], True), (["--no_vision_batched_sdpa", "--no_dit_cuda_graph"], False)):
+                result = subprocess.run([
+                    "bash", str(launcher), "--python", str(executable), "--nproc_per_node", "2",
+                    "--eval-script", str(evaluator), "--", *required, *switches,
+                ], capture_output=True, text=True, check=True)
+                command = result.stdout.split("\0")[:-1]
+                self.assertIn("--nproc_per_node=2", command)
+                actual = parser.parse_args(command[command.index(str(evaluator)) + 1:])
+                self.assertEqual(actual.vision_batched_sdpa, enabled)
+                self.assertEqual(actual.dit_cuda_graph, enabled)
+                self.assertEqual(actual.num_inference_steps, original.num_inference_steps)
+                self.assertEqual(actual.action_step, original.action_step)
+                self.assertEqual(actual.training_config, original.training_config)
+        contract_node = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                             and node.name == "_build_evaluation_contract")
+        contract_return = next(node for node in contract_node.body if isinstance(node, ast.Return))
+        optimization_node = next(value for key, value in zip(contract_return.value.keys, contract_return.value.values)
+                                 if isinstance(key, ast.Constant) and key.value == "forward_optimizations")
+        for enabled in (False, True):
+            options = SimpleNamespace(dit_cuda_graph=enabled)
+            config = SimpleNamespace(vision_batched_sdpa=enabled)
+            actual = eval(compile(ast.Expression(optimization_node), str(evaluator), "eval"),
+                          {"args": options, "config": config})
+            self.assertEqual(actual, dict(vision_batched_sdpa=enabled, dit_cuda_graph=enabled))
 
     def test_launcher_rejects_missing_values(self):
         launcher = Path(__file__).resolve().parents[1] / "src/lerobot/scripts/profile_azure_v07c.sh"

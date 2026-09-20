@@ -15,6 +15,160 @@ bench steps after `--warmup`; it does not replace the trainer's `max_steps`.
 A checkpoint near the end of its training horizon can end the bench early;
 that is reported as a failure, not a complete measurement.
 
+## Integration Decision, 2026-09-20
+
+The selected training recipe is corrected grouped vision SDPA plus retention
+of the last 12 vision blocks. Keep global/language checkpointing enabled,
+DiT checkpointing disabled, ZeRO3 live/reuse at 2e9/2e9, parameter persistence
+at zero, and allgather/reduce/prefetch buckets at 5e8. Retention stores
+activations; it does not release trainable vision weights.
+
+The target workload is two nodes, sixteen A100 40 GB GPUs, BF16, batch 32 per
+rank (global 512), the recorded Cosmos3-Nano/CALVIN shapes and checkpoint.
+Other batch sizes, resolutions or hardware must be rechecked against the
+90% target. The measured 74.12% estimate is not a hard memory cap or a bound
+on initialization/checkpoint-saving peaks.
+
+### Results and Disposition
+
+Cluster results use all 200 measured steps after 40 warmup steps, without
+traces. The time metric is the mean per-step maximum across ranks of
+step plus data wait. Slow samples and periodic cleanup remain included.
+
+| Comparison | Mean step time | Recorded peak estimate | Decision |
+| --- | ---: | ---: | --- |
+| A07: grouping off, retain 12 | 5.657391 s | 75.30% | Reference |
+| B08: corrected grouping on, retain 12 | 4.979472 s | 74.12% | Adopt B recipe |
+| C09: grouping on, intended live/reuse 3e9 | 4.989423 s | 79.76% | Do not adopt |
+| Grouping on, retain 18 | 5.188514 s | 77.69% | Do not adopt |
+| Grouping on, retain 24 | 6.849667 s | 80.96% | Do not adopt |
+
+B versus A reduced mean time by 11.98% and increased estimated throughput by
+13.61%; all four 50-step windows favored B. This is one job per setting, not
+independent repeated-job proof. C had no overall gain and used more memory;
+its external JSON bytes were not archived by the cluster runner. V24's
+post-hoc favorable windows showed only 0.83-1.55% and do not replace its poor
+full-run result. The newly stalled V12 job is excluded; B08 is the V12 reference.
+
+Local cache repeats used the same physical A6000 GPU0, restored module weights,
+synthetic inputs and seeds, four warmup pairs and 18 measured AB/BA pairs per
+mode. Both GPUs were empty before and after repeat 02, not continuously monitored.
+Positive percentages below mean lower mean elapsed time.
+
+| Cache candidate | Mode | Run 01 reduction | Run 02 reduction | Decision |
+| --- | --- | ---: | ---: | --- |
+| Vision metadata | B32 forward | 3.44% | -0.41% | Hold |
+| Vision metadata | B32 forward/backward | -4.42% | -3.85% | Hold |
+| Vision metadata | B1 no-grad forward | 5.19% | 6.91% | Keep experimental, no shared-path integration |
+| DiT RoPE | B32 forward | 3.86% | 1.63% | Defer small gain |
+| DiT RoPE | B32 forward/backward | 4.89% | 1.22% | Defer small gain |
+| DiT RoPE | B1 no-grad forward | 0.31% | 2.14% | No consistently greater-than-2% gain |
+
+Full-size BF16 outputs and active gradients matched exactly in both local runs.
+Vision candidate forward/backward spikes repeated at iteration 5, case 2:
+832.599 ms and 866.640 ms. They cannot be dismissed as the other GPU's load.
+The useful B1 metadata result does not qualify the shared training path or
+prove full-policy latency gains. Neither new cache was copied into production.
+
+The existing fixed-step Euler loop and precomputed mask remain unchanged.
+The existing DiT CUDA Graph helper is now reachable from the CALVIN evaluator.
+Its historical local full-policy bundle measured 645.7 -> 183.7 ms with exact
+actions; the old grouped-SDPA flag silently fell back in that experiment.
+This supports the graph path, not an isolated vision-grouping inference claim
+or a CALVIN success-rate improvement. No graph is installed in training.
+
+Detailed immutable reports remain under `/data_16T/lola_util/profile_amlt/`
+for corrected ABC07/08/09 and V12/V18/V24, and under
+`/data_16T/lola_util/profile_local_20260918/cache_ab_gpu0_01/` and
+`/data_16T/lola_util/profile_local_20260918/cache_ab_gpu0_02/` for the local repeats.
+The older source hashes describe their original executions, not this integration.
+
+### Training and Profile Launchers
+
+[test_azure_v07c.sh](../../src/lerobot/scripts/test_azure_v07c.sh) is the production
+TRAINING launcher despite its name. It now defaults to grouped SDPA, retain 12,
+and reduce/allgather buckets 5e8. The same effective vision arguments are passed
+to both the training process and resume-search configuration reconstruction.
+No optimizer settings, batch size, data, weights or sampling parameters change.
+Existing explicitly supplied options still override launcher defaults.
+
+For a baseline, append `--no_vision_batched_sdpa --vision_no_checkpoint_layers 0`.
+To disable vision checkpointing entirely, `--no_vision_gradient_checkpointing`
+sets retained layers to zero in this launcher, avoiding contradictory settings.
+Direct Python trainer and model defaults remain unchanged for compatibility.
+Do not pass the experimental C JSON when reproducing B; a custom DeepSpeed
+configuration still overrides the generated configuration.
+
+[profile_azure_v07c.sh](../../src/lerobot/scripts/profile_azure_v07c.sh) accepts
+`--validated-optimizations` before `--`. This selects grouping, retain 12,
+reduce/allgather buckets 5e8 and a default 0.90 budget. Explicit trainer options
+after `--` override the preset. Without the flag, historical profile behavior
+is unchanged. The preset does not remove a saved custom DeepSpeed JSON.
+
+```bash
+bash src/lerobot/scripts/profile_azure_v07c.sh \
+  --nnodes 2 --nproc_per_node 8 --node_rank "$NODE_RANK" \
+  --master_addr "$MASTER_ADDR" --master_port 9901 \
+  --python "$PYTHON_BIN" \
+  --training-config "$TRAINING_CONFIG" --output "$NEW_PROFILE_OUTPUT" \
+  --validated-optimizations --warmup 40 --steps 200 --trace-steps 0 \
+  -- --strategy deepspeed --deepspeed_zero_stage 3 --batch_size 32 \
+  --resume "$CHECKPOINT_TAG"
+```
+
+Use staged local paths in that example; add the existing localized IO options
+for blob storage. The budget is checked at step boundaries and stops the profile
+on any-rank excess, not a hard allocator cap. Production training does not gain
+an automatic 90% stop from this preset. No new cloud run was launched.
+
+### CALVIN Evaluation Launcher
+
+[eval_lola_v07_summary.sh](../../src/lerobot/scripts/eval_lola_v07_summary.sh)
+launches the adjacent CALVIN summary evaluator with grouped SDPA and DiT CUDA
+Graph enabled. The evaluator file is OUTSIDE this Git repository at its parent;
+deploy the updated evaluator too, or select it using `--eval-script PATH` or
+`LOLA_EVAL_SCRIPT`. The launcher defaults `LOLA_LEROBOT_SRC` to this repository's
+source directory rather than the evaluator's old machine-specific fallback.
+The independent `lola-alpha` copy and legacy validation scripts are unchanged.
+Use a CALVIN-capable interpreter with the existing simulator, Hydra and OmegaConf
+dependencies plus this LoLA source. The local `lerobot-gcr3` training environment
+used for the focused tests is missing Hydra; it is not a verified full CALVIN
+runtime. No packages or interpreter settings were changed by this integration.
+
+```bash
+bash src/lerobot/scripts/eval_lola_v07_summary.sh \
+  --python "$PYTHON_BIN" --nproc_per_node 1 \
+  --eval-script "$SUMMARY_EVALUATOR" -- \
+  --training_config "$TRAINING_CONFIG" --checkpoint_path "$CHECKPOINT_TAG" \
+  --vlm_path "$VLM_PATH" --dataset_root "$DATASET_ROOT" \
+  --dataset_dir "$CALVIN_DATASET_DIR" --eval_sequences_path "$EVAL_SEQUENCES" \
+  --eval_dir "$NEW_EVAL_DIR"
+```
+
+All existing official-input, checkpoint/config, EMA, null-state and protocol
+checks remain enabled. Supply the same approved evaluation recipe as before:
+the bash does NOT set action execution length, integration steps, thresholds,
+seed, sequence count or summary-variant permission. In particular the existing
+summary evaluator's integration-step default is 3; the historical timing used
+10 steps and must not be claimed for this different setting.
+
+Use `--no_dit_cuda_graph` and/or `--no_vision_batched_sdpa` after `--` to opt out.
+Direct evaluator invocation defaults to no graph and checkpoint-config grouping.
+The graph wrapper is attached only after weight/EMA loading, device placement
+and eval mode. Capture is lazy; first capture is not steady-state latency.
+Optimization choices are printed and bound into the evaluation contract, so use
+a fresh evaluation directory rather than merging into an older contract.
+
+### Integration Verification
+
+Focused regression covers production bash -> resume arguments -> actual model
+configuration, opt-out precedence, profile/localized IO, CALVIN launch arguments
+and contract fields, grouped attention outputs/gradients, selective recomputation,
+real BF16 DiT graph replay, shape changes and training fallback. Shell syntax
+is checked for all three launchers. The CALVIN CLI/contract tests isolate those
+functions without loading the simulator. Full CALVIN rollouts and a new full
+sixteen-GPU training run were not executed for this integration.
+
 ## Local Results, 2026-09-19
 
 Historical caveat added 2026-09-20: the old attention patch fell back whenever
