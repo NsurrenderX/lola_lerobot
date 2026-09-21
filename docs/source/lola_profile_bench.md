@@ -4,8 +4,11 @@
 
 The bench imports the production trainer and calls its existing setup, data,
 forward, backward, clipping, optimizer, EMA and resume paths. It performs real
-training updates in memory, but disables all checkpoint saves, including the
-final save. It never writes resume history into the source checkpoint run.
+training updates in memory, but disables normal training checkpoint saves,
+including the final save. By default it writes no model checkpoints. The opt-in
+unfreeze diagnostic permits the production method's temporary ZeRO3 roundtrip
+inside the new profile output, never in a source training run.
+It never writes resume history into the source checkpoint run.
 Use a separate diagnostic job, not a live training process.
 
 The saved training configuration supplies defaults; arguments after `--`
@@ -232,6 +235,90 @@ Keep slow steps; do not relax the 90% budget or change batch size after a
 failure. The budget check is at step boundaries, not a hard allocator cap.
 A single A-then-B pair is diagnostic, not repeated-job proof. Local tests
 check configuration and wiring; two local GPUs cannot measure this 2x8 topology.
+
+## Independent Unfreeze Profile, 2026-09-21
+
+Use `--unfreeze-after N` to diagnose the fresh frozen-to-trainable lifecycle.
+It runs the existing production trainer, including actual frozen updates and
+the original loss-threshold calculation/collective. Only the deferred trigger
+flag is overridden after `training_step`: unfreeze happens exactly after update
+N, irrespective of loss. Native threshold messages before N are not an actual
+engine rebuild. No loss, gradient, optimizer or model implementation is replaced.
+
+The existing `_unfreeze_vlm_deepspeed` method performs temporary checkpoint
+save, cross-node shard exchange, old-engine destruction, optimizer memory
+release, GC reconfiguration, engine rebuild, weight reload and EMA rebind.
+The recorder releases its old-engine references before this call and attaches
+timers to the new engine afterward. An unexpected second replacement fails.
+The stable profile mode is unchanged and still rejects an engine replacement.
+
+Requirements: fresh step zero, DeepSpeed ZeRO3, `train_vlm=True`, and a positive
+delayed-unfreeze threshold. A saved resume path is rejected, not silently cleared;
+pass `--resume ''` explicitly. This diagnostic does not fix auto-resume matching.
+Use `--localize_io` for multi-node jobs: temporary shards are scoped to
+`NEW_DIR/unfreeze_checkpoint`, and their blob exchange prefix is
+`NEW_DIR/unfreeze_exchange`. An inherited production `LOLA_CKPT_BLOB_BASE` is
+not used. Normal checkpoint/final saves remain disabled. Temporary leftovers
+on a node or after failure stay inside this experiment, not the source run;
+allow sufficient local disk and blob space for full model/optimizer shards.
+
+Run the same command on both A100 nodes, with `NODE_RANK=0/1` and a common
+`MASTER_ADDR`. This reproduces the real log's switch at update 590 and retains
+the original training horizon. Use a fresh output root for every attempt.
+
+```bash
+bash src/lerobot/scripts/profile_azure_v07c.sh \
+  --nnodes 2 --nproc_per_node 8 --node_rank "$NODE_RANK" \
+  --master_addr "$MASTER_ADDR" --master_port 9911 \
+  --python /home/aiscuser/.conda/envs/lerobot/bin/python \
+  --localize_io --storage_account azsussc --storage_container v-wangxiaofa \
+  --mount_prefix /mnt/wangxiaofa --local_mirror /scratch/lola_profile_mirror \
+  --training-config /mnt/wangxiaofa/checkpoints/lola07/lola-v07-azure-20260920_224336/training_config.json \
+  --output /mnt/wangxiaofa/profiles/lola_unfreeze_01 \
+  --unfreeze-after 590 --validated-optimizations --zero-hpz-partition-size 1 \
+  --warmup 40 --steps 200 --trace-steps 0 --memory-budget-fraction 0.90 \
+  -- --resume '' --strategy deepspeed --deepspeed_zero_stage 3 \
+  --train_vlm --vlm_unfreeze_v_loss_threshold 0.6 --batch_size 32 --seed 0 \
+  --ema_decay 0 \
+  --dataset_root /mnt/wangxiaofa/robot_dataset/lerobot-format-v30/calvin_task_ABC_D_training_v5_1 \
+  --vlm_path /mnt/wangxiaofa/utils/Cosmos3-Nano
+```
+
+Before launch, confirm the saved config has no custom DeepSpeed override,
+global/vision GC on and DiT GC off. No historical checkpoint is loaded: the
+VLM loads its pretrained backbone and the rest follows fresh production setup.
+This requires 830 updates, not 240: frozen 1-589, transition 590, post-unfreeze
+warmup 591-630, measurement 631-830. `--unfreeze-after 40` is a shorter lifecycle
+diagnostic, not a reproduction of the 590-update optimizer/allocator history.
+To inspect the periodic cleanup at update 1000 as well, use a separately named
+run with `--steps 500`; do not silently change an active protocol.
+
+Each rank adds `unfreeze.json` with before/after policy state, effective
+DeepSpeed configs, transition duration and completion status. `steps.jsonl`
+adds phase labels, attention-call/fallback counts and fallback metadata. State
+receipts include actual GC flags, patched attention count, selected backend
+and trainable VLM tensor/parameter counts (using `ds_numel`, not empty ZeRO3
+parameter views). The hooks add small CPU overhead; they are diagnostic only.
+
+Collect all 16 ranks and summarize normally. The summary validates the single
+transition, matching rank receipts and the full phase/step sequence, then
+computes throughput only from untraced post-unfreeze measurement steps. It
+reports transition duration separately and checks the memory budget over all
+phases, including the transition. The 90% check is an estimate at boundaries,
+not a hard cap on transient non-PyTorch or initial model-loading allocations.
+
+For a separate CUDA/NCCL trace run, use `--trace-steps 3 --steps 203` with a new
+output root; this leaves 200 untraced measurement steps. Tracing begins only
+after the post-unfreeze warmup. Do not compare this fresh v5_1 lifecycle to the
+historical v4 checkpoint profile as though only the unfreeze flag differed.
+
+Local verification: 26 CPU profile tests passed; a real two-A6000 tiny BF16
+Qwen3-VL run completed 2 frozen + 1 warmup + 4 measured updates, including the
+production ZeRO3 save/rebuild/reload. All 35 VLM tensors became trainable;
+grouped attention had zero fallback, selective GC remained `[true, false]`,
+and no model checkpoint files remained in that shared local test output.
+This uses local DeepSpeed 0.18.8/PyTorch 2.11.0 and does not validate A100
+throughput, cluster DeepSpeed 0.19.7, full-model memory or actual blob exchange.
 
 ## Local Results, 2026-09-19
 
@@ -782,6 +869,12 @@ an actual small BF16 Qwen3-VL vision tower with four images/two lengths, forward
 hidden-state metadata, grouped SDPA and one of two vision blocks retaining
 activations under ZeRO-3. The smoke asserts exactly six SDPA calls per update
 including checkpoint recomputation, so a silent per-image fallback fails.
+
+Use `--distributed-unfreeze-smoke` for seven updates with that same small vision
+tower: two frozen updates with an actual production ZeRO3 roundtrip at step 2,
+one post-unfreeze warmup and four measured updates (one traced/excluded).
+It verifies newly trainable VLM tensors, grouped-attention/GC retention and
+absence of retained model checkpoint shards. Use a new output directory.
 
 Numeric comparisons are required on the deployed hardware/software. Local
 action agreement is not a robot task-success evaluation. Do not infer an

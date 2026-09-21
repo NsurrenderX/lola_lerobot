@@ -17,11 +17,32 @@ from lerobot.scripts.profile_lola_v07 import (
     BenchComplete, BenchRecorder, ProfileLoader, counter_deltas, parse_options, summarize,
     assess_memory_budget, localize_main, resolve_training_arguments, run_profile_child,
     stage_checkpoint_config, validate_checkpoint_tag, configure_profile_deepspeed,
-    profile_deepspeed_initialization, profile_hpz_topology,
+    profile_deepspeed_initialization, profile_hpz_topology, configure_unfreeze_profile,
+    profile_engine_lifecycle,
 )
 
 
 class ProfileBenchTests(unittest.TestCase):
+    def test_unfreeze_profile_options(self):
+        options, extra = parse_options([
+            "--training-config", "config.json", "--output", "/tmp/unfreeze-profile",
+            "--unfreeze-after", "590", "--", "--resume", "",
+        ])
+        self.assertEqual(options.unfreeze_after, 590)
+        self.assertEqual(options.memory_budget_fraction, 0.9)
+        self.assertEqual(extra, ["--resume", ""])
+        defaults = dict(strategy="deepspeed", deepspeed_zero_stage=3, train_vlm=True,
+                        vlm_unfreeze_v_loss_threshold=0.6, resume="")
+        configure_unfreeze_profile(options, SimpleNamespace(**defaults))
+        for changes in (dict(strategy="ddp"), dict(deepspeed_zero_stage=2),
+                        dict(train_vlm=False), dict(vlm_unfreeze_v_loss_threshold=0),
+                        dict(resume="/checkpoint")):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                configure_unfreeze_profile(options, SimpleNamespace(**(defaults | changes)))
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            parse_options(["--training-config", "config.json", "--output", "/tmp/new",
+                           "--unfreeze-after", "0"])
+
     def test_hpz_profile_config_isolated(self):
         from lerobot.scripts import train_lola_v07_azure as training
 
@@ -310,13 +331,15 @@ class ProfileBenchTests(unittest.TestCase):
                 "--master_addr=host", "--training-config=/mnt/config.json", "--output=/mnt/profiles/new",
                 "--python", str(executable), "--localize_io", "--storage_account=account",
                 "--storage_container", "container", "--mount_prefix=/mnt", "--local_mirror=/scratch/mirror",
-                "--azcopy_path", "/tmp/azcopy binary", "--", "--dataset_root", "/mnt/dataset"],
+                "--azcopy_path", "/tmp/azcopy binary", "--unfreeze-after", "590",
+                "--", "--dataset_root", "/mnt/dataset", "--resume", ""],
                 env=environment, capture_output=True, text=True, check=True)
             actual = result.stdout.split("\0")[:-1]
             self.assertTrue(actual[0].endswith("profile_lola_v07.py"))
             self.assertEqual(actual[1], "localize")
             self.assertEqual(actual[actual.index("--azcopy_path") + 1], "/tmp/azcopy binary")
-            self.assertEqual(actual[-3:], ["--", "--dataset_root", "/mnt/dataset"])
+            self.assertEqual(actual[actual.index("--unfreeze-after") + 1], "590")
+            self.assertEqual(actual[-5:], ["--", "--dataset_root", "/mnt/dataset", "--resume", ""])
 
     def test_summary_eval_launcher_options(self):
         root = Path(__file__).resolve().parents[1]
@@ -434,10 +457,11 @@ class ProfileBenchTests(unittest.TestCase):
             parser.set_defaults(**snapshot["training_args"])
             return None, parser, parser.parse_args(arguments)
 
-        for child_exit, fail_upload, missing_shard, missing_metadata in (
-            (0, None, False, False), (7, None, False, False),
-            (0, "rank008", False, False), (0, "upload_status.json", False, False),
-            (0, None, True, False), (0, None, False, True)):
+        for child_exit, fail_upload, missing_shard, missing_metadata, unfreeze in (
+            (0, None, False, False, False), (7, None, False, False, False),
+            (0, "rank008", False, False, False), (0, "upload_status.json", False, False, False),
+            (0, None, True, False, False), (0, None, False, True, False),
+            (0, None, False, False, True)):
             with self.subTest(child_exit=child_exit, fail_upload=fail_upload, missing_shard=missing_shard,
                       missing_metadata=missing_metadata), \
                     tempfile.TemporaryDirectory() as folder:
@@ -461,7 +485,8 @@ class ProfileBenchTests(unittest.TestCase):
                 config = mount / "training_config.json"
                 config.write_text(json.dumps(dict(training_args=dict(
                     dataset_root="/stale/dataset", vlm_path=str(vlm), resume=str(checkpoint),
-                    strategy="deepspeed", deepspeed_zero_stage=3))))
+                    strategy="deepspeed", deepspeed_zero_stage=3,
+                    train_vlm=True, vlm_unfreeze_v_loss_threshold=0.6))))
                 downloaded = []
                 launched = []
 
@@ -499,7 +524,14 @@ class ProfileBenchTests(unittest.TestCase):
                     _, _, training = resolve(json.loads(options.training_config.read_text()), arguments)
                     self.assertFalse(Path(training.dataset_root).is_relative_to(mount))
                     self.assertTrue((Path(training.dataset_root) / "meta/info.json").is_file())
-                    self.assertEqual((Path(training.resume) / "training_config.json").read_text(), checkpoint_config)
+                    if unfreeze:
+                        self.assertEqual(options.unfreeze_after, 2)
+                        self.assertEqual(training.resume, "")
+                        self.assertEqual(os.environ["LOLA_PROFILE_UNFREEZE_BLOB_BASE"],
+                                         "https://account.blob.core.windows.net/container/profiles/run01/unfreeze_exchange")
+                        self.assertEqual(os.environ["LOLA_AZCOPY_BIN"], "fake-azcopy")
+                    else:
+                        self.assertEqual((Path(training.resume) / "training_config.json").read_text(), checkpoint_config)
                     self.assertNotEqual(options.training_config.read_text(), checkpoint_config)
                     node = int(next(value.split("=", 1)[1] for value in command if value.startswith("--node_rank=")))
                     foreign = options.output / f"rank{8 if node == 0 else 0:03d}"
@@ -529,8 +561,10 @@ class ProfileBenchTests(unittest.TestCase):
                             "--storage_container", "container", "--mount_prefix", str(mount),
                             "--local_mirror", str(root / f"node{node}"), "--training-config", str(config),
                             "--output", str(mount / "profiles/run01"), "--memory-budget-fraction", "0.9",
-                            "--vision-batched-sdpa", "--zero-hpz-partition-size", "8", "--", "--no_vision_gradient_checkpointing",
-                            "--dataset_root", str(dataset)])
+                            "--vision-batched-sdpa", "--zero-hpz-partition-size", "8",
+                            *(["--unfreeze-after", "2"] if unfreeze else []),
+                            "--", "--no_vision_gradient_checkpointing", "--dataset_root", str(dataset),
+                            *(["--resume", ""] if unfreeze else [])])
                     expected = child_exit or (1 if missing_metadata or node == 1 and (fail_upload or missing_shard) else 0)
                     self.assertEqual(result, expected)
                     receipt_path = blob / f"profiles/run01/io_node{node:03d}/upload_status.json"
@@ -540,12 +574,12 @@ class ProfileBenchTests(unittest.TestCase):
                     receipt = json.loads(receipt_path.read_text())
                     self.assertEqual(receipt["child_exit_code"], 1 if missing_metadata or missing_shard and node == 1 else child_exit)
                     self.assertEqual(receipt["upload_complete"], not (fail_upload == "rank008" and node == 1))
-                    self.assertEqual(len(list(local_tag.glob("*model_states.pt"))), 0 if missing_metadata else 8)
+                    self.assertEqual(len(list(local_tag.glob("*model_states.pt"))), 0 if missing_metadata or unfreeze else 8)
                     if missing_metadata:
                         error_path = blob / f"profiles/run01/io_node{node:03d}/error.log"
                         self.assertIn("Missing checkpoint training_config.json", error_path.read_text())
                 self.assertEqual(len(launched), 0 if missing_metadata else (1 if missing_shard else 2))
-                self.assertEqual(len(downloaded), 0 if missing_metadata else 6)
+                self.assertEqual(len(downloaded), 0 if missing_metadata else 4 if unfreeze else 6)
                 self.assertTrue((blob / "profiles/run01/source_training_config.json").is_file())
                 self.assertFalse(list(blob.rglob("foreign.txt")))
                 self.assertTrue((checkpoint / "zero_pp_rank_0_mp_rank_00_model_states.pt").is_file())
@@ -670,6 +704,118 @@ class ProfileBenchTests(unittest.TestCase):
             self.assertEqual([row["warmup"] for row in rows], [True, False, False])
             self.assertEqual(recorder.count, 3)
 
+    def test_unfreeze_lifecycle_and_phases(self):
+        import weakref
+
+        class Engine:
+            def __init__(self, trainable):
+                self._lola_profile_deepspeed_config = dict(trainable=trainable)
+
+            def backward(self, loss):
+                pass
+
+            def step(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            options, _ = parse_options(["--training-config", "config.json", "--output", folder,
+                                        "--unfreeze-after", "2", "--warmup", "1", "--steps", "2", "--trace-steps", "0"])
+            options.memory_budget_fraction = None
+            visual = torch.nn.Module()
+            block = torch.nn.Module()
+            block.attn = torch.nn.Linear(1, 1)
+            block.attn.config = SimpleNamespace(_attn_implementation="sdpa")
+            block.attn.attention_dropout = 0
+            block.attn._lola_original_forward = block.attn.forward
+            block.gradient_checkpointing = False
+            visual.blocks = torch.nn.ModuleList([block])
+            visual.requires_grad_(False)
+            trainer = SimpleNamespace(world_rank=0, device="cpu", global_step=0, model=Engine(False),
+                                      policy=SimpleNamespace(vlm=SimpleNamespace(visual=visual, parameters=visual.parameters)),
+                                      config=SimpleNamespace(vlm_unfreeze_v_loss_threshold=0.6),
+                                      _vlm_delayed_unfreeze=True, _vlm_unfrozen=False,
+                                      ckpt_dir="/must-not-write")
+            old_engine = weakref.ref(trainer.model)
+
+            def training_step(batch):
+                self.assertEqual(trainer.config.vlm_unfreeze_v_loss_threshold, 0.6)
+                trainer._pending_deepspeed_unfreeze = True
+                return block.attn(torch.ones(1))
+
+            def unfreeze():
+                self.assertEqual(trainer.global_step, 2)
+                self.assertEqual(trainer.ckpt_dir, str(Path(folder) / "unfreeze_checkpoint"))
+                trainer.model = None
+                self.assertIsNone(old_engine(), "Profile must not retain the destroyed engine")
+                trainer.model = Engine(True)
+                visual.requires_grad_(True)
+                trainer._vlm_unfrozen = True
+                trainer._vlm_delayed_unfreeze = False
+
+            trainer.training_step = training_step
+            trainer._unfreeze_vlm_deepspeed = unfreeze
+            recorder = BenchRecorder(trainer, options)
+            stats = {"num_alloc_retries": 0}
+            with patch("torch.cuda.synchronize"), patch("torch.cuda.reset_peak_memory_stats"), \
+                    patch("lerobot.scripts.profile_lola_v07.memory_stats", return_value=stats), \
+                    profile_engine_lifecycle(trainer, recorder), self.assertRaises(BenchComplete):
+                for batch in ProfileLoader(range(10), recorder):
+                    trainer.training_step(batch)
+                    trainer.model.backward(None)
+                    trainer.model.step()
+                    trainer.global_step += 1
+                    if trainer._pending_deepspeed_unfreeze and not trainer._vlm_unfrozen:
+                        trainer._pending_deepspeed_unfreeze = False
+                        trainer._unfreeze_vlm_deepspeed()
+            recorder.journal.close()
+            rows = [json.loads(line) for line in (recorder.output / "steps.jsonl").read_text().splitlines()]
+            self.assertEqual([row["phase"] for row in rows],
+                             ["frozen", "unfreeze", "post_unfreeze_warmup", "measure", "measure"])
+            self.assertEqual([row["warmup"] for row in rows], [True, True, True, False, False])
+            self.assertTrue(all("backward" in row["host_stage_s"] for row in rows))
+            self.assertTrue(all(row["vision_attention"]["calls"] == 1 for row in rows))
+            receipt = json.loads((recorder.output / "unfreeze.json").read_text())
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["before"]["vlm_trainable_tensors"], 0)
+            self.assertEqual(receipt["after"]["vlm_trainable_tensors"], 2)
+            self.assertEqual(trainer.ckpt_dir, "/must-not-write")
+            self.assertIs(trainer.training_step, training_step)
+            (recorder.output / "status.json").write_text(json.dumps(dict(status="complete")))
+            (recorder.output / "manifest.json").write_text(json.dumps(dict(
+                rank=0, world_size=1, training_args=dict(batch_size=1),
+                bench=dict(unfreeze_after=2, warmup=1, steps=2))))
+            with patch("builtins.print"):
+                summary = summarize(Path(folder))
+            self.assertEqual(summary["per_rank"][0]["count"], 2)
+            self.assertEqual(summary["unfreeze"]["global_step"], 2)
+            receipt["status"] = "failed"
+            (recorder.output / "unfreeze.json").write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, "incomplete production unfreeze"):
+                summarize(Path(folder))
+
+    def test_unfreeze_trace_boundaries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            options, _ = parse_options(["--training-config", "config.json", "--output", folder,
+                                        "--unfreeze-after", "2", "--warmup", "1", "--steps", "3", "--trace-steps", "1"])
+            options.memory_budget_fraction = None
+            trainer = SimpleNamespace(world_rank=0, device="cpu", global_step=0)
+            recorder = BenchRecorder(trainer, options)
+            trace_events = []
+            with patch("torch.cuda.synchronize"), patch("torch.cuda.reset_peak_memory_stats"), \
+                    patch("lerobot.scripts.profile_lola_v07.memory_stats", return_value={}), \
+                    patch("torch.distributed.is_initialized", return_value=False), \
+                    patch.object(recorder, "start_trace", side_effect=lambda: trace_events.append(("start", recorder.count))), \
+                    patch.object(recorder, "stop_trace", side_effect=lambda: trace_events.append(("stop", recorder.count))), \
+                    self.assertRaises(BenchComplete):
+                for batch in ProfileLoader(range(10), recorder):
+                    trainer.global_step += 1
+                    if trainer.global_step == 2:
+                        recorder.unfreeze_complete = True
+            recorder.journal.close()
+            self.assertEqual(trace_events, [("start", 3), ("stop", 4)])
+            rows = [json.loads(line) for line in (recorder.output / "steps.jsonl").read_text().splitlines()]
+            self.assertEqual([row["global_step"] for row in rows if row["traced"]], [4])
+
     def test_summary_excludes_trace_and_snapshot_following_step(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
@@ -739,7 +885,7 @@ class ProfileBenchTests(unittest.TestCase):
                 summarize(directory)
 
 
-def distributed_smoke(output, real_vision=False):
+def distributed_smoke(output, real_vision=False, unfreeze=False):
     import os
     from types import MethodType
     import deepspeed
@@ -781,6 +927,13 @@ def distributed_smoke(output, real_vision=False):
             self.model = torch.nn.Module()
             self.model.vlm_bridge = torch.nn.Linear(width, width)
             self.model.dit = torch.nn.Linear(width, width)
+            self.model.action_encoder = torch.nn.Identity()
+            self.model.arm_dit_to_latent = torch.nn.Identity()
+            self.model.grip_dit_to_latent = torch.nn.Identity()
+            self.model.state_encoder = None
+
+        def enable_vlm_gradient_checkpointing(self):
+            LoLAV07Policy.enable_vlm_gradient_checkpointing(self)
 
         def forward(self, batch):
             if real_vision:
@@ -793,45 +946,53 @@ def distributed_smoke(output, real_vision=False):
 
     torch.manual_seed(42)
     policy = TinyPolicy().to(device)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
     options = SimpleNamespace(output=output, training_config=Path(__file__),
                               warmup=1, steps=4, trace_steps=1, trace_ranks=(0,),
                               memory_history=True, snapshot_threshold=100.0,
                               sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
-                              memory_budget_fraction=0.9, zero_hpz_partition_size=None)
-    with profile_deepspeed_initialization(options):
-        engine, optimizer, _, _ = deepspeed.initialize(
-            model=policy, optimizer=optimizer, config=dict(
-                train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1,
-                zero_optimization=dict(stage=3, stage3_param_persistence_threshold=0),
-                zero_allow_untested_optimizer=True, bf16=dict(enabled=real_vision),
-                steps_per_print=1000,
-            ),
-        )
+                              memory_budget_fraction=0.9, zero_hpz_partition_size=None,
+                              unfreeze_after=2 if unfreeze else None)
+    config = LoLAV07Config(train_vlm=unfreeze, gradient_checkpointing=True, ema_decay=0,
+                          vision_batched_sdpa=real_vision, vision_no_checkpoint_layers=1 if real_vision else 0)
     trainer = training.LoLAV07Trainer(
-        LoLAV07Config(), {}, dict(device=device, local_rank=local_rank, world_rank=rank,
+        config, {}, dict(device=device, local_rank=local_rank, world_rank=rank,
                                  world_size=torch.distributed.get_world_size(), is_distributed=True),
-        max_steps=20, strategy="deepspeed", batch_size=2,
+        max_steps=100, strategy="deepspeed", batch_size=2, train_vlm=unfreeze, deepspeed_zero_stage=3,
         training_args=dict(seed=42, batch_size=2), log_every_n_steps=100,
     )
     trainer.policy = policy
-    trainer.model = engine
-    trainer.optimizer = optimizer
-    trainer.total_steps = 20
+    trainer.total_steps = 100
+    policy.config = config
+    with profile_deepspeed_initialization(options):
+        if unfreeze:
+            policy.vlm.requires_grad_(False)
+            trainer._setup_deepspeed()
+        else:
+            optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
+            trainer.model, trainer.optimizer, _, _ = deepspeed.initialize(
+                model=policy, optimizer=optimizer, config=dict(
+                    train_micro_batch_size_per_gpu=2, gradient_accumulation_steps=1,
+                    zero_optimization=dict(stage=3, stage3_param_persistence_threshold=0),
+                    zero_allow_untested_optimizer=True, bf16=dict(enabled=real_vision),
+                    steps_per_print=1000,
+                ),
+            )
     trainer.preprocessor = lambda batch: {key: value.to(device) for key, value in batch.items()}
 
     def training_step(owner, batch, timing_dict=None):
-        return owner.model(owner.preprocessor(batch))
+        prepared = owner.preprocessor(batch)
+        prepared["input"] = prepared["input"].to(next(owner.policy.parameters()).dtype)
+        return owner.model(prepared)
 
     trainer.training_step = MethodType(training_step, trainer)
     loader = [dict(input=torch.randn(40, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]]))
               if real_vision else {"input": torch.randn(2, 16)} for batch_index in range(16)]
     with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",
-               wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa:
+               wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa, profile_deepspeed_initialization(options):
         run_bench(trainer, options, loader, 0, 0, training.LoLAV07Trainer.train)
     if real_vision:
-        assert sdpa.call_count == 5 * 6, sdpa.call_count
-    assert trainer.global_step == 5
+        assert sdpa.call_count == 5 * 6 + (2 * 4 if unfreeze else 0), sdpa.call_count
+    assert trainer.global_step == (7 if unfreeze else 5)
     torch.distributed.barrier()
     assert not list(output.rglob("*model_states.pt"))
     if rank == 0:
@@ -840,13 +1001,19 @@ def distributed_smoke(output, real_vision=False):
         assert result["memory_budget"]["passed"]
         assert (output / "rank000/trace.json").is_file()
         assert (output / "rank000/memory_final.pickle").is_file()
-        print(f"PASS: real two-rank ZeRO-3 updates, vision={real_vision}, 90% budget, trace, allocator snapshot, bounded exit, no checkpoint")
+        if unfreeze:
+            assert result["unfreeze"]["before"]["vlm_trainable_tensors"] == 0
+            assert result["unfreeze"]["after"]["vlm_trainable_tensors"] > 0
+            assert result["unfreeze"]["vision_fallback_calls"] == 0
+            assert result["unfreeze"]["after"]["vision_gc"] == [True, False]
+        print(f"PASS: real two-rank ZeRO-3 updates, vision={real_vision}, unfreeze={unfreeze}, 90% budget, trace, allocator snapshot, bounded exit, no retained checkpoint")
     torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
     import sys
-    if sys.argv[1:2] in (["--distributed-smoke"], ["--distributed-vision-smoke"]):
-        distributed_smoke(Path(sys.argv[2]), real_vision=sys.argv[1] == "--distributed-vision-smoke")
+    if sys.argv[1:2] in (["--distributed-smoke"], ["--distributed-vision-smoke"], ["--distributed-unfreeze-smoke"]):
+        distributed_smoke(Path(sys.argv[2]), real_vision=sys.argv[1] != "--distributed-smoke",
+                          unfreeze=sys.argv[1] == "--distributed-unfreeze-smoke")
     else:
         unittest.main()

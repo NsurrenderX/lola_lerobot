@@ -1,4 +1,4 @@
-"""Bounded, checkpoint-read-only profiling of the production DeepSpeed trainer."""
+"""Bounded production profiling, with optional isolated temporary unfreeze checkpoints."""
 
 import argparse
 from contextlib import ExitStack, contextmanager
@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import traceback
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -41,6 +42,8 @@ def parse_options(arguments=None):
                         help="Use grouped vision SDPA, retain 12 vision blocks, and check a 90%% memory budget")
     parser.add_argument("--zero-hpz-partition-size", type=int, choices=(1, 8), default=None,
                         help="Profile-only hpZ control: 1 for baseline, 8 for node-local parameter caching")
+    parser.add_argument("--unfreeze-after", type=int, default=None,
+                        help="Fresh-run diagnostic: force production VLM unfreeze after N frozen updates")
     parser.add_argument("--dry-run", action="store_true")
     options, trainer_arguments = parser.parse_known_args(arguments)
     if trainer_arguments[:1] == ["--"]:
@@ -55,8 +58,24 @@ def parse_options(arguments=None):
         parser.error("Require steps > 0, warmup >= 0, and 0 <= trace-steps <= steps")
     if options.memory_budget_fraction is not None and not 0 < options.memory_budget_fraction < 1:
         parser.error("memory-budget-fraction must be between 0 and 1")
+    if options.unfreeze_after is not None:
+        if options.unfreeze_after <= 0:
+            parser.error("unfreeze-after must be positive")
+        if options.memory_budget_fraction is None:
+            options.memory_budget_fraction = 0.90
     options.trace_ranks = tuple(int(rank) for rank in options.trace_ranks.split(",") if rank)
     return options, trainer_arguments
+
+
+def configure_unfreeze_profile(options, arguments):
+    if options.unfreeze_after is None:
+        return
+    if arguments.strategy != "deepspeed" or arguments.deepspeed_zero_stage != 3:
+        raise ValueError("Unfreeze profile requires DeepSpeed ZeRO-3")
+    if not arguments.train_vlm or arguments.vlm_unfreeze_v_loss_threshold <= 0:
+        raise ValueError("Unfreeze profile requires train_vlm and a positive delayed-unfreeze threshold")
+    if arguments.resume:
+        raise ValueError("Unfreeze profile starts fresh; explicitly pass --resume '' to clear a saved resume path")
 
 
 def configure_profile_deepspeed(config, partition_size, world_size, local_world_size):
@@ -224,6 +243,7 @@ def localize_main(arguments=None):
     source_config = options.training_config.read_text()
     snapshot = json.loads(source_config)
     _, _, effective = resolve_training_arguments(snapshot, trainer_arguments)
+    configure_unfreeze_profile(options, effective)
     if effective.strategy != "deepspeed" or effective.deepspeed_zero_stage != 3:
         parser.error("Localized profile requires DeepSpeed ZeRO-3")
     if not effective.dataset_root or not effective.vlm_path:
@@ -304,7 +324,14 @@ def localize_main(arguments=None):
                         raise FileNotFoundError(f"Missing optimizer shard for rank {rank} in {path}")
         status["phase"] = "running"
         status_path.write_text(json.dumps(status, indent=2))
-        child_code = run_profile_child(command, node_output / "console.log")
+        child_environment = {}
+        if options.unfreeze_after is not None:
+            blob_output = transfers.resolve_blob_ref(str(requested_output), settings.storage_account,
+                                                     settings.storage_container, str(mount))
+            child_environment = dict(LOLA_PROFILE_UNFREEZE_BLOB_BASE=f"{blob_output}/unfreeze_exchange",
+                                     LOLA_AZCOPY_BIN=str(azcopy))
+        with patch.dict(os.environ, child_environment):
+            child_code = run_profile_child(command, node_output / "console.log")
     except Exception:
         (node_output / "error.log").write_text(traceback.format_exc())
         traceback.print_exc()
@@ -400,6 +427,12 @@ class BenchRecorder:
         self.shapes = {}
         self.active = False
         self.memory_budget_fraction = getattr(options, "memory_budget_fraction", None)
+        self.frozen_steps = getattr(options, "unfreeze_after", None) or 0
+        self.total_steps = self.frozen_steps + options.warmup + options.steps
+        self.unfreeze_complete = False
+        self.vision_attention_calls = 0
+        self.vision_fallback_calls = 0
+        self.vision_fallback_details = {}
 
     @contextmanager
     def stage(self, name):
@@ -449,10 +482,11 @@ class BenchRecorder:
 
     def batches(self, loader):
         iterator = iter(loader)
-        while self.count < self.options.warmup + self.options.steps:
+        measure_start = self.frozen_steps + self.options.warmup
+        while self.count < self.total_steps:
             if getattr(self.trainer, "model", None) is not self.engine:
                 raise RuntimeError("DeepSpeed engine changed during bench; use a stable frozen/unfrozen checkpoint")
-            if self.count == self.options.warmup:
+            if self.count == measure_start:
                 self.start_trace()
             started = time.perf_counter()
             with torch.profiler.record_function("bench/data_wait"):
@@ -468,6 +502,9 @@ class BenchRecorder:
             device_before = device_memory_sample(self.device, before_memory) if self.memory_budget_fraction else None
             self.host_times = {}
             self.shapes = {}
+            self.vision_attention_calls = 0
+            self.vision_fallback_calls = 0
+            self.vision_fallback_details = {}
             self.active = True
             started_ns = time.time_ns()
             started = time.perf_counter()
@@ -477,6 +514,10 @@ class BenchRecorder:
             self.active = False
             if self.trainer.global_step == before_step:
                 continue
+            if getattr(self.trainer, "model", None) is not self.engine:
+                raise RuntimeError("Untracked DeepSpeed engine replacement")
+            if self.frozen_steps and self.count + 1 >= self.frozen_steps and not self.unfreeze_complete:
+                raise RuntimeError("Scheduled production unfreeze did not complete")
             after_memory = memory_stats(self.device)
             deltas = counter_deltas(before_memory, after_memory)
             budget = None
@@ -491,14 +532,21 @@ class BenchRecorder:
                                and self.snapshot_count < 2
                                and (elapsed >= self.options.snapshot_threshold or deltas.get("num_alloc_retries", 0)))
             row = dict(rank=self.rank, bench_step=self.count, global_step=self.trainer.global_step,
-                       warmup=self.count < self.options.warmup,
-                       traced=self.options.warmup <= self.count < self.options.warmup + self.options.trace_steps,
+                       warmup=self.count < measure_start,
+                       traced=measure_start <= self.count < measure_start + self.options.trace_steps,
                        profiler_active=self.tracing,
                        sync_phases=self.options.sync_phases, wall_start_ns=started_ns,
                        step_s=elapsed, data_wait_s=data_seconds,
                        host_stage_s=self.host_times, shapes=self.shapes,
                        memory_before=before_memory, memory_after=after_memory, counter_delta=deltas,
                        snapshot_saved=bool(snapshot_needed))
+            if self.frozen_steps:
+                row["phase"] = ("frozen" if self.count < self.frozen_steps - 1 else
+                                "unfreeze" if self.count == self.frozen_steps - 1 else
+                                "post_unfreeze_warmup" if self.count < measure_start else "measure")
+                row["vision_attention"] = dict(calls=self.vision_attention_calls,
+                                               fallback_calls=self.vision_fallback_calls,
+                                               fallback_details=self.vision_fallback_details)
             if budget is not None:
                 row["memory_budget"] = budget
             self.journal.write(json.dumps(row) + "\n")
@@ -511,7 +559,7 @@ class BenchRecorder:
                                    f"rank {self.rank} estimated peak={budget['estimated_peak_fraction']:.1%}")
             if self.profiler is not None:
                 self.profiler.step()
-            if self.options.trace_steps and self.count == self.options.warmup + self.options.trace_steps:
+            if self.options.trace_steps and self.count == measure_start + self.options.trace_steps:
                 self.stop_trace()
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
@@ -531,6 +579,105 @@ class ProfileLoader:
 
     def __iter__(self):
         return self.recorder.batches(self.loader)
+
+
+def profile_policy_state(trainer):
+    blocks = trainer.policy.vlm.visual.blocks
+    parameters = list(trainer.policy.vlm.parameters())
+    return dict(vision_gc=[getattr(block, "gradient_checkpointing", None) for block in blocks],
+                grouped_attention_modules=sum(hasattr(block.attn, "_lola_original_forward") for block in blocks),
+                attention_implementations=sorted({block.attn.config._attn_implementation for block in blocks}),
+                vlm_trainable_tensors=sum(parameter.requires_grad for parameter in parameters),
+                vlm_parameter_tensors=len(parameters),
+                vlm_trainable_numel=sum(getattr(parameter, "ds_numel", parameter.numel())
+                                        for parameter in parameters if parameter.requires_grad))
+
+
+@contextmanager
+def profile_engine_lifecycle(trainer, recorder):
+    with ExitStack() as scope, ExitStack() as engine_scope:
+        def bind_engine():
+            recorder.engine = trainer.model
+            for attribute, label in (("backward", "backward"), ("step", "optimizer")):
+                engine_scope.enter_context(patch.object(
+                    trainer.model, attribute, recorder.wrap(getattr(trainer.model, attribute), label)))
+
+        bind_engine()
+        if recorder.frozen_steps:
+            if trainer.global_step != 0 or not trainer._vlm_delayed_unfreeze or trainer._vlm_unfrozen:
+                raise ValueError("Unfreeze profile must start at step zero with a frozen VLM")
+            initial_state = profile_policy_state(trainer)
+            if initial_state["vlm_trainable_tensors"]:
+                raise ValueError("Unfreeze profile VLM is already trainable")
+            original_step = trainer.training_step
+            original_unfreeze = trainer._unfreeze_vlm_deepspeed
+
+            def training_step(*args, **kwargs):
+                result = original_step(*args, **kwargs)
+                if not recorder.unfreeze_complete:
+                    trainer._pending_deepspeed_unfreeze = trainer.global_step + 1 == recorder.frozen_steps
+                return result
+
+            def unfreeze():
+                if recorder.unfreeze_complete or trainer.global_step != recorder.frozen_steps:
+                    raise RuntimeError("Unexpected production unfreeze boundary")
+                old_engine = weakref.ref(trainer.model)
+                receipt = dict(status="started", global_step=trainer.global_step,
+                               trigger="forced_profile_step", before=profile_policy_state(trainer),
+                               deepspeed_before=deepcopy(trainer.model._lola_profile_deepspeed_config),
+                               temporary_checkpoint_root=str(recorder.options.output / "unfreeze_checkpoint"),
+                               exchange_blob_base=os.environ.get("LOLA_CKPT_BLOB_BASE", ""))
+                receipt_path = recorder.output / "unfreeze.json"
+                receipt_path.write_text(json.dumps(receipt, indent=2))
+                engine_scope.close()
+                recorder.engine = None
+                started = time.perf_counter()
+                try:
+                    with patch.object(trainer, "ckpt_dir", receipt["temporary_checkpoint_root"]):
+                        original_unfreeze()
+                    torch.cuda.synchronize(recorder.device)
+                    if trainer.model is old_engine() or not trainer._vlm_unfrozen:
+                        raise RuntimeError("Production unfreeze did not rebuild the engine")
+                    receipt["after"] = profile_policy_state(trainer)
+                    if receipt["after"]["vlm_trainable_tensors"] != receipt["after"]["vlm_parameter_tensors"]:
+                        raise RuntimeError("VLM parameters remain frozen after rebuild")
+                    receipt["deepspeed_after"] = deepcopy(trainer.model._lola_profile_deepspeed_config)
+                    receipt["hpz_topology_after"] = profile_hpz_topology(trainer, recorder.options.zero_hpz_partition_size)
+                    bind_engine()
+                    recorder.unfreeze_complete = True
+                    receipt["status"] = "complete"
+                except Exception:
+                    receipt["status"] = "failed"
+                    raise
+                finally:
+                    receipt["duration_s"] = time.perf_counter() - started
+                    receipt_path.write_text(json.dumps(receipt, indent=2))
+
+            def attention_called(module, arguments):
+                if recorder.active:
+                    recorder.vision_attention_calls += 1
+
+            def fallback_wrapper(attention):
+                original = attention._lola_original_forward
+
+                def fallback(*args, **kwargs):
+                    if recorder.active:
+                        recorder.vision_fallback_calls += 1
+                        detail = json.dumps(dict(implementation=attention.config._attn_implementation,
+                                                 training=attention.training, dropout=attention.attention_dropout,
+                                                 kwargs=sorted(kwargs)), sort_keys=True)
+                        recorder.vision_fallback_details[detail] = recorder.vision_fallback_details.get(detail, 0) + 1
+                    return original(*args, **kwargs)
+
+                return fallback
+
+            for block in trainer.policy.vlm.visual.blocks:
+                scope.callback(block.attn.register_forward_pre_hook(attention_called).remove)
+                if hasattr(block.attn, "_lola_original_forward"):
+                    scope.enter_context(patch.object(block.attn, "_lola_original_forward", fallback_wrapper(block.attn)))
+            scope.enter_context(patch.object(trainer, "training_step", training_step))
+            scope.enter_context(patch.object(trainer, "_unfreeze_vlm_deepspeed", unfreeze))
+        yield
 
 
 def run_bench(trainer, options, loader, start_step, start_epoch, original_train):
@@ -559,7 +706,10 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
                     optimizations_sha256=hashlib.sha256(Path(forward_optimizations.__file__).read_bytes()).hexdigest(),
                     policy_sha256=hashlib.sha256(Path(sys.modules[trainer.policy.__module__].__file__).read_bytes()).hexdigest(),
                     training_config_sha256=hashlib.sha256(options.training_config.read_bytes()).hexdigest(),
-                    start_step=start_step, checkpoint_writes=False)
+                    start_step=start_step, checkpoint_writes=bool(recorder.frozen_steps),
+                    training_checkpoint_writes=False, temporary_checkpoint_writes=bool(recorder.frozen_steps))
+    if recorder.frozen_steps:
+        manifest["policy_state_before"] = profile_policy_state(trainer)
     (recorder.output / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
     memory_history = options.memory_history and trainer.world_rank in options.trace_ranks
     status = "failed"
@@ -567,9 +717,13 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
         if memory_history:
             torch.cuda.memory._record_memory_history(max_entries=100000)
         with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {
+                "LOLA_CKPT_BLOB_BASE": os.environ.get("LOLA_PROFILE_UNFREEZE_BLOB_BASE", "")
+                if recorder.frozen_steps else "",
+            }))
+            stack.enter_context(profile_engine_lifecycle(trainer, recorder))
             for owner, attribute, label in (
-                (trainer, "training_step", "forward"), (trainer.model, "backward", "backward"),
-                (trainer.model, "step", "optimizer"), (trainer.policy, "forward", "policy"),
+                (trainer, "training_step", "forward"), (trainer.policy, "forward", "policy"),
                 (trainer.policy.vlm.visual, "forward", "vision"),
                 (trainer.policy.vlm.language_model, "forward", "language"),
                 (trainer.policy.model.vlm_bridge, "forward", "bridge"),
@@ -583,7 +737,7 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
                 original_train(trainer, ProfileLoader(loader, recorder), start_step, start_epoch)
             except BenchComplete:
                 pass
-        if recorder.count != options.warmup + options.steps:
+        if recorder.count != recorder.total_steps:
             raise RuntimeError(f"Training ended early: {recorder.count} productive steps")
         status = "complete"
     finally:
@@ -606,7 +760,7 @@ def summarize(directory):
         raise ValueError("Missing ranks; copy both nodes' rank directories before summarizing")
     for key in ("world_size", "source_sha256", "trainer_sha256", "policy_sha256",
                 "optimizations_sha256", "training_config_sha256", "start_step", "training_args", "bench",
-                "deepspeed_config", "hpz_topology"):
+                "deepspeed_config", "hpz_topology", "policy_state_before"):
         if any(entry.get(key) != manifests[0].get(key) for entry in manifests):
             raise ValueError(f"Rank manifests disagree on {key}")
     per_rank = {}
@@ -642,6 +796,27 @@ def summarize(directory):
     result = dict(per_rank=per_rank, mean_rank_max_step_plus_data_s=rank_max_mean,
                   estimated_samples_per_second=world_size * manifests[0]["training_args"]["batch_size"] / rank_max_mean,
                   caveat="Rank-max step+data estimate; boundary synchronization and instrumentation perturb training. Host stages overlap and are not additive.")
+    frozen_steps = manifests[0].get("bench", {}).get("unfreeze_after")
+    if frozen_steps:
+        receipts = [json.loads((directory / f"rank{rank:03d}" / "unfreeze.json").read_text())
+                    for rank in range(world_size)]
+        if any(receipt["status"] != "complete" or receipt["global_step"] != frozen_steps for receipt in receipts):
+            raise ValueError("Missing or incomplete production unfreeze")
+        for key in ("before", "after", "deepspeed_before", "deepspeed_after", "hpz_topology_after"):
+            if any(receipt[key] != receipts[0][key] for receipt in receipts):
+                raise ValueError(f"Rank unfreeze receipts disagree on {key}")
+        bench = manifests[0]["bench"]
+        phases = (["frozen"] * (frozen_steps - 1) + ["unfreeze"]
+                  + ["post_unfreeze_warmup"] * bench["warmup"] + ["measure"] * bench["steps"])
+        for rows in rows_by_rank.values():
+            if [row.get("phase") for row in rows] != phases or [row["global_step"] for row in rows] != list(range(1, len(phases) + 1)):
+                raise ValueError("Unfreeze profile phase/step sequence mismatch")
+        result["unfreeze"] = dict(global_step=frozen_steps,
+                                  max_rank_duration_s=max(receipt["duration_s"] for receipt in receipts),
+                                  before=receipts[0]["before"], after=receipts[0]["after"],
+                                  temporary_checkpoint_writes=True,
+                                  vision_attention_calls=sum(row["vision_attention"]["calls"] for rows in rows_by_rank.values() for row in rows),
+                                  vision_fallback_calls=sum(row["vision_attention"]["fallback_calls"] for rows in rows_by_rank.values() for row in rows))
     budgets = [row["memory_budget"] for rows in rows_by_rank.values() for row in rows if "memory_budget" in row]
     if budgets:
         if len(budgets) != sum(map(len, rows_by_rank.values())) or any(
@@ -667,6 +842,10 @@ def main():
     options, trainer_arguments = parse_options()
     snapshot = json.loads(options.training_config.read_text())
     training, parser, arguments = resolve_training_arguments(snapshot, trainer_arguments)
+    configure_unfreeze_profile(options, arguments)
+    if options.unfreeze_after and int(os.environ.get("WORLD_SIZE", "1")) > int(os.environ.get("LOCAL_WORLD_SIZE", "1")) \
+            and not os.environ.get("LOLA_PROFILE_UNFREEZE_BLOB_BASE"):
+        parser.error("Multi-node unfreeze profile requires --localize_io for isolated temporary shard exchange")
     arguments.disable_wandb = True
     arguments.resume_gpu_keepalive = False
     arguments.resume_fast_skip = True
@@ -682,7 +861,10 @@ def main():
                              or Path(arguments.resume).resolve().parent in options.output.resolve().parents):
         parser.error("Bench output must be outside the source checkpoint run directory")
     if options.dry_run:
-        print(json.dumps(dict(bench=vars(options), training=vars(arguments), checkpoint_writes=False), indent=2, default=str))
+        print(json.dumps(dict(bench=vars(options), training=vars(arguments),
+                              checkpoint_writes=options.unfreeze_after is not None,
+                              training_checkpoint_writes=False,
+                              temporary_checkpoint_writes=options.unfreeze_after is not None), indent=2, default=str))
         return
 
     original_train = training.LoLAV07Trainer.train

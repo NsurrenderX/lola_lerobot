@@ -66,6 +66,8 @@ while (( $# )); do
                 '  [--azcopy_path EXECUTABLE] (--output is the blob destination in localized mode)' \
                 '  [--validated-optimizations] (grouped SDPA, retain 12 vision blocks, 90% budget)' \
                 '  [--zero-hpz-partition-size 1|8] (A: baseline=1; B: hpZ=8; profile only)' \
+                '  [--unfreeze-after N] (fresh ZeRO3 run; temporary checkpoints inside NEW_DIR)' \
+                "    Use --localize_io across nodes and -- --resume '' to clear saved resume defaults." \
                 '  [profile options] [-- trainer options]' \
                 'CLI values override environment defaults. Options accept VALUE or =VALUE.'
             exit 0
