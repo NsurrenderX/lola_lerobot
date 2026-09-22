@@ -320,6 +320,82 @@ and no model checkpoint files remained in that shared local test output.
 This uses local DeepSpeed 0.18.8/PyTorch 2.11.0 and does not validate A100
 throughput, cluster DeepSpeed 0.19.7, full-model memory or actual blob exchange.
 
+## Frozen-Boundary Handoff Profile, 2026-09-21
+
+This opt-in diagnostic compares a real production in-process unfreeze with a
+fresh-process trainable engine. It does not implement permanent two-stage
+production training. The production trainer and default launch behavior are
+unchanged. All new flags are profile options, BEFORE `--`.
+
+The AMLT command fragments are maintained outside this repository in
+`/data_16T/lola_util/`:
+
+- Same-job A then B (`lola_profile_pair.yaml`): the recommended
+  performance experiment, 2 nodes x 8 A100 40GB. Set the outer job's
+  `process_count_per_node: 1`, `NODES: 2`, `GPUS: 8` and retain the existing
+  image/setup/storage/identity. Replace its `command`, not its whole job.
+- Split job 1 (`lola_profile_stage1.yaml`): stop at the frozen
+  boundary and upload the handoff. It does NOT rebuild/unfreeze the engine.
+- Split job 2 (`lola_profile_stage2.yaml`): short fresh-process
+  restore acceptance, 5 warmup + 8 measured updates. Submit it only after
+  job 1 succeeds on both nodes; these are not two concurrently submitted jobs.
+
+Synchronize this code to the repository cloned by the cluster first. Pin the
+same code revision and dependency versions for both stages. Use new output
+roots for every attempt; update stage 2's handoff input together with stage 1's
+output. The examples are YAML command fragments, not standalone AMLT submission
+files. No cluster task is submitted by these local changes.
+
+`--handoff-export --unfreeze-after 100` intercepts the production temporary
+checkpoint save and hard-links each rank's model/optimizer shards into
+`OUTPUT/handoff/boundary`. Frozen VLM fragments are included. `latest`, source
+hashes, training contract, normalization statistics, original training horizon,
+epoch/batch position and per-rank RNG are retained. Keeping optimizer shards is
+necessary for DeepSpeed's reconstruction of the previously trainable weights;
+the second-stage optimizer does NOT resume their old Adam state.
+
+Both paths reset ALL Adam state and use OneCycleLR over the original remaining
+steps, matching the current production unfreeze. Do not change `max_steps` or
+`max_epochs` to stop the producer. B starts with all VLM parameters trainable,
+loads weights only, and checks parameter shards, buffers, FP32 master weights,
+Adam state, learning rates, scheduler and DeepSpeed config against A before
+measuring. The pure stop/restart mode has no A trainable-state reference.
+
+To avoid saving hundreds of full image/history batches, the diagnostic captures
+the next 8 real CPU batches PER RANK and cycles that fixed bank in both arms.
+It resets CPU/CUDA/Python/NumPy RNG at the first replay step; preprocessing and
+augmentation remain in the production training path. Each iteration receives
+an independent copy. This is a paired lifecycle diagnostic, NOT normal dataset
+sampling, an accuracy run, or a production-throughput claim. Allocate enough
+host RAM and disk for this bank as well as checkpoint shards. The input tensors
+are dataset material; store the output with the dataset's access restrictions.
+Only load trusted handoff artifacts: the payload uses PyTorch pickle loading.
+
+`--handoff-pair` runs localized A and B serially under the same node allocation,
+each in a separate torchrun process. The parent waits for both A exit/upload
+codes via a TCPStore before launching B. It uses master port P for A, P+1 for B,
+P+2 for the gate, with a one-hour timeout. Any A failure blocks B. This first
+implementation still uploads the handoff and stages required shards for B;
+it does not claim zero blob IO. Uploads occur outside timed training.
+
+The long pair uses 100 frozen updates, then 40 warmup + 120 untraced + 3 final
+traced updates in A; B starts at step100 and executes only the latter 163.
+All 16 ranks trace the final 3 steps. Ordinary stage synchronization and memory
+history remain off. `--trace-at-end` is opt-in, preserving old trace placement.
+Summarize A and B separately and compare identical global-step sets; keep all
+slow samples, compare per-step `loss_metrics`, `replay_index`, fallback counts
+and memory budgets. The stop-only producer has no throughput summary; its final
+save/exit is not an ordinary timed step.
+
+Local validation used two RTX A6000 GPUs, BF16 tiny Qwen3 vision, DeepSpeed
+0.18.8/PyTorch2.11.0: A exported and completed the real production rebuild;
+B in a new process matched both initial and final model/FP32/Adam/scheduler
+states exactly, with all five replay losses equal and zero vision fallbacks.
+A separate stop-at-boundary followed by a fresh consumer also passed. CPU
+tests cover hash corruption, options, remaining-step schedule, upload/download
+layout and failed-node gates. This is not an A100/DeepSpeed0.19.7 throughput
+result or a real Azure storage/job-dependency validation.
+
 ## Local Results, 2026-09-19
 
 Historical caveat added 2026-09-20: the old attention patch fell back whenever

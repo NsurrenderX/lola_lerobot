@@ -1,8 +1,9 @@
 """Bounded production profiling, with optional isolated temporary unfreeze checkpoints."""
 
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -19,6 +20,8 @@ from unittest.mock import patch
 
 import torch
 
+from lerobot.scripts import profile_lola_handoff as handoff
+
 
 class BenchComplete(Exception):
     pass
@@ -31,6 +34,7 @@ def parse_options(arguments=None):
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--trace-steps", type=int, default=3)
+    parser.add_argument("--trace-at-end", action="store_true")
     parser.add_argument("--trace-ranks", default="0,8")
     parser.add_argument("--sync-phases", action="store_true")
     parser.add_argument("--trace-memory", action="store_true")
@@ -44,6 +48,15 @@ def parse_options(arguments=None):
                         help="Profile-only hpZ control: 1 for baseline, 8 for node-local parameter caching")
     parser.add_argument("--unfreeze-after", type=int, default=None,
                         help="Fresh-run diagnostic: force production VLM unfreeze after N frozen updates")
+    parser.add_argument("--handoff-export", action="store_true",
+                        help="Export a frozen-boundary checkpoint and fixed real-batch replay for a paired profile")
+    parser.add_argument("--handoff-input", type=Path,
+                        help="Start a fresh trainable engine from a trusted profile handoff directory")
+    parser.add_argument("--stop-at-handoff", action="store_true",
+                        help="Exit after exporting the frozen boundary, without rebuilding the engine")
+    parser.add_argument("--replay-batches", type=int, default=8)
+    parser.add_argument("--handoff-pair", action="store_true",
+                        help="Localized same-allocation A then B, with an all-node success gate")
     parser.add_argument("--dry-run", action="store_true")
     options, trainer_arguments = parser.parse_known_args(arguments)
     if trainer_arguments[:1] == ["--"]:
@@ -63,11 +76,27 @@ def parse_options(arguments=None):
             parser.error("unfreeze-after must be positive")
         if options.memory_budget_fraction is None:
             options.memory_budget_fraction = 0.90
+    if options.handoff_export and (not options.unfreeze_after or options.handoff_input):
+        parser.error("--handoff-export requires --unfreeze-after and excludes --handoff-input")
+    if options.handoff_input and options.unfreeze_after:
+        parser.error("--handoff-input excludes --unfreeze-after")
+    if options.stop_at_handoff and not options.handoff_export:
+        parser.error("--stop-at-handoff requires --handoff-export")
+    if options.replay_batches <= 0:
+        parser.error("--replay-batches must be positive")
+    if options.handoff_pair and (not options.handoff_export or options.stop_at_handoff):
+        parser.error("--handoff-pair requires --handoff-export and excludes --stop-at-handoff")
     options.trace_ranks = tuple(int(rank) for rank in options.trace_ranks.split(",") if rank)
     return options, trainer_arguments
 
 
 def configure_unfreeze_profile(options, arguments):
+    if options.handoff_export or options.handoff_input:
+        if arguments.strategy != "deepspeed" or arguments.deepspeed_zero_stage != 3 \
+                or not arguments.train_vlm or arguments.resume or arguments.ema_decay != 0:
+            raise ValueError("Handoff requires fresh BF16 ZeRO3, train_vlm, empty resume and EMA disabled")
+        if arguments.deepspeed_config:
+            raise ValueError("Handoff profiles do not support custom DeepSpeed config overrides")
     if options.unfreeze_after is None:
         return
     if arguments.strategy != "deepspeed" or arguments.deepspeed_zero_stage != 3:
@@ -207,6 +236,57 @@ def run_profile_child(command, console_path):
                     signal.signal(signum, handler)
 
 
+def option_arguments(settings, options, trainer_arguments):
+    arguments = []
+    for namespace, separator in ((settings, "_"), (options, "-")):
+        for name, value in vars(namespace).items():
+            if value is None or value is False:
+                continue
+            flag = "--" + name.replace("_", separator)
+            arguments.append(flag)
+            if value is not True:
+                arguments.append(",".join(map(str, value)) if isinstance(value, tuple) else str(value))
+    return [*arguments, "--", *trainer_arguments]
+
+
+def paired_localize(settings, options, trainer_arguments):
+    if settings.master_port > 65532:
+        raise ValueError("Paired profile needs master_port and the following two ports")
+    root = options.output
+    producer = deepcopy(options)
+    producer.handoff_pair = False
+    producer.output = root / "A"
+    consumer = deepcopy(producer)
+    consumer.output = root / "B"
+    consumer.handoff_export = False
+    consumer.unfreeze_after = None
+    consumer.handoff_input = root / "A" / "handoff"
+    if options.dry_run:
+        for stage in (producer, consumer):
+            localize_main(option_arguments(settings, stage, trainer_arguments))
+        return 0
+    producer_code = localize_main(option_arguments(settings, producer, trainer_arguments))
+    store = torch.distributed.TCPStore(settings.master_addr, settings.master_port + 2,
+                                      settings.nnodes, settings.node_rank == 0,
+                                      timeout=timedelta(seconds=3600))
+    store.set(f"A/{settings.node_rank}", str(producer_code))
+    codes = [int(store.get(f"A/{node}")) for node in range(settings.nnodes)]
+    if any(codes):
+        store.set(f"A/read/{settings.node_rank}", "1")
+        if settings.node_rank == 0:
+            store.wait([f"A/read/{node}" for node in range(settings.nnodes)])
+        raise RuntimeError(f"A failed on at least one node; B not started: {codes}")
+    consumer_settings = deepcopy(settings)
+    consumer_settings.master_port += 1
+    consumer_code = localize_main(option_arguments(consumer_settings, consumer, trainer_arguments))
+    store.set(f"B/{settings.node_rank}", str(consumer_code))
+    codes = [int(store.get(f"B/{node}")) for node in range(settings.nnodes)]
+    store.set(f"B/read/{settings.node_rank}", "1")
+    if settings.node_rank == 0:
+        store.wait([f"B/read/{node}" for node in range(settings.nnodes)])
+    return max(codes)
+
+
 def localize_main(arguments=None):
     parser = argparse.ArgumentParser(description="Stage node-local profile IO and drain uploads on exit")
     parser.add_argument("--nnodes", type=int, required=True)
@@ -223,6 +303,8 @@ def localize_main(arguments=None):
     options, trainer_arguments = parse_options(remaining)
     if settings.nnodes <= 0 or settings.nproc_per_node <= 0 or not 0 <= settings.node_rank < settings.nnodes:
         parser.error("Invalid node topology")
+    if options.handoff_pair:
+        return paired_localize(settings, options, trainer_arguments)
     if not settings.mount_prefix.is_absolute() or not settings.local_mirror.is_absolute():
         parser.error("mount_prefix and local_mirror must be absolute paths")
     mount = settings.mount_prefix.resolve()
@@ -251,6 +333,8 @@ def localize_main(arguments=None):
     output = local_path(requested_output)
     sources = {name: getattr(effective, name) for name in ("dataset_root", "vlm_path", "resume")
                if getattr(effective, name)}
+    if options.handoff_input:
+        sources["handoff"] = str(options.handoff_input)
     inputs = {name: local_path(value) for name, value in sources.items()}
     for name, path in inputs.items():
         protected = path.parent if name == "resume" else path
@@ -261,6 +345,8 @@ def localize_main(arguments=None):
     config_path = output / "source_training_config.json"
     options.training_config = config_path
     options.output = output
+    if "handoff" in inputs:
+        options.handoff_input = inputs["handoff"]
     command = [sys.executable, "-m", "torch.distributed.run",
                f"--nnodes={settings.nnodes}", f"--nproc_per_node={settings.nproc_per_node}",
                f"--node_rank={settings.node_rank}", f"--master_addr={settings.master_addr}",
@@ -276,7 +362,8 @@ def localize_main(arguments=None):
             command.extend([flag, ",".join(map(str, value)) if isinstance(value, tuple) else str(value)])
     command.extend(["--", *trainer_arguments])
     for name, path in inputs.items():
-        command.extend([f"--{name}", str(path)])
+        if name != "handoff":
+            command.extend([f"--{name}", str(path)])
     plan = dict(node_rank=settings.node_rank, ranks=ranks, blob_output=str(requested_output),
                 local_output=str(output), inputs={name: dict(source=sources[name], local=str(path))
                                                  for name, path in inputs.items()}, command=command)
@@ -301,11 +388,16 @@ def localize_main(arguments=None):
             checkpoint_config = stage_checkpoint_config(sources["resume"], inputs["resume"])
             (node_output / "checkpoint_config.json").write_text(json.dumps(checkpoint_config, indent=2))
             print(f"[localize] checkpoint config: {checkpoint_config['source']} -> {checkpoint_config['local']}", flush=True)
+        if "handoff" in inputs:
+            handoff.validate_producer(Path(sources["handoff"]).parent, settings.nnodes, settings.nproc_per_node)
         for name, path in inputs.items():
             source = Path(sources[name]).resolve()
             if source.is_relative_to(mount):
                 patterns = [pattern for rank in ranks for pattern in
                             (f"*zero_pp_rank_{rank}_mp_rank_00_*", f"ema_rank_{rank}.pt")] if name == "resume" else None
+                if name == "handoff":
+                    patterns = ["manifest.json", "latest", "*model_states.pt", "*optim_states.pt",
+                                *[f"rank{rank:03d}*" for rank in ranks]]
                 extra = ["--include-pattern=" + ";".join(patterns)] if patterns else []
                 url = transfers.resolve_blob_ref(str(source), settings.storage_account,
                                                  settings.storage_container, str(mount))
@@ -322,6 +414,8 @@ def localize_main(arguments=None):
                 for rank in ranks:
                     if not any(path.glob(f"*zero_pp_rank_{rank}_mp_rank_00_optim_states.pt")):
                         raise FileNotFoundError(f"Missing optimizer shard for rank {rank} in {path}")
+            if name == "handoff":
+                handoff.validate_handoff(path, ranks, settings.nnodes * settings.nproc_per_node)
         status["phase"] = "running"
         status_path.write_text(json.dumps(status, indent=2))
         child_environment = {}
@@ -357,6 +451,22 @@ def localize_main(arguments=None):
             traceback.print_exc()
             success = False
         (uploaded if success else failed).append(path.name)
+    if options.handoff_export:
+        handoff_root = output / "handoff"
+        paths = [path for rank in ranks for pattern in
+                 (f"boundary/*zero_pp_rank_{rank}_mp_rank_00_*.pt", f"replay/rank{rank:03d}*")
+                 for path in handoff_root.glob(pattern)]
+        if settings.node_rank == 0 and (handoff_root / "manifest.json").exists():
+            paths.extend([handoff_root / "manifest.json", handoff_root / "latest"])
+        for path in paths:
+            relative = path.relative_to(output)
+            try:
+                success = transfers.run_azcopy_transfer(
+                    azcopy, str(path), f"{blob_output}/{relative}", overwrite="true", max_retries=3)
+            except Exception:
+                traceback.print_exc()
+                success = False
+            (uploaded if success else failed).append(str(relative))
     receipt = node_output / "upload_status.json"
     receipt.write_text(json.dumps(dict(node_rank=settings.node_rank, child_exit_code=child_code,
                                       upload_complete=not failed, uploaded=uploaded, failed=failed,
@@ -433,6 +543,10 @@ class BenchRecorder:
         self.vision_attention_calls = 0
         self.vision_fallback_calls = 0
         self.vision_fallback_details = {}
+        self.replay = None
+        self.replay_rng_pending = False
+        self.source_iterator = None
+        self.handoff_manifest = None
 
     @contextmanager
     def stage(self, name):
@@ -456,6 +570,8 @@ class BenchRecorder:
             if shapes and self.active:
                 self.shapes = {key: list(value.shape) for key, value in output.items()
                                if isinstance(value, torch.Tensor)}
+            if name == "forward" and self.replay and isinstance(output, tuple) and isinstance(output[1], dict):
+                self.loss_metrics = {key: value for key, value in output[1].items() if isinstance(value, (int, float))}
             return output
         return wrapped
 
@@ -482,16 +598,20 @@ class BenchRecorder:
 
     def batches(self, loader):
         iterator = iter(loader)
+        self.source_iterator = iterator
         measure_start = self.frozen_steps + self.options.warmup
+        trace_start = (self.total_steps - self.options.trace_steps
+                       if getattr(self.options, "trace_at_end", False) else measure_start)
         while self.count < self.total_steps:
             if getattr(self.trainer, "model", None) is not self.engine:
                 raise RuntimeError("DeepSpeed engine changed during bench; use a stable frozen/unfrozen checkpoint")
-            if self.count == measure_start:
+            if self.count == trace_start:
                 self.start_trace()
             started = time.perf_counter()
             with torch.profiler.record_function("bench/data_wait"):
                 try:
-                    batch = next(iterator)
+                    replay_index = (self.count - self.frozen_steps) % len(self.replay["batches"]) if self.replay else None
+                    batch = handoff.cpu_copy(self.replay["batches"][replay_index]) if self.replay else next(iterator)
                 except StopIteration:
                     return
             data_seconds = time.perf_counter() - started
@@ -505,7 +625,11 @@ class BenchRecorder:
             self.vision_attention_calls = 0
             self.vision_fallback_calls = 0
             self.vision_fallback_details = {}
+            self.loss_metrics = {}
             self.active = True
+            if self.replay_rng_pending:
+                handoff.restore_rng(self.replay["rng"], self.device)
+                self.replay_rng_pending = False
             started_ns = time.time_ns()
             started = time.perf_counter()
             yield batch
@@ -533,17 +657,21 @@ class BenchRecorder:
                                and (elapsed >= self.options.snapshot_threshold or deltas.get("num_alloc_retries", 0)))
             row = dict(rank=self.rank, bench_step=self.count, global_step=self.trainer.global_step,
                        warmup=self.count < measure_start,
-                       traced=measure_start <= self.count < measure_start + self.options.trace_steps,
+                       traced=trace_start <= self.count < trace_start + self.options.trace_steps,
                        profiler_active=self.tracing,
                        sync_phases=self.options.sync_phases, wall_start_ns=started_ns,
                        step_s=elapsed, data_wait_s=data_seconds,
                        host_stage_s=self.host_times, shapes=self.shapes,
                        memory_before=before_memory, memory_after=after_memory, counter_delta=deltas,
                        snapshot_saved=bool(snapshot_needed))
+            if replay_index is not None:
+                row["replay_index"] = replay_index
+                row["loss_metrics"] = self.loss_metrics
             if self.frozen_steps:
                 row["phase"] = ("frozen" if self.count < self.frozen_steps - 1 else
                                 "unfreeze" if self.count == self.frozen_steps - 1 else
                                 "post_unfreeze_warmup" if self.count < measure_start else "measure")
+            if self.frozen_steps or getattr(self.options, "handoff_input", None):
                 row["vision_attention"] = dict(calls=self.vision_attention_calls,
                                                fallback_calls=self.vision_fallback_calls,
                                                fallback_details=self.vision_fallback_details)
@@ -559,7 +687,7 @@ class BenchRecorder:
                                    f"rank {self.rank} estimated peak={budget['estimated_peak_fraction']:.1%}")
             if self.profiler is not None:
                 self.profiler.step()
-            if self.options.trace_steps and self.count == measure_start + self.options.trace_steps:
+            if self.options.trace_steps and self.count == trace_start + self.options.trace_steps:
                 self.stop_trace()
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
@@ -621,6 +749,9 @@ def profile_engine_lifecycle(trainer, recorder):
             def unfreeze():
                 if recorder.unfreeze_complete or trainer.global_step != recorder.frozen_steps:
                     raise RuntimeError("Unexpected production unfreeze boundary")
+                if recorder.options.stop_at_handoff:
+                    handoff.export_handoff(trainer, recorder)
+                    raise handoff.HandoffComplete()
                 old_engine = weakref.ref(trainer.model)
                 receipt = dict(status="started", global_step=trainer.global_step,
                                trigger="forced_profile_step", before=profile_policy_state(trainer),
@@ -633,7 +764,17 @@ def profile_engine_lifecycle(trainer, recorder):
                 recorder.engine = None
                 started = time.perf_counter()
                 try:
-                    with patch.object(trainer, "ckpt_dir", receipt["temporary_checkpoint_root"]):
+                    with ExitStack() as transition_scope:
+                        transition_scope.enter_context(patch.object(trainer, "ckpt_dir", receipt["temporary_checkpoint_root"]))
+                        if recorder.options.handoff_export:
+                            original_save = trainer.model.save_checkpoint
+
+                            def save_boundary(*args, **kwargs):
+                                result = original_save(*args, **kwargs)
+                                handoff.export_handoff(trainer, recorder, Path(kwargs["save_dir"]) / kwargs["tag"])
+                                return result
+
+                            transition_scope.enter_context(patch.object(trainer.model, "save_checkpoint", save_boundary))
                         original_unfreeze()
                     torch.cuda.synchronize(recorder.device)
                     if trainer.model is old_engine() or not trainer._vlm_unfrozen:
@@ -643,6 +784,8 @@ def profile_engine_lifecycle(trainer, recorder):
                         raise RuntimeError("VLM parameters remain frozen after rebuild")
                     receipt["deepspeed_after"] = deepcopy(trainer.model._lola_profile_deepspeed_config)
                     receipt["hpz_topology_after"] = profile_hpz_topology(trainer, recorder.options.zero_hpz_partition_size)
+                    if recorder.options.handoff_export:
+                        handoff.publish_trainable_state(trainer, recorder)
                     bind_engine()
                     recorder.unfreeze_complete = True
                     receipt["status"] = "complete"
@@ -653,6 +796,7 @@ def profile_engine_lifecycle(trainer, recorder):
                     receipt["duration_s"] = time.perf_counter() - started
                     receipt_path.write_text(json.dumps(receipt, indent=2))
 
+        if recorder.frozen_steps or getattr(recorder.options, "handoff_input", None):
             def attention_called(module, arguments):
                 if recorder.active:
                     recorder.vision_attention_calls += 1
@@ -675,6 +819,7 @@ def profile_engine_lifecycle(trainer, recorder):
                 scope.callback(block.attn.register_forward_pre_hook(attention_called).remove)
                 if hasattr(block.attn, "_lola_original_forward"):
                     scope.enter_context(patch.object(block.attn, "_lola_original_forward", fallback_wrapper(block.attn)))
+        if recorder.frozen_steps:
             scope.enter_context(patch.object(trainer, "training_step", training_step))
             scope.enter_context(patch.object(trainer, "_unfreeze_vlm_deepspeed", unfreeze))
         yield
@@ -685,6 +830,18 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
         raise ValueError("This bench requires the production DeepSpeed training path")
     hpz_topology = profile_hpz_topology(trainer, options.zero_hpz_partition_size)
     recorder = BenchRecorder(trainer, options)
+    if options.handoff_input:
+        manifest = json.loads((options.handoff_input / "manifest.json").read_text())
+        for key in ("warmup", "steps", "trace_steps", "trace_at_end"):
+            if getattr(options, key) != manifest[key]:
+                raise ValueError(f"Handoff measurement protocol differs: {key}")
+        recorder.replay = torch.load(options.handoff_input / "replay" / f"rank{trainer.world_rank:03d}.pt",
+                                     map_location="cpu", weights_only=False)
+        recorder.replay_rng_pending = True
+        reference = None
+        if manifest["mode"] == "paired":
+            reference = json.loads((options.handoff_input / "replay" / f"rank{trainer.world_rank:03d}_state.json").read_text())
+        handoff.record_trainable_state(trainer, recorder, reference)
     trainer.resume_save_dir = None
     trainer.ckpt_dir = str(options.output / "runtime_config")
     trainer.use_wandb = False
@@ -705,10 +862,11 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
                     trainer_sha256=hashlib.sha256(Path(training.__file__).read_bytes()).hexdigest(),
                     optimizations_sha256=hashlib.sha256(Path(forward_optimizations.__file__).read_bytes()).hexdigest(),
                     policy_sha256=hashlib.sha256(Path(sys.modules[trainer.policy.__module__].__file__).read_bytes()).hexdigest(),
+                    handoff_sha256=handoff.file_hash(handoff.__file__) if options.handoff_export or options.handoff_input else None,
                     training_config_sha256=hashlib.sha256(options.training_config.read_bytes()).hexdigest(),
                     start_step=start_step, checkpoint_writes=bool(recorder.frozen_steps),
                     training_checkpoint_writes=False, temporary_checkpoint_writes=bool(recorder.frozen_steps))
-    if recorder.frozen_steps:
+    if recorder.frozen_steps or options.handoff_input:
         manifest["policy_state_before"] = profile_policy_state(trainer)
     (recorder.output / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
     memory_history = options.memory_history and trainer.world_rank in options.trace_ranks
@@ -735,6 +893,11 @@ def run_bench(trainer, options, loader, start_step, start_epoch, original_train)
             stack.enter_context(patch.object(trainer, "_checkpoint_reasons", lambda *args, **kwargs: []))
             try:
                 original_train(trainer, ProfileLoader(loader, recorder), start_step, start_epoch)
+            except handoff.HandoffComplete:
+                if not options.stop_at_handoff or trainer.global_step != options.unfreeze_after:
+                    raise
+                status = "complete"
+                return
             except BenchComplete:
                 pass
         if recorder.count != recorder.total_steps:
@@ -756,10 +919,12 @@ def summarize(directory):
     if not manifests:
         raise ValueError("No rank manifests found")
     world_size = manifests[0]["world_size"]
+    if manifests[0].get("bench", {}).get("stop_at_handoff"):
+        raise ValueError("This is a handoff-only producer, not a throughput measurement")
     if {entry["rank"] for entry in manifests} != set(range(world_size)):
         raise ValueError("Missing ranks; copy both nodes' rank directories before summarizing")
     for key in ("world_size", "source_sha256", "trainer_sha256", "policy_sha256",
-                "optimizations_sha256", "training_config_sha256", "start_step", "training_args", "bench",
+                "optimizations_sha256", "handoff_sha256", "training_config_sha256", "start_step", "training_args", "bench",
                 "deepspeed_config", "hpz_topology", "policy_state_before"):
         if any(entry.get(key) != manifests[0].get(key) for entry in manifests):
             raise ValueError(f"Rank manifests disagree on {key}")
@@ -840,6 +1005,8 @@ def main():
         summarize(parser.parse_args(sys.argv[2:]).directory)
         return
     options, trainer_arguments = parse_options()
+    if options.handoff_pair:
+        raise ValueError("--handoff-pair requires the localized launcher")
     snapshot = json.loads(options.training_config.read_text())
     training, parser, arguments = resolve_training_arguments(snapshot, trainer_arguments)
     configure_unfreeze_profile(options, arguments)
@@ -867,6 +1034,12 @@ def main():
                               temporary_checkpoint_writes=options.unfreeze_after is not None), indent=2, default=str))
         return
 
+    handoff_manifest = None
+    if options.handoff_input:
+        handoff_manifest = handoff.validate_handoff(options.handoff_input,
+                                                    [int(os.environ.get("RANK", "0"))],
+                                                    int(os.environ.get("WORLD_SIZE", "1")))
+
     original_train = training.LoLAV07Trainer.train
     original_build_config = training.build_lola_config
 
@@ -876,6 +1049,9 @@ def main():
         return result
 
     def train(trainer, loader, start_step=0, start_epoch=0):
+        if handoff_manifest:
+            start_step, start_epoch = handoff_manifest["step"], handoff_manifest["epoch"]
+            loader = handoff.ReplayLoader(loader, handoff_manifest)
         return run_bench(trainer, options, loader, start_step, start_epoch, original_train)
 
     with patch.object(parser, "parse_args", return_value=arguments), \
@@ -883,6 +1059,7 @@ def main():
             patch.object(training, "build_lola_config", build_config), \
             patch.object(training, "_resolve_inplace_save_dir", return_value=None), \
             patch.object(training.LoLAV07Trainer, "train", train), \
+            handoff.consumer_context(training, options, handoff_manifest) if handoff_manifest else nullcontext(), \
             profile_deepspeed_initialization(options):
         training.main()
 

@@ -20,9 +20,241 @@ from lerobot.scripts.profile_lola_v07 import (
     profile_deepspeed_initialization, profile_hpz_topology, configure_unfreeze_profile,
     profile_engine_lifecycle,
 )
+from lerobot.scripts import profile_lola_handoff as handoff
 
 
 class ProfileBenchTests(unittest.TestCase):
+    def test_localized_handoff_roundtrip(self):
+        import hashlib
+        from lerobot.scripts import profile_lola_v07 as profile
+        from lerobot.scripts import download_azure_azcopy as transfers
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            mount = root / "mount"
+            (mount / "dataset/meta").mkdir(parents=True)
+            (mount / "dataset/meta/info.json").write_text("{}")
+            (mount / "vlm").mkdir()
+            (mount / "vlm/config.json").write_text("{}")
+            effective = SimpleNamespace(dataset_root=str(mount / "dataset"), vlm_path=str(mount / "vlm"),
+                                        resume="", strategy="deepspeed", deepspeed_zero_stage=3,
+                                        train_vlm=True, ema_decay=0, deepspeed_config=None,
+                                        vlm_unfreeze_v_loss_threshold=0.6)
+            config = mount / "config.json"
+            config.write_text('{"training_args":{}}')
+            files = {f"boundary/zero_pp_rank_{rank}_mp_rank_00_{kind}_states.pt": b"weights"
+                     for rank in range(2) for kind in ("model", "optim")}
+            files.update({f"replay/rank{rank:03d}.pt": b"replay" for rank in range(2)})
+            files["latest"] = b"boundary"
+            manifest = dict(version=1, mode="stop", contract=dict(world_size=2, torch=torch.__version__,
+                            source_hashes=handoff.source_hashes()),
+                            files={name: hashlib.sha256(value).hexdigest() for name, value in files.items()})
+
+            def transfer(binary, source, destination, **kwargs):
+                target = mount / destination.split("/container/", 1)[1]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if Path(source).is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copyfile(source, target)
+                return True
+
+            def download(binary, source, destination, **kwargs):
+                origin = mount / source.split("/container/", 1)[1]
+                for path in origin.rglob("*"):
+                    patterns = kwargs.get("include_patterns")
+                    if path.is_file() and (not patterns or any(fnmatch.fnmatch(path.name, pattern) for pattern in patterns)):
+                        target = Path(destination) / path.relative_to(origin)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(path, target)
+                return True
+
+            launched = []
+
+            def child(command, console):
+                options, arguments = parse_options(command[command.index("--training-config"):])
+                rank = int(next(value.split("=")[1] for value in command if value.startswith("--node_rank=")))
+                launched.append((options, arguments))
+                directory = options.output / f"rank{rank:03d}"
+                directory.mkdir()
+                (directory / "status.json").write_text('{"status":"complete"}')
+                if options.handoff_export:
+                    target = options.output / "handoff"
+                    target.mkdir()
+                    for name, content in files.items():
+                        if f"rank_{rank}_" in name or f"rank{rank:03d}" in name or name == "latest":
+                            path = target / name
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(content)
+                    (target / "manifest.json").write_text(json.dumps(manifest))
+                else:
+                    self.assertIsNotNone(options.handoff_input)
+                    self.assertFalse(options.handoff_input.is_relative_to(mount))
+                    self.assertNotIn("--handoff", arguments)
+                    self.assertTrue((options.handoff_input / "latest").is_file())
+                console.write_text("fake child\n")
+                return 0
+
+            with patch.object(profile, "resolve_training_arguments", return_value=(None, None, effective)), \
+                    patch.object(transfers, "install_azcopy", return_value="fake"), \
+                    patch.object(transfers, "download_with_fallback", side_effect=download), \
+                    patch.object(transfers, "run_azcopy_transfer", side_effect=transfer), \
+                    patch.object(profile, "run_profile_child", side_effect=child), patch("builtins.print"):
+                for stage in ("A", "B"):
+                    for node in range(2):
+                        command = ["--nnodes", "2", "--nproc_per_node", "1", "--node_rank", str(node),
+                                   "--master_addr", "host", "--master_port", "9911", "--storage_account", "account",
+                                   "--storage_container", "container", "--mount_prefix", str(mount),
+                                   "--local_mirror", str(root / f"node{node}"), "--training-config", str(config),
+                                   "--output", str(mount / f"profiles/{stage}")]
+                        extra = (["--unfreeze-after", "2", "--handoff-export", "--stop-at-handoff"] if stage == "A"
+                                 else ["--handoff-input", str(mount / "profiles/A/handoff")])
+                        self.assertEqual(localize_main([*command, *extra]), 0)
+                self.assertEqual(len(launched), 4)
+                self.assertTrue((mount / "profiles/B/io_node001/upload_status.json").is_file())
+
+    def test_handoff_rng_and_integrity(self):
+        import random
+        import numpy as np
+
+        state = handoff.capture_rng("cpu")
+        expected = (random.random(), float(np.random.rand()), torch.rand(3))
+        handoff.restore_rng(state, "cpu")
+        actual = (random.random(), float(np.random.rand()), torch.rand(3))
+        self.assertEqual(expected[:2], actual[:2])
+        self.assertTrue(torch.equal(expected[2], actual[2]))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            options, _ = parse_options(["--training-config", "config.json", "--output", folder,
+                                        "--unfreeze-after", "2", "--handoff-export", "--replay-batches", "2"])
+            source = root / "temporary"
+            source.mkdir()
+            for kind in ("model", "optim"):
+                (source / f"zero_pp_rank_0_mp_rank_00_{kind}_states.pt").write_bytes(b"weights")
+            trainer = SimpleNamespace(world_rank=0, local_rank=0, world_size=1, global_step=2,
+                                      current_epoch=1, _batches_per_epoch=10, device="cpu")
+            recorder = SimpleNamespace(options=options, source_iterator=iter([{"input": torch.ones(2)}] * 2))
+            contract = dict(world_size=1, source_hashes=handoff.source_hashes(), torch=torch.__version__)
+            with patch.object(handoff, "handoff_contract", return_value=contract):
+                manifest = handoff.export_handoff(trainer, recorder, source)
+            target = root / "handoff"
+            self.assertEqual(os.stat(source / "zero_pp_rank_0_mp_rank_00_model_states.pt").st_ino,
+                             os.stat(target / "boundary/zero_pp_rank_0_mp_rank_00_model_states.pt").st_ino)
+            manifest["mode"] = "stop"
+            (target / "manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(handoff.validate_handoff(target, [0], 1), manifest)
+            (target / "replay/rank000.pt").write_bytes(b"corrupt")
+            with self.assertRaisesRegex(ValueError, "hash mismatch"):
+                handoff.validate_handoff(target, [0], 1)
+
+    def test_handoff_consumer_remaining_schedule(self):
+        from lerobot.scripts import train_lola_v07_azure as training
+        from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
+
+        def setup(trainer):
+            self.assertEqual(trainer.total_steps, 98)
+            self.assertFalse(trainer._vlm_delayed_unfreeze)
+            self.assertTrue(trainer._resume_vlm_unfrozen)
+            self.assertEqual(trainer.vlm_lr, trainer.learning_rate * trainer.config.vlm_lr_mult)
+            trainer.model = SimpleNamespace(load_checkpoint=lambda *args, **kwargs: ("loaded", {}))
+
+        with patch.object(training.LoLAV07Trainer, "_setup_deepspeed", setup), \
+                patch.object(handoff, "verify_contract"), \
+                handoff.consumer_context(training, SimpleNamespace(handoff_input=Path("/handoff")), dict(step=2, epoch=1)):
+            trainer = training.LoLAV07Trainer(
+                LoLAV07Config(train_vlm=True, ema_decay=0), {},
+                dict(device="cpu", local_rank=0, world_rank=0, world_size=1, is_distributed=False),
+                train_vlm=True, strategy="deepspeed", max_steps=100)
+            trainer.policy = torch.nn.Linear(2, 2)
+            trainer.total_steps = 100
+            trainer._setup_deepspeed()
+        self.assertEqual(trainer.total_steps, 100)
+        self.assertEqual(trainer.global_step, 2)
+        self.assertTrue(trainer._vlm_unfrozen)
+
+    def test_handoff_pair_gate(self):
+        from lerobot.scripts import profile_lola_v07 as profile
+
+        settings = SimpleNamespace(master_port=9921, master_addr="host", nnodes=2, node_rank=0)
+        options, _ = parse_options(["--training-config", "config.json", "--output", "/tmp/pair",
+                                    "--unfreeze-after", "100", "--handoff-export", "--handoff-pair"])
+        for failure in (False, True):
+            store = SimpleNamespace(set=lambda *args: None,
+                                    wait=lambda keys: None,
+                                    get=lambda key: b"1" if failure and key == "A/1" else b"0")
+            with patch.object(profile, "localize_main", return_value=0) as launch, \
+                    patch("torch.distributed.TCPStore", return_value=store):
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "B not started"):
+                        profile.paired_localize(settings, options, ["--resume", ""])
+                    self.assertEqual(launch.call_count, 1)
+                else:
+                    self.assertEqual(profile.paired_localize(settings, options, ["--resume", ""]), 0)
+                    self.assertEqual(launch.call_count, 2)
+                    producer, consumer = [call.args[0] for call in launch.call_args_list]
+                    self.assertIn("--handoff-export", producer)
+                    self.assertNotIn("--unfreeze-after", consumer)
+                    self.assertIn("/tmp/pair/A/handoff", consumer)
+                    self.assertIn("9922", consumer)
+
+    def test_handoff_pair_real_tcp_gate(self):
+        import multiprocessing
+        import socket
+        from lerobot.scripts import profile_lola_v07 as profile
+
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        options, _ = parse_options(["--training-config", "config.json", "--output", "/tmp/pair",
+                                    "--unfreeze-after", "100", "--handoff-export", "--handoff-pair"])
+
+        def worker(rank):
+            settings = SimpleNamespace(master_port=port - 2, master_addr="127.0.0.1", nnodes=2, node_rank=rank)
+            with patch.object(profile, "localize_main", return_value=0):
+                if profile.paired_localize(settings, options, []) != 0:
+                    raise RuntimeError("pair failed")
+
+        processes = [multiprocessing.get_context("fork").Process(target=worker, args=(rank,)) for rank in range(2)]
+        try:
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(20)
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+
+    def test_handoff_producer_gate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for node in range(2):
+                path = root / f"io_node{node:03d}"
+                path.mkdir()
+                (path / "upload_status.json").write_text(json.dumps(dict(child_exit_code=0, upload_complete=True)))
+                rank = root / f"rank{node:03d}"
+                rank.mkdir()
+                (rank / "status.json").write_text('{"status":"complete"}')
+            handoff.validate_producer(root, 2, 1)
+            (root / "io_node001/upload_status.json").write_text('{"child_exit_code":1,"upload_complete":true}')
+            with self.assertRaisesRegex(ValueError, "producer failed"):
+                handoff.validate_producer(root, 2, 1)
+
+    def test_handoff_options(self):
+        common = ["--training-config", "config.json", "--output", "/tmp/profile"]
+        options, _ = parse_options([*common, "--unfreeze-after", "100", "--handoff-export",
+                                    "--stop-at-handoff", "--trace-at-end"])
+        self.assertTrue(options.stop_at_handoff and options.trace_at_end)
+        self.assertEqual(options.replay_batches, 8)
+        options, _ = parse_options([*common, "--handoff-input", "/tmp/previous/handoff"])
+        self.assertEqual(options.handoff_input, Path("/tmp/previous/handoff"))
+        for extra in (["--handoff-export"], ["--stop-at-handoff"], ["--replay-batches", "0"],
+                      ["--handoff-input", "/tmp/input", "--unfreeze-after", "100"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit), patch("sys.stderr"):
+                parse_options([*common, *extra])
+
     def test_unfreeze_profile_options(self):
         options, extra = parse_options([
             "--training-config", "config.json", "--output", "/tmp/unfreeze-profile",
@@ -816,6 +1048,23 @@ class ProfileBenchTests(unittest.TestCase):
             rows = [json.loads(line) for line in (recorder.output / "steps.jsonl").read_text().splitlines()]
             self.assertEqual([row["global_step"] for row in rows if row["traced"]], [4])
 
+    def test_trace_at_end(self):
+        with tempfile.TemporaryDirectory() as folder:
+            options, _ = parse_options(["--training-config", "config.json", "--output", folder,
+                                        "--warmup", "1", "--steps", "4", "--trace-steps", "1", "--trace-at-end"])
+            trainer = SimpleNamespace(world_rank=0, device="cpu", global_step=100)
+            recorder = BenchRecorder(trainer, options)
+            with patch("torch.cuda.synchronize"), patch("torch.cuda.reset_peak_memory_stats"), \
+                    patch("lerobot.scripts.profile_lola_v07.memory_stats", return_value={}), \
+                    patch.object(recorder, "start_trace") as start, patch.object(recorder, "stop_trace"), \
+                    self.assertRaises(BenchComplete):
+                for _ in ProfileLoader(range(5), recorder):
+                    trainer.global_step += 1
+                    self.assertEqual(start.called, trainer.global_step == 105)
+            recorder.journal.close()
+            rows = [json.loads(line) for line in (recorder.output / "steps.jsonl").read_text().splitlines()]
+            self.assertEqual([row["global_step"] for row in rows if row["traced"]], [105])
+
     def test_summary_excludes_trace_and_snapshot_following_step(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
@@ -885,12 +1134,13 @@ class ProfileBenchTests(unittest.TestCase):
                 summarize(directory)
 
 
-def distributed_smoke(output, real_vision=False, unfreeze=False):
+def distributed_smoke(output, real_vision=False, unfreeze=False, handoff_mode=None, handoff_input=None):
     import os
     from types import MethodType
     import deepspeed
     from lerobot.scripts import train_lola_v07_azure as training
     from lerobot.scripts.profile_lola_v07 import run_bench
+    from contextlib import nullcontext
     from lerobot.policies.lola_v07.configuration_lola_v07 import LoLAV07Config
     from lerobot.policies.lola_v07.modeling_lola_v07 import LoLAV07Policy
     from lerobot.policies.lola_v07.forward_optimizations import enable_batched_vision_sdpa
@@ -951,21 +1201,26 @@ def distributed_smoke(output, real_vision=False, unfreeze=False):
                               memory_history=True, snapshot_threshold=100.0,
                               sync_phases=False, trace_memory=False, vision_batched_sdpa=real_vision,
                               memory_budget_fraction=0.9, zero_hpz_partition_size=None,
-                              unfreeze_after=2 if unfreeze else None)
-    config = LoLAV07Config(train_vlm=unfreeze, gradient_checkpointing=True, ema_decay=0,
+                              unfreeze_after=2 if unfreeze else None,
+                              trace_at_end=bool(handoff_mode), handoff_export=handoff_mode in ("export", "stop"),
+                              handoff_input=handoff_input, stop_at_handoff=handoff_mode == "stop", replay_batches=2)
+    config = LoLAV07Config(train_vlm=unfreeze or bool(handoff_mode), gradient_checkpointing=True, ema_decay=0,
                           vision_batched_sdpa=real_vision, vision_no_checkpoint_layers=1 if real_vision else 0)
-    trainer = training.LoLAV07Trainer(
-        config, {}, dict(device=device, local_rank=local_rank, world_rank=rank,
-                                 world_size=torch.distributed.get_world_size(), is_distributed=True),
-        max_steps=100, strategy="deepspeed", batch_size=2, train_vlm=unfreeze, deepspeed_zero_stage=3,
-        training_args=dict(seed=42, batch_size=2), log_every_n_steps=100,
-    )
-    trainer.policy = policy
-    trainer.total_steps = 100
-    policy.config = config
-    with profile_deepspeed_initialization(options):
-        if unfreeze:
-            policy.vlm.requires_grad_(False)
+    manifest = handoff.validate_handoff(handoff_input, [rank], torch.distributed.get_world_size()) if handoff_input else None
+    context = handoff.consumer_context(training, options, manifest) if manifest else nullcontext()
+    with context, profile_deepspeed_initialization(options):
+        trainer = training.LoLAV07Trainer(
+            config, {}, dict(device=device, local_rank=local_rank, world_rank=rank,
+                                     world_size=torch.distributed.get_world_size(), is_distributed=True),
+            max_steps=100, strategy="deepspeed", batch_size=2, train_vlm=unfreeze or bool(handoff_mode), deepspeed_zero_stage=3,
+            training_args=dict(seed=42, batch_size=2), log_every_n_steps=100,
+        )
+        trainer.policy = policy
+        trainer.total_steps = 100
+        policy.config = config
+        if unfreeze or handoff_mode:
+            if unfreeze:
+                policy.vlm.requires_grad_(False)
             trainer._setup_deepspeed()
         else:
             optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-4)
@@ -987,14 +1242,32 @@ def distributed_smoke(output, real_vision=False, unfreeze=False):
     trainer.training_step = MethodType(training_step, trainer)
     loader = [dict(input=torch.randn(40, 12), grid=torch.tensor([[1, 4, 4], [1, 2, 2], [1, 4, 4], [1, 2, 2]]))
               if real_vision else {"input": torch.randn(2, 16)} for batch_index in range(16)]
+    if manifest:
+        proxy = SimpleNamespace(batch_sampler=torch.utils.data.BatchSampler(range(32), 2, True))
+        class SmokeLoader:
+            batch_sampler = proxy.batch_sampler
+
+            def __len__(self):
+                return 16
+
+        loader = handoff.ReplayLoader(SmokeLoader(), manifest)
     with patch("lerobot.policies.lola_v07.forward_optimizations.functional.scaled_dot_product_attention",
                wraps=torch.nn.functional.scaled_dot_product_attention) as sdpa, profile_deepspeed_initialization(options):
-        run_bench(trainer, options, loader, 0, 0, training.LoLAV07Trainer.train)
+        run_bench(trainer, options, loader, manifest["step"] if manifest else 0,
+                  manifest["epoch"] if manifest else 0, training.LoLAV07Trainer.train)
+    if handoff_mode == "stop":
+        assert trainer.global_step == 2 and not trainer._vlm_unfrozen
+        assert (output / "handoff/manifest.json").is_file()
+        torch.distributed.destroy_process_group()
+        return
+    if handoff_mode:
+        (output / f"rank{rank:03d}" / "final_state.json").write_text(json.dumps(handoff.engine_state(trainer), indent=2))
     if real_vision:
         assert sdpa.call_count == 5 * 6 + (2 * 4 if unfreeze else 0), sdpa.call_count
-    assert trainer.global_step == (7 if unfreeze else 5)
+    assert trainer.global_step == (7 if unfreeze or handoff_mode else 5)
     torch.distributed.barrier()
-    assert not list(output.rglob("*model_states.pt"))
+    if not handoff_mode:
+        assert not list(output.rglob("*model_states.pt"))
     if rank == 0:
         result = summarize(output)
         assert all(row["count"] == 3 for row in result["per_rank"].values())
@@ -1006,13 +1279,17 @@ def distributed_smoke(output, real_vision=False, unfreeze=False):
             assert result["unfreeze"]["after"]["vlm_trainable_tensors"] > 0
             assert result["unfreeze"]["vision_fallback_calls"] == 0
             assert result["unfreeze"]["after"]["vision_gc"] == [True, False]
-        print(f"PASS: real two-rank ZeRO-3 updates, vision={real_vision}, unfreeze={unfreeze}, 90% budget, trace, allocator snapshot, bounded exit, no retained checkpoint")
+        print(f"PASS: real two-rank ZeRO-3 updates, vision={real_vision}, unfreeze={unfreeze}, handoff={handoff_mode}, 90% budget, trace, allocator snapshot, bounded exit")
     torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
     import sys
-    if sys.argv[1:2] in (["--distributed-smoke"], ["--distributed-vision-smoke"], ["--distributed-unfreeze-smoke"]):
+    if sys.argv[1:2] == ["--distributed-handoff-smoke"]:
+        mode = sys.argv[3]
+        distributed_smoke(Path(sys.argv[2]), real_vision=True, unfreeze=mode != "consume",
+                          handoff_mode=mode, handoff_input=Path(sys.argv[4]) if mode == "consume" else None)
+    elif sys.argv[1:2] in (["--distributed-smoke"], ["--distributed-vision-smoke"], ["--distributed-unfreeze-smoke"]):
         distributed_smoke(Path(sys.argv[2]), real_vision=sys.argv[1] != "--distributed-smoke",
                           unfreeze=sys.argv[1] == "--distributed-unfreeze-smoke")
     else:
