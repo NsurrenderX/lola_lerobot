@@ -9,8 +9,10 @@ import json
 import os
 from pathlib import Path
 import random
+import socket
 import subprocess
 import sys
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -418,6 +420,39 @@ def node_group(options, port_offset):
         torch.distributed.destroy_process_group()
 
 
+def wait_for_staging(options, plan, node_io, error=None):
+    contract = dict(arguments=plan['arguments'], nnodes=options.nnodes, nproc_per_node=options.nproc_per_node,
+                    master_addr=options.master_addr, master_port=options.master_port,
+                    source_sha256=file_hash(__file__))
+    status = dict(node_rank=options.node_rank, hostname=socket.gethostname(), ready_at=time.time(),
+                  error=error, contract_sha256=hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest())
+    receipt = dict(phase='waiting_for_nodes', endpoint=f'{options.master_addr}:{options.master_port + 4}',
+                   timeout_s=options.exchange_timeout, local=status)
+    write_json(node_io / 'staging_status.json', receipt)
+    print(f'[split] node={options.node_rank} staging finished; waiting for {options.nnodes} nodes '
+          f'at {receipt["endpoint"]}, timeout={options.exchange_timeout}s, error={error}', flush=True)
+    started = time.monotonic()
+    try:
+        with node_group(options, 4):
+            records = gather_nodes(status)
+            receipt['nodes'] = records
+            if any(record['error'] is not None for record in records):
+                raise RuntimeError(f'Input staging failed; training not started: {records}')
+            if sorted(record['node_rank'] for record in records) != list(range(options.nnodes)) \
+                    or len({record['contract_sha256'] for record in records}) != 1:
+                raise ValueError('Nodes disagree on launch contract; training not started')
+            torch.distributed.barrier()
+        receipt['phase'] = 'ready'
+    except Exception as failure:
+        receipt.update(phase='failed', failure=f'{type(failure).__name__}: {failure}')
+        raise
+    finally:
+        receipt.update(wait_s=time.monotonic() - started, finished_at=time.time())
+        write_json(node_io / 'staging_status.json', receipt)
+    print(f'[split] all {options.nnodes} nodes ready; node={options.node_rank} launching frozen torchrun '
+          f'at {options.master_addr}:{options.master_port}', flush=True)
+
+
 def finish_frozen(root, code, node_rank, nproc_per_node):
     status_path = root / f'frozen_node{node_rank:03d}.json'
     status = read_json(status_path) if status_path.is_file() else dict(outcome='missing')
@@ -514,18 +549,24 @@ def run_job(options, overrides):
     write_json(node_io / 'plan.json', plan)
     write_json(root / 'arguments.json', plan['arguments'])
     write_json(root / 'source_training_config.json', read_json(options.training_config))
-    azcopy = transfers.install_azcopy(str(options.local_mirror / 'bin/azcopy'))
-    for name, paths in plan['inputs'].items():
-        if paths['source'] != paths['local']:
-            url = transfers.resolve_blob_ref(paths['source'], options.storage_account,
-                                             options.storage_container, str(options.mount_prefix))
-            if not transfers.download_with_fallback(azcopy, url, paths['local'], account=options.storage_account,
-                                                    container=options.storage_container,
-                                                    mount_prefix=str(options.mount_prefix), dir_transfer=True):
-                raise RuntimeError(f'Failed to stage {name}')
-        required = 'meta/info.json' if name == 'dataset_root' else 'config.json'
-        if not (Path(paths['local']) / required).is_file():
-            raise FileNotFoundError(f'Missing {name}/{required}')
+    azcopy = None
+    staging_error = None
+    try:
+        azcopy = transfers.install_azcopy(str(options.local_mirror / 'bin/azcopy'))
+        for name, paths in plan['inputs'].items():
+            if paths['source'] != paths['local']:
+                url = transfers.resolve_blob_ref(paths['source'], options.storage_account,
+                                                 options.storage_container, str(options.mount_prefix))
+                if not transfers.download_with_fallback(azcopy, url, paths['local'], account=options.storage_account,
+                                                        container=options.storage_container,
+                                                        mount_prefix=str(options.mount_prefix), dir_transfer=True):
+                    raise RuntimeError(f'Failed to stage {name}')
+            required = 'meta/info.json' if name == 'dataset_root' else 'config.json'
+            if not (Path(paths['local']) / required).is_file():
+                raise FileNotFoundError(f'Missing {name}/{required}')
+    except Exception as failure:
+        staging_error = f'{type(failure).__name__}: {failure}'
+    wait_for_staging(options, plan, node_io, staging_error)
     blob_output = transfers.resolve_blob_ref(str(options.output), options.storage_account,
                                              options.storage_container, str(options.mount_prefix))
     checkpoints = root / 'checkpoints'

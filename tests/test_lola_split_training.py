@@ -1,8 +1,10 @@
 from datetime import timedelta
+from contextlib import contextmanager
 import json
 import multiprocessing
 import os
 import random
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,7 +45,86 @@ def exchange_worker(directory, node, mode):
         torch.distributed.destroy_process_group()
 
 
+def staging_worker(directory, node, port, release, entered, finished, mode):
+    root = Path(directory) / f'node{node}'
+    options = SimpleNamespace(master_addr='127.0.0.1', master_port=port, node_rank=node,
+                              nnodes=2, nproc_per_node=8, exchange_timeout=15)
+    plan = dict(arguments=dict(batch_size=16 if mode == 'mismatch' and node == 1 else 32))
+    if node == 1 and not release.wait(timeout=15):
+        raise RuntimeError('Test did not release the slow node')
+    original_group = split.node_group
+    @contextmanager
+    def signal_group(options, offset):
+        if node == 0:
+            entered.set()
+        with original_group(options, offset):
+            yield
+    try:
+        with patch.object(split, 'node_group', signal_group):
+            split.wait_for_staging(options, plan, root,
+                                   'download failed' if mode == 'failure' and node == 1 else None)
+        if mode == 'success':
+            result = subprocess.run([
+                sys.executable, '-m', 'torch.distributed.run', '--nnodes=2', '--nproc_per_node=1',
+                f'--node_rank={node}', '--master_addr=127.0.0.1', f'--master_port={port}',
+                '--rdzv_conf=timeout=15', '--max_restarts=0', str(Path(__file__).resolve()), '--rendezvous-smoke',
+            ], env=dict(os.environ, CUDA_VISIBLE_DEVICES=''), capture_output=True, text=True, timeout=45)
+            if result.returncode != 0:
+                raise RuntimeError(f'Torchrun failed after staging gate: {result.stdout}\n{result.stderr}')
+            if f'CPU_WORKER_READY rank={node} world_size=2' not in result.stdout:
+                raise RuntimeError('Torchrun did not start the expected CPU worker')
+            split.write_json(root / 'torchrun.json', dict(returncode=result.returncode, worker_rank=node))
+        split.write_json(root / 'result.json', dict(launch=True))
+    except (RuntimeError, ValueError) as error:
+        split.write_json(root / 'result.json', dict(error=str(error)))
+    finally:
+        finished.set()
+
+
 class SplitTrainingTests(unittest.TestCase):
+    def test_staging_waits_for_all_nodes_and_rejects_failures(self):
+        for mode in ('success', 'failure', 'mismatch'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                with socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    port = listener.getsockname()[1] - 4
+                context = multiprocessing.get_context('spawn')
+                release, entered = context.Event(), context.Event()
+                finished = [context.Event(), context.Event()]
+                processes = [context.Process(target=staging_worker,
+                             args=(directory, node, port, release, entered, finished[node], mode)) for node in range(2)]
+                for process in processes:
+                    process.start()
+                try:
+                    self.assertTrue(entered.wait(timeout=15), 'Fast node did not reach staging gate')
+                    self.assertFalse(finished[0].is_set(), 'Fast node launched before slow node was ready')
+                    self.assertFalse((Path(directory) / 'node0/result.json').exists())
+                    release.set()
+                    for process in processes:
+                        process.join(timeout=60)
+                        self.assertFalse(process.is_alive(), 'Staging gate hung')
+                        self.assertEqual(process.exitcode, 0)
+                    for node in range(2):
+                        root = Path(directory) / f'node{node}'
+                        result = split.read_json(root / 'result.json')
+                        receipt = split.read_json(root / 'staging_status.json')
+                        self.assertEqual(len(receipt['nodes']), 2)
+                        self.assertEqual(receipt['endpoint'], f'127.0.0.1:{port + 4}')
+                        if mode == 'success':
+                            self.assertEqual(result, dict(launch=True))
+                            self.assertEqual(receipt['phase'], 'ready')
+                            self.assertEqual(split.read_json(root / 'torchrun.json'), dict(returncode=0, worker_rank=node))
+                        else:
+                            self.assertIn('training not started', result['error'])
+                            self.assertEqual(receipt['phase'], 'failed')
+                            self.assertFalse((root / 'torchrun.json').exists())
+                finally:
+                    release.set()
+                    for process in processes:
+                        if process.is_alive():
+                            process.terminate()
+                            process.join()
+
     def test_shell_launcher_environment_and_passthrough(self):
         launcher = Path(split.__file__).with_name('train_azure_v07_split.sh')
         with tempfile.TemporaryDirectory() as directory:
@@ -368,4 +449,10 @@ class SplitTrainingTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    if sys.argv[1:] == ['--rendezvous-smoke']:
+        torch.distributed.init_process_group('gloo', timeout=timedelta(seconds=15))
+        print(f'CPU_WORKER_READY rank={torch.distributed.get_rank()} world_size={torch.distributed.get_world_size()}', flush=True)
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+    else:
+        unittest.main()
